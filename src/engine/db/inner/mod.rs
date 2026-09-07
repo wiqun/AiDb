@@ -178,12 +178,25 @@ impl DB {
         ));
         let cache_for_open = Some(Arc::clone(&block_cache));
 
+        // 阶段 1: WAL 回放计时与物理字节累加
+        let wal_replay_start = std::time::Instant::now();
         let recovery = WALManager::recover(&path, Arc::clone(&options))?;
         let memtable = MemTable::new_with_stats(Some(Arc::clone(&stats)));
         replay_entries(&memtable, &recovery.entries)?;
+        let wal_replay_duration = wal_replay_start.elapsed().as_micros() as u64;
+        let wal_replayed_bytes: u64 = recovery.recovered_files.iter().map(|f| f.file_size).sum();
+        stats
+            .recovery_wal_replay_duration_us
+            .store(wal_replay_duration, AtomicOrdering::Relaxed);
+        stats
+            .recovery_wal_replayed_bytes
+            .store(wal_replayed_bytes, AtomicOrdering::Relaxed);
+
         let mut last_sequence = recovery.max_sequence;
         last_sequence = last_sequence.max(max_sequence_in_memtable(&memtable));
 
+        // 阶段 2: Manifest 加载与版本树重建计时
+        let manifest_start = std::time::Instant::now();
         let version_set = if current_exists(&path) {
             VersionSet::recover(&path, max_levels, options.max_manifest_size)?
         } else {
@@ -204,12 +217,24 @@ impl DB {
                 )?
             }
         };
+        let manifest_duration = manifest_start.elapsed().as_micros() as u64;
+        stats
+            .recovery_manifest_duration_us
+            .store(manifest_duration, AtomicOrdering::Relaxed);
+
+        // 阶段 3: SSTable Reader 打开与元数据加载计时
+        let sstable_open_start = std::time::Instant::now();
         let sstables = load_sstables_from_version(
             &path,
             version_set.current(),
             cache_for_open,
             Some(Arc::clone(&stats)),
         )?;
+        let sstable_open_duration = sstable_open_start.elapsed().as_micros() as u64;
+        stats
+            .recovery_sstable_open_duration_us
+            .store(sstable_open_duration, AtomicOrdering::Relaxed);
+
         remove_orphan_sstables(&path, version_set.current())?;
         last_sequence = last_sequence.max(max_sequence_in_sstables(&sstables));
 

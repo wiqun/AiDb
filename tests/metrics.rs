@@ -39,3 +39,6 @@ mod pending_compaction_test;
 #[cfg(feature = "monitoring")]
 #[path = "modules/metrics/otel_export_test.rs"]
 mod otel_export_test;
+
+#[path = "modules/metrics/recovery_test.rs"]
+mod recovery_test;
