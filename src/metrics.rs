@@ -84,6 +84,10 @@ struct OtelMetrics {
     write_stall_duration_seconds: Histogram<f64>,
     write_stall_max_duration_seconds: Gauge<f64>,
     compaction_pending_bytes: Gauge<f64>,
+    recovery_wal_replay_duration_seconds: Gauge<f64>,
+    recovery_wal_replayed_bytes: Gauge<f64>,
+    recovery_manifest_duration_seconds: Gauge<f64>,
+    recovery_sstable_open_duration_seconds: Gauge<f64>,
 }
 
 #[cfg(feature = "monitoring")]
@@ -293,6 +297,26 @@ impl OtelMetrics {
                 .f64_gauge("aidb_compaction_pending_bytes")
                 .with_description("当前待 Compaction 积压量 (字节)")
                 .with_unit("By")
+                .build(),
+            recovery_wal_replay_duration_seconds: meter
+                .f64_gauge("aidb_recovery_wal_replay_duration_seconds")
+                .with_description("WAL 回放恢复耗时")
+                .with_unit("s")
+                .build(),
+            recovery_wal_replayed_bytes: meter
+                .f64_gauge("aidb_recovery_wal_replayed_bytes")
+                .with_description("回放的 WAL 物理字节总和")
+                .with_unit("By")
+                .build(),
+            recovery_manifest_duration_seconds: meter
+                .f64_gauge("aidb_recovery_manifest_duration_seconds")
+                .with_description("Manifest 元数据加载恢复耗时")
+                .with_unit("s")
+                .build(),
+            recovery_sstable_open_duration_seconds: meter
+                .f64_gauge("aidb_recovery_sstable_open_duration_seconds")
+                .with_description("SSTable Reader 打开恢复耗时")
+                .with_unit("s")
                 .build(),
         }
     }
@@ -640,6 +664,20 @@ pub fn sync_to_otel(stats: &crate::statistics::Statistics) {
     );
     m.compaction_pending_bytes
         .record(current.compaction_pending_bytes as f64, &[]);
+    m.recovery_wal_replay_duration_seconds.record(
+        current.recovery_wal_replay_duration_us as f64 / 1_000_000.0,
+        &[],
+    );
+    m.recovery_wal_replayed_bytes
+        .record(current.recovery_wal_replayed_bytes as f64, &[]);
+    m.recovery_manifest_duration_seconds.record(
+        current.recovery_manifest_duration_us as f64 / 1_000_000.0,
+        &[],
+    );
+    m.recovery_sstable_open_duration_seconds.record(
+        current.recovery_sstable_open_duration_us as f64 / 1_000_000.0,
+        &[],
+    );
 
     // 9. 推进基线
     *baseline = current;

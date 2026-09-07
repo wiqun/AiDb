@@ -72,3 +72,54 @@ fn test_recovery_metrics_and_reset_retention() {
         "recovery_sstable_open_duration_us must survive stats.reset()"
     );
 }
+
+#[cfg(feature = "monitoring")]
+#[test]
+fn test_recovery_metrics_otel_export() {
+    let exporter = aidb::metrics::testutil::init_in_memory();
+    let dir = TempDir::new().unwrap();
+    let opts = Options {
+        block_size: 256,
+        sync_wal: true,
+        ..Options::for_testing()
+    };
+    {
+        let db = DB::open(dir.path(), opts.clone()).unwrap();
+        db.put(b"k1", b"v1").unwrap();
+        db.flush().unwrap();
+        db.put(b"k2", b"v2").unwrap();
+        drop(db);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    let db = DB::open(dir.path(), opts).unwrap();
+    let snap = db.statistics().snapshot();
+    aidb::metrics::sync_to_otel(db.statistics().as_ref());
+
+    // 使用 testutil 统一辅助函数断言 4 个恢复 Gauge 指标且数值严格对应
+    let wal_dur = aidb::metrics::testutil::gauge_value(
+        &exporter,
+        "aidb_recovery_wal_replay_duration_seconds",
+    );
+    assert!(
+        wal_dur > 0.0,
+        "aidb_recovery_wal_replay_duration_seconds must be exported (> 0)"
+    );
+    let wal_bytes =
+        aidb::metrics::testutil::gauge_value(&exporter, "aidb_recovery_wal_replayed_bytes");
+    assert_eq!(wal_bytes, snap.recovery_wal_replayed_bytes as f64);
+    let manifest_dur =
+        aidb::metrics::testutil::gauge_value(&exporter, "aidb_recovery_manifest_duration_seconds");
+    assert!(
+        manifest_dur > 0.0,
+        "aidb_recovery_manifest_duration_seconds must be exported (> 0)"
+    );
+    let sst_dur = aidb::metrics::testutil::gauge_value(
+        &exporter,
+        "aidb_recovery_sstable_open_duration_seconds",
+    );
+    assert!(
+        sst_dur > 0.0,
+        "aidb_recovery_sstable_open_duration_seconds must be exported (> 0)"
+    );
+}
