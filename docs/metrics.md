@@ -23,6 +23,7 @@ description: AiDb 全量 OTel 指标总表 (仅当前已存在指标). 查指标
   - 快照直读 (`INFO storage`): 返回无 `_total` 后缀的即时快照值 (如 `aidb_wal_written_bytes`, `aidb_write_stall_requests`), 适合压测前后单轮差分计算.
   - OTel 导出: 返回符合 Prometheus 命名规范的单调 Counter (`_total`), 标签化 Histogram (`_seconds_bucket`) 与 Gauge.
   - 对账一致性: `INFO storage` 的 stall 汇总指标等于 OTel 分维度指标之和 (`requests = sum(requests_total)`, `duration_us ≈ duration_seconds_sum * 1e6`, `max_duration_us = max_duration_seconds * 1e6`).
+  - 冷启动恢复与线程对账: `INFO storage` 的 5 项恢复指标与 OTel Gauge 对应（耗时微秒与秒换算一致、字节直读 1:1 等价），且 aidb 4 项恢复指标在 `Statistics::reset()` 保护白名单内常驻不被清零; `INFO threads` 渲染 3 项系统指标，OTel 侧线程数为 Gauge 镜像，上下文切换数以差分方式推入 Counter（先 add 后推进基线，崩溃安全）.
 - 缓存卫生与读放大隔离 (`iter_uncached` 与 `key_exists_for_write`):
   - Compaction 遍历 SSTable 全面改走 `iter_uncached()`, 绕过 BlockCache, 杜绝后台大范围 I/O 冲刷用户热数据并污染缓存命中率.
   - Reader 打开阶段的 `load_range_tombstones()` 同样以未缓存模式读取, 确保只在用户业务读路径发生实际缓存填充与命中统计.
@@ -69,6 +70,20 @@ description: AiDb 全量 OTel 指标总表 (仅当前已存在指标). 查指标
 | `aidb_backup_total` | Counter | 1 | `aidb_backup_operation(3: create\|delete\|restore)`<br>基数 3 | 备份/恢复操作完成时原子累加<br>`stats.backup_total`; `backup/manager.rs`, `backup/recovery.rs` | 备份与恢复系统操作统计 | 备份操作量速率:<br>`sum by (aidb_backup_operation) (rate(aidb_backup_total[1m]))` |
 | `aidb_backup_size_bytes` | Gauge | By | — (基数 1) | 仅 create 时原子记录<br>`stats.backup_size_bytes`; `backup/manager.rs` | 最近一次备份总大小 | 备份体积观测 (MB):<br>`aidb_backup_size_bytes / 1024 / 1024` |
 | `aidb_backup_duration_seconds` | Histogram | s | — (基数 1) | 备份打包耗时原子记录<br>`stats.backup_duration`; `backup/manager.rs` | 桶边界 0.01~10.0 s | 备份耗时分布:<br>`histogram_quantile(0.95, rate(aidb_backup_duration_seconds_bucket[5m]))` |
+| `aidb_recovery_wal_replay_duration_seconds` | Gauge | s | — (基数 1) | WAL 重放与解析耗时原子记录<br>`stats.recovery_wal_replay_duration_us`; `engine/db/inner/mod.rs` | 冷启动一次性事件, 微秒转秒; `Statistics::reset()` 保护白名单保留 (不被清零) | 冷启动恢复耗时定位:<br>`aidb_recovery_wal_replay_duration_seconds` |
+| `aidb_recovery_wal_replayed_bytes` | Gauge | By | — (基数 1) | WAL 重放物理文件总大小<br>`stats.recovery_wal_replayed_bytes`; `engine/db/inner/mod.rs` | 冷启动一次性事件, 物理重放文件字节量 (Gauge 规范不带 `_total`); `Statistics::reset()` 保护白名单保留 | 冷启动 WAL 恢复带宽分析:<br>`aidb_recovery_wal_replayed_bytes / aidb_recovery_wal_replay_duration_seconds` |
+| `aidb_recovery_manifest_duration_seconds` | Gauge | s | — (基数 1) | Manifest 元数据版本恢复耗时原子记录<br>`stats.recovery_manifest_duration_us`; `engine/db/inner/mod.rs` | 冷启动一次性事件 (微秒转秒); 覆盖 `recover` / `open_new` / `bootstrap_from_scan` 三分支; `Statistics::reset()` 保护白名单保留 | 元数据恢复耗时定位:<br>`aidb_recovery_manifest_duration_seconds` |
+| `aidb_recovery_sstable_open_duration_seconds` | Gauge | s | — (基数 1) | 全量 SSTable 打开与校验耗时原子记录<br>`stats.recovery_sstable_open_duration_us`; `engine/db/inner/mod.rs` | 冷启动一次性事件 (微秒转秒); `remove_orphan_sstables` 隔离在此耗时之外; `Statistics::reset()` 保护白名单保留 | SST 元数据加载耗时定位:<br>`aidb_recovery_sstable_open_duration_seconds` |
+
+## 协议与进程指标 (aikv 进程)
+
+由嵌入方 `aikv` 维护并经由同一 OTel 导出通道上报.
+
+| 指标名 | 类型 | 单位 | 标签与基数 | 数据源与代码位置 | 说明 (实现陷阱与口径) | 用途与典型 PromQL |
+| --- | --- | --- | --- | --- | --- | --- |
+| `aikv_recovery_rebuild_counters_duration_seconds` | Gauge | s | — (基数 1) | 存储层键计数器全库重建耗时 (微秒转秒)<br>`storage.rebuild_counters_duration_us()`; `server/config.rs:295` 挂载 | 最近一次键计数器重建耗时 (16 个逻辑 DB 全库双次扫描与物化); 周期刷新同步至 OTel Gauge | 键计数器恢复耗时定位:<br>`aikv_recovery_rebuild_counters_duration_seconds` |
+| `aikv_process_threads` | Gauge | 1 | — (基数 1) | 周期读取 `/proc/self/status` 的 `Threads:` 字段<br>`ServerMetrics`; `server/metrics.rs` | 进程当前 OS 线程总数; 零 node-exporter 依赖 | 线程数监控 / 线程泄漏与膨胀预警:<br>`aikv_process_threads` |
+| `aikv_process_context_switches_total` | Counter | 1 | `aikv_context_switch_type(2: voluntary\|nonvoluntary)`<br>基数 2 | 周期读取 `/proc/self/status` 上下文切换累计值后差分累加<br>`ServerMetrics`; `server/metrics.rs` | 进程级自愿与非自愿上下文切换次数; 先 add 差分后更新基线 (崩溃安全) | 上下文切换速率 (判断 CPU 争用与阻塞):<br>`sum by (aikv_context_switch_type) (rate(aikv_process_context_switches_total[1m]))` |
 
 ## OTel semconv 双写指标
 
