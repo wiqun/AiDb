@@ -35,6 +35,9 @@ impl DB {
         self.stats
             .logical_read_bytes
             .fetch_add(bytes, AtomicOrdering::Relaxed);
+        self.stats
+            .logical_read_count
+            .fetch_add(1, AtomicOrdering::Relaxed);
         Ok(r)
     }
 

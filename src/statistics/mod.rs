@@ -50,6 +50,8 @@ pub struct Statistics {
     pub memtable_size_bytes: [AtomicU64; 2],
     pub sstable_count: Box<[AtomicU64]>,
     pub sstable_size_bytes: Box<[AtomicU64]>,
+    /// SST 有效 entry 载荷字节 (Σ raw_key_size + raw_value_size), flush/compaction 后重算
+    pub live_bytes: AtomicU64,
     pub block_cache_size: AtomicU64,
     pub block_cache_capacity: AtomicU64,
     pub sequence: AtomicU64,
@@ -63,6 +65,10 @@ pub struct Statistics {
     pub logical_write_bytes: AtomicU64,
     pub block_read_bytes: AtomicU64,
     pub logical_read_bytes: AtomicU64,
+    /// data block 触碰次数 (含 BlockCache 命中), 仅用户读路径; 经典读放大 RA 分子
+    pub block_seek_count: AtomicU64,
+    /// 逻辑读次数 (get 命中/未命中各 1, 迭代每产出 1 条 KV 计 1); 经典读放大 RA 分母
+    pub logical_read_count: AtomicU64,
     pub compaction_read_bytes: AtomicU64,
     pub write_stall_requests: [AtomicU64; NUM_WRITE_STALL_KINDS],
     pub write_stall_durations: [AtomicHistogram; NUM_WRITE_STALL_KINDS],
@@ -120,6 +126,7 @@ impl Statistics {
             memtable_size_bytes: [AtomicU64::new(0), AtomicU64::new(0)],
             sstable_count: sst_count.into_boxed_slice(),
             sstable_size_bytes: sst_size.into_boxed_slice(),
+            live_bytes: AtomicU64::new(0),
             block_cache_size: AtomicU64::new(0),
             block_cache_capacity: AtomicU64::new(0),
             sequence: AtomicU64::new(0),
@@ -132,6 +139,8 @@ impl Statistics {
             logical_write_bytes: AtomicU64::new(0),
             block_read_bytes: AtomicU64::new(0),
             logical_read_bytes: AtomicU64::new(0),
+            block_seek_count: AtomicU64::new(0),
+            logical_read_count: AtomicU64::new(0),
             compaction_read_bytes: AtomicU64::new(0),
             write_stall_requests: std::array::from_fn(|_| AtomicU64::new(0)),
             write_stall_durations: std::array::from_fn(|_| AtomicHistogram::default()),
@@ -257,6 +266,7 @@ impl Statistics {
             ],
             sstable_count: sst_c,
             sstable_size_bytes: sst_s,
+            live_bytes: self.live_bytes.load(Ordering::Relaxed),
             block_cache_size: self.block_cache_size.load(Ordering::Relaxed),
             block_cache_capacity: self.block_cache_capacity.load(Ordering::Relaxed),
             sequence: self.sequence.load(Ordering::Relaxed),
@@ -269,6 +279,8 @@ impl Statistics {
             logical_write_bytes: self.logical_write_bytes.load(Ordering::Relaxed),
             block_read_bytes: self.block_read_bytes.load(Ordering::Relaxed),
             logical_read_bytes: self.logical_read_bytes.load(Ordering::Relaxed),
+            block_seek_count: self.block_seek_count.load(Ordering::Relaxed),
+            logical_read_count: self.logical_read_count.load(Ordering::Relaxed),
             compaction_read_bytes: self.compaction_read_bytes.load(Ordering::Relaxed),
             write_stall_requests: stall_req,
             write_stall_duration_buckets: stall_b,
@@ -334,6 +346,8 @@ impl Statistics {
         self.logical_write_bytes.store(0, Ordering::Relaxed);
         self.block_read_bytes.store(0, Ordering::Relaxed);
         self.logical_read_bytes.store(0, Ordering::Relaxed);
+        self.block_seek_count.store(0, Ordering::Relaxed);
+        self.logical_read_count.store(0, Ordering::Relaxed);
         self.compaction_read_bytes.store(0, Ordering::Relaxed);
         for s in &self.write_stall_requests {
             s.store(0, Ordering::Relaxed);

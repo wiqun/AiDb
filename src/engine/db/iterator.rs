@@ -350,6 +350,7 @@ impl DBIterator {
                 if let Some(ref s) = self.stats {
                     s.logical_read_bytes
                         .fetch_add((k.len() + v.len()) as u64, Ordering::Relaxed);
+                    s.logical_read_count.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -599,6 +600,7 @@ impl Iterator for DBIterator {
                 (current.0.len() + current.1.len()) as u64,
                 Ordering::Relaxed,
             );
+            s.logical_read_count.fetch_add(1, Ordering::Relaxed);
         }
         self.load_next_valid();
         Some(Ok(current))

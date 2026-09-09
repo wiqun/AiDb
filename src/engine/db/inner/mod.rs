@@ -571,6 +571,18 @@ pub(crate) fn update_sstable_metrics(
     stats: &Statistics,
     pending_bytes: u64,
 ) {
+    // live_bytes: 全部 SST 的有效 entry 载荷 (raw_key_size + raw_value_size) 之和,
+    // 空间放大 SA 分母的 SST 侧; flush/compaction 改变 SST 集合后随本函数自然重算
+    let live_total: u64 = sstables
+        .iter()
+        .flatten()
+        .map(|r| {
+            r.properties()
+                .map(|p| p.raw_key_size + p.raw_value_size)
+                .unwrap_or(0)
+        })
+        .sum();
+    stats.live_bytes.store(live_total, AtomicOrdering::Relaxed);
     for (level, readers) in sstables.iter().enumerate() {
         if level < stats.sstable_count.len() {
             let total: u64 = readers.iter().map(|r| r.file_size()).sum();

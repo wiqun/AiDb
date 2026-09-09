@@ -60,6 +60,11 @@ pub fn read_block_cached(
         file_number,
         offset: handle.offset,
     };
+    // 触碰计数: hit 与 miss 双路径均计 1, 与 block_read_bytes (仅 miss 落盘字节) 互补,
+    // 前者为经典读放大 RA 分子, 后者为读穿透字节比分子
+    if let Some(s) = stats {
+        s.block_seek_count.fetch_add(1, Ordering::Relaxed);
+    }
     if let Some(cache) = block_cache {
         if let Some(bytes) = cache.get(key.clone()) {
             return Ok(bytes);

@@ -46,6 +46,7 @@ struct OtelMetrics {
     memtable_size_bytes: Gauge<f64>,
     sstable_count: Gauge<f64>,
     sstable_size_bytes: Gauge<f64>,
+    live_bytes: Gauge<f64>,
     operations_total: Counter<u64>,
     operation_duration_seconds: Histogram<f64>,
     db_client_operations: Counter<u64>,
@@ -78,6 +79,8 @@ struct OtelMetrics {
     logical_write_bytes_total: Counter<u64>,
     block_read_bytes_total: Counter<u64>,
     logical_read_bytes_total: Counter<u64>,
+    block_seek_count_total: Counter<u64>,
+    logical_read_count_total: Counter<u64>,
     compaction_read_bytes_total: Counter<u64>,
     bloom_useful_total: Counter<u64>,
     write_stall_requests_total: Counter<u64>,
@@ -112,6 +115,11 @@ impl OtelMetrics {
             sstable_size_bytes: meter
                 .f64_gauge("aidb_sstable_size_bytes")
                 .with_description("各层 SSTable 文件总大小")
+                .with_unit("By")
+                .build(),
+            live_bytes: meter
+                .f64_gauge("aidb_live_bytes")
+                .with_description("SST 有效 entry 载荷字节 (Σ raw_key_size + raw_value_size), 空间放大 SA 分母的 SST 侧")
                 .with_unit("By")
                 .build(),
             operations_total: meter
@@ -266,6 +274,16 @@ impl OtelMetrics {
                 .u64_counter("aidb_logical_read_bytes_total")
                 .with_description("用户点查与迭代消费逻辑字节总数")
                 .with_unit("By")
+                .build(),
+            block_seek_count_total: meter
+                .u64_counter("aidb_block_seek_count_total")
+                .with_description("data block 触碰次数总数 (含 BlockCache 命中, 仅用户读路径), 经典读放大 RA 分子")
+                .with_unit("1")
+                .build(),
+            logical_read_count_total: meter
+                .u64_counter("aidb_logical_read_count_total")
+                .with_description("用户逻辑读次数总数 (get 命中/未命中各 1, 迭代每产出 1 条 KV 计 1), 经典读放大 RA 分母")
+                .with_unit("1")
                 .build(),
             compaction_read_bytes_total: meter
                 .u64_counter("aidb_compaction_read_bytes_total")
@@ -527,6 +545,7 @@ pub fn sync_to_otel(stats: &crate::statistics::Statistics) {
     m.sequence.record(current.sequence as f64, &[]);
     m.total_key_count
         .record(current.total_key_count as f64, &[]);
+    m.live_bytes.record(current.live_bytes as f64, &[]);
 
     for (level, (&count, &size)) in current
         .sstable_count
@@ -622,6 +641,19 @@ pub fn sync_to_otel(stats: &crate::statistics::Statistics) {
         .saturating_sub(baseline.logical_read_bytes);
     if logical_read_delta > 0 {
         m.logical_read_bytes_total.add(logical_read_delta, &[]);
+    }
+    let block_seek_delta = current
+        .block_seek_count
+        .saturating_sub(baseline.block_seek_count);
+    if block_seek_delta > 0 {
+        m.block_seek_count_total.add(block_seek_delta, &[]);
+    }
+    let logical_read_count_delta = current
+        .logical_read_count
+        .saturating_sub(baseline.logical_read_count);
+    if logical_read_count_delta > 0 {
+        m.logical_read_count_total
+            .add(logical_read_count_delta, &[]);
     }
     let comp_read_delta = current
         .compaction_read_bytes

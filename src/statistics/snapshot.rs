@@ -38,6 +38,8 @@ pub struct StatsSnapshot {
     pub memtable_size_bytes: [u64; 2],
     pub sstable_count: Vec<u64>,
     pub sstable_size_bytes: Vec<u64>,
+    /// SST 有效 entry 载荷字节 (Σ raw_key_size + raw_value_size)
+    pub live_bytes: u64,
     pub block_cache_size: u64,
     pub block_cache_capacity: u64,
     pub sequence: u64,
@@ -51,6 +53,10 @@ pub struct StatsSnapshot {
     pub logical_write_bytes: u64,
     pub block_read_bytes: u64,
     pub logical_read_bytes: u64,
+    /// data block 触碰次数 (含 BlockCache 命中, 仅用户读路径)
+    pub block_seek_count: u64,
+    /// 逻辑读次数 (get 命中/未命中各 1, 迭代每产出 1 条 KV 计 1)
+    pub logical_read_count: u64,
     pub compaction_read_bytes: u64,
     pub write_stall_requests: [u64; NUM_WRITE_STALL_KINDS],
     pub write_stall_duration_buckets: [[u64; NUM_HISTOGRAM_BUCKETS]; NUM_WRITE_STALL_KINDS],
