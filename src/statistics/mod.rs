@@ -2,16 +2,20 @@
 //!
 //! 对标 RocksDB `Statistics`, 热路径完全无锁、零堆内存分配, 仅执行原子加减.
 
+pub mod duration;
 pub mod histogram;
+pub mod prometheus;
 pub mod snapshot;
 pub mod types;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub use duration::{LatencyHistogram, LatencySnapshot, COMMAND_DURATION_BOUNDS_US};
 pub use histogram::{
     AtomicHistogram, BUCKET_MID_POINTS_SECS, HISTOGRAM_BOUNDS_US, NUM_HISTOGRAM_BUCKETS,
     OVERFLOW_BUCKET_VALUE_SECS,
 };
+pub use prometheus::render_histogram;
 pub use snapshot::StatsSnapshot;
 pub use types::{
     BackupOp, CompactionPhase, DbOp, RaftRestartOutcome, RaftRpcDirection, RaftRpcType,
