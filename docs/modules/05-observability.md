@@ -88,6 +88,10 @@ flowchart LR
 
 | 指标全名 | 类型 | 标签 (Labels) | 触发与采集时机 |
 | --- | --- | --- | --- |
+| `aidb_raft_apply_lag_entries` | Gauge | `group` | 导出时 `commit - applied`, 不在请求路径计算 |
+| `aidb_raft_replication_lag_entries` | Gauge | `group` | leader 上 `last_log - max matched`, 其他角色是 0 |
+| `aidb_raft_leader_contact_age_seconds` | Gauge | `group` | follower 距上次心跳的秒数, leader 是 0 |
+| `aidb_raft_role` | Gauge | `group`, `role` | 只输出当前角色, 值是 1 |
 | `aidb_raft_rpc_total` | Counter | `aidb.raft.rpc.type=vote\|append_entries\|install_snapshot`<br>`aidb.raft.rpc.direction=incoming\|outgoing` | Raft RPC 消息收发计数 |
 | `aidb_raft_log_entries_total` | Counter | — | AppendEntries 入站 entry 数量累加 |
 | `aidb_raft_group_fatal_total` | Counter | `aidb.raft.group.id` | Group 进入 OpenRaft Fatal 状态时记录 |
