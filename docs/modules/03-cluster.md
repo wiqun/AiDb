@@ -162,19 +162,19 @@ flowchart TD
 | `Put` / `Delete` | 单 key 写入 / 删除 |
 | `WriteBatch(ThinWriteBatch)` | 组内原子批量写 |
 | `PutConditional` | slot 迁移目标写入 (key 已存在则跳过) |
-| `MigrationWrite` | slot 迁移数据写 (apply 侧同样走 overlay + `WriteStats`) |
+| `MigrationWrite` | slot 迁移数据写 (与用户 key, tombstone, tip 同一 batch) |
 | `Meta(MetaRequest)` | 仅 MetaRaft group 使用 |
 
 | Response 变体 | 用途 |
 | --- | --- |
-| `Ok` | 控制面 / skip / Blank 等无写摘要的成功 |
+| `Ok` | 写入, 控制面, skip, Blank 的成功 |
 | `Value(...)` | 读路径 |
-| `WriteStats { effects }` | 数据写成功摘要; `effects` 与本次实际 apply 的 Put/Delete ops 一一对应 (Put=`inserted`, Delete=`deleted`) |
 | `Error(String)` | 业务错误 |
 
-- Apply 对合并批次共享批内 overlay, 经 `key_exists(sm_key(gid, key))` 判定后组装 `effects`, 同源更新引擎 `total_key_count`.
-- `OpenRaftNode::write_batch` / `put` / `delete` 将 `Ok | WriteStats` 视为成功; Meta / Barrier / Gc / Freeze 等控制面臂仍只接受 `Ok`.
-- **同版本兼容**: 滚动升级须 aidb/aikv 同版本同时带 `WriteStats`; 消费者对数据写响应 fail-fast, 禁止吞掉意外变体.
+- `Put` / `Delete` / `WriteBatch` / `MigrationWrite` 成功都返回 `Response::Ok`. 它们不再为 effects 调用 `key_exists`.
+- 同一 apply 批次仍维护 overlay, 只供 `PutConditional` 判断 key 是否已存在.
+- `OpenRaftNode::write_batch` / `put` / `delete` 只把 `Response::Ok` 当成成功.
+- `MultiRaftNode::estimate_entry_count` 把本地各 group 的 `DB::estimate_entry_count` 相加, 不调用 `scan_local_pairs`.
 
 ### MetaRequest (控制面, 摘要)
 

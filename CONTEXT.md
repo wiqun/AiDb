@@ -54,17 +54,15 @@
 
 **WriteBatch**: 一批原子写入操作, 要么全部成功要么全部失败.
 
-**EngineWriteStats**: `write` / `write_without_wal` 返回的批写摘要 (`inserted` / `deleted` 计数); 与 `total_key_count` 同源.
-
 **Snapshot (快照)**: 某一时刻的完整数据视图, 用于崩溃恢复和新节点追赶.
 
 **MVCC**: 多版本并发控制, 通过快照实现隔离读取.
 
-**total_key_count**: 引擎内逻辑 key 计数 (AtomicUsize, 不持久化); 经完整 `key_exists` (及批内 overlay) 判定后增减, 供 `aidb_total_key_count` 指标. 精确 `DBSIZE` 由上层 aikv `DbKeyCounters` 负责.
+**estimate_entry_count**: 已打开 SSTable 的 `num_entries` 与活跃, 不可变 MemTable 的 `entry_count` 之和. 含旧版本, 点删除, 范围删除. 写路径不为这个数做存在性判断.
 
 ## 数据路径
 
-**put**: 写入 (插入或更新) 一个 key-value; 返回 `Result<bool>` (`inserted`).
+**put**: 写入 (插入或更新) 一个 key-value; 返回 `Result<()>`.
 
 **key_exists**: 完整存在性判定 (mem→imm→SST), 热路径只读 `ValueType`, **不**物化 Value. 禁止仅用 MemTable `contains_key` 代替.
 
@@ -76,4 +74,4 @@
 
 ## 集群写回传
 
-**Response::WriteStats**: 数据面 apply 成功时回传的 per-op `effects` (`Vec<bool>`; Put=`inserted`, Delete=`deleted`). 与本次实际写入 ops 顺序对齐; 供上层 (aikv) 更新键计数. Meta / Barrier / Gc 等控制面成功仍为 `Response::Ok`. 仅支持同版本滚动.
+**Response::Ok**: 数据面 `Put` / `Delete` / `WriteBatch` / `MigrationWrite` 与控制面成功都返回这个变体. apply 不再为 effects 做存在性判断.

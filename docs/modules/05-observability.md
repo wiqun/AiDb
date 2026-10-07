@@ -77,7 +77,6 @@ flowchart LR
 | `aidb_block_cache_misses_total` | Counter | — | BlockCache 读取未命中 |
 | `aidb_bloom_false_positive_total` | Counter | — | Bloom Filter 假阳性穿透判定 |
 | `aidb_sequence` | Gauge | — | 最新已分配的全局 Sequence 编号 |
-| `aidb_total_key_count` | Gauge | — | 逻辑 Key 总数 (`key_exists` + overlay 同源计数, AtomicUsize; 不持久化) |
 | `aidb_compaction_total` | Counter | `aidb.compaction.phase=pick\|run\|apply` | Compaction 各阶段累加 |
 | `aidb_compaction_duration_seconds` | Histogram | `aidb.compaction.phase=pick\|run\|apply` | Compaction 各阶段耗时分布 |
 | `aidb_backup_total` | Counter | `aidb.backup.operation=create\|delete\|restore` | 备份与恢复操作统计 |

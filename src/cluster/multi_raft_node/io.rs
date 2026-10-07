@@ -194,6 +194,13 @@ impl MultiRaftNode {
         }
     }
 
+    /// 本地各 group 引擎条目估值之和. 每个 group 有独立 DB, 直接读 SST 与 MemTable 计数, 不扫描.
+    pub fn estimate_entry_count(&self) -> u64 {
+        self.storages.read().values().fold(0u64, |sum, storage| {
+            sum.saturating_add(storage.db().estimate_entry_count())
+        })
+    }
+
     /// 扫描本地 group 状态机的全部 (user_key, value) 对.
     ///
     /// 返回的 key 已剥离 `sm/{gid}/` 前缀, 即与写入时传入的 user key 一致.

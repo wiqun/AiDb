@@ -32,7 +32,7 @@ description: AiDb 写路径 — WAL、MemTable、DB API、WriteBatch、MVCC 快�
 | `engine/memtable/range_tombstone.rs` | Range tombstone 辅助 (`[start,end)` 覆盖 / 最大 seq) | `max_covering_range_tombstone_seq` |
 | `engine/db/mod.rs` | DB 模块根; re-export | — |
 | `engine/db/inner/` | DB 总协调 (子目录): `mod.rs` 生命周期/状态 + `write.rs` 写路径 + `read.rs` 读路径 + `exists.rs` 存在性判定 + `flush.rs` Flush + `compaction.rs` Compaction | `DB::open`, `put`, `write`, `get`, `key_exists` |
-| `engine/db/write_batch.rs` | 批写容器与写摘要 | `WriteBatch`, `WriteOp`, `EngineWriteStats` |
+| `engine/db/write_batch.rs` | 批写容器 | `WriteBatch`, `WriteOp` |
 | `engine/db/replay.rs` | WAL entry → MemTable 回放 | `replay_entries` |
 | `engine/db/snapshot.rs` | MVCC 快照; `SnapshotList` | `Snapshot::get`, `SnapshotList` |
 | `engine/db/iterator.rs` | 跨 MemTable + SSTable 归并迭代 | `DBIterator` |
@@ -40,7 +40,7 @@ description: AiDb 写路径 — WAL、MemTable、DB API、WriteBatch、MVCC 快�
 | `src/config.rs` | 引擎配置: `Options` / `ClusterConfig` / `MigrationConfig` / `CompressionType` | `Options::for_testing`, `Options::validate` |
 | `src/error.rs` | 类型化错误 (`thiserror`); `Cluster` 变体需 feature `cluster` | `Error`, `Result` |
 
-公共 re-export (`src/lib.rs`): `DB`, `WriteBatch`, `WriteOp`, `EngineWriteStats`, `Snapshot`, `DbIterGuard`.
+公共 re-export (`src/lib.rs`): `DB`, `WriteBatch`, `WriteOp`, `Snapshot`, `DbIterGuard`.
 
 ## 关键 invariant (勿破坏)
 
@@ -115,9 +115,10 @@ SSTable / VersionSet 细节见 [engine-storage.md](02-engine-storage.md).
 | API | 说明 |
 | --- | --- |
 | `DB::open(path, Options)` | 恢复 + 启动后台 flush/compaction 线程 |
-| `put(key, value) -> Result<bool>` | 单条写; 返回是否 insert (新 key); 同源更新 `total_key_count` |
-| `write(&WriteBatch) -> Result<EngineWriteStats>` | 原子批量写; BatchStart + 连续 seq; 一次 `sync_wal`; 批内 overlay 累计 inserted/deleted |
-| `write_without_wal(&WriteBatch) -> Result<EngineWriteStats>` | 同上但不写引擎 WAL (Raft apply 等); 同样用 `key_exists` + overlay |
+| `put(key, value) -> Result<()>` | 单条写; 不为键计数做存在性判断 |
+| `write(&WriteBatch) -> Result<()>` | 原子批量写; BatchStart + 连续 seq; 一次 `sync_wal` |
+| `write_without_wal(&WriteBatch) -> Result<()>` | 同上但不写引擎 WAL (Raft apply 等) |
+| `estimate_entry_count() -> u64` | SST `num_entries` 与 MemTable `entry_count` 之和, 含旧版本和墓碑 |
 | `delete(key)` | 单条删; 分配连续 sequence |
 | `get(key)` | 读取最新可见版本 |
 | `key_exists(key)` | 完整存在性判定 (mem→imm→SST); 不物化 Value |
@@ -160,7 +161,7 @@ batch.delete(b"k2");
 let _ = db.write(&batch)?;
 ```
 
-空 batch 为 no-op (不写 WAL, 不分配 sequence; 返回零值 `EngineWriteStats`).
+空 batch 为 no-op (不写 WAL, 不分配 sequence; 返回 `Ok(())`).
 
 ### Snapshot 点读
 
@@ -214,5 +215,4 @@ cargo test --test engine --test snapshot -- --test-threads=1
 
 - 并发 `get` 无锁读 MemTable: WriteBatch 逐条写入 MemTable 期间, 其他线程可能看到 batch **部分** 效果 (与 LevelDB 一致). Snapshot 创建持 `write_lock`, 无此问题.
 - `iter`/`scan` 不过滤到当前 sequence, 使用 `K_MAX_SEQUENCE` 见全部已写入版本.
-- `total_key_count` 与 `put`/`write`/`write_without_wal` 返回的 insert/delete 摘要同源: 经完整 `key_exists` (及批内 overlay) 判定后增减 (AtomicUsize Relaxed 序, 不持久化).
 - 数据目录格式与旧版 `aidb-oldmain` **不兼容** (文本 WAL → 二进制 WalEntry).
