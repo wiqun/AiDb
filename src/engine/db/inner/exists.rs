@@ -22,6 +22,14 @@ impl DB {
         self.key_exists_internal(key, max_seq, true)
     }
 
+    /// 与 `key_exists` 同一判定, 不记入 BlockCache 和读统计. 给 apply 里的 `PutConditional` 用.
+    pub fn key_exists_without_stats(&self, key: &[u8]) -> Result<bool> {
+        self.check_not_closed()?;
+        Self::validate_user_key(key)?;
+        let max_seq = self.sequence.load(AtomicOrdering::SeqCst);
+        self.key_exists_internal(key, max_seq, false)
+    }
+
     /// 在给定 `max_seq` 边界下判定 key 是否存在 (不物化 Value).
     #[allow(dead_code)]
     pub(crate) fn key_exists_at_sequence(&self, key: &[u8], max_seq: u64) -> Result<bool> {

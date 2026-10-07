@@ -262,7 +262,7 @@ impl OpenRaftStorage {
     ) -> Result<bool> {
         match overlay.get(sk) {
             Some(present) => Ok(*present),
-            None => db.key_exists(sk),
+            None => db.key_exists_without_stats(sk),
         }
     }
 

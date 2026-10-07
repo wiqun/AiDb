@@ -64,7 +64,9 @@
 
 **put**: 写入 (插入或更新) 一个 key-value; 返回 `Result<()>`.
 
-**key_exists**: 完整存在性判定 (mem→imm→SST), 热路径只读 `ValueType`, **不**物化 Value. 禁止仅用 MemTable `contains_key` 代替.
+**key_exists**: 完整存在性判定 (mem→imm→SST), 热路径只读 `ValueType`, **不**物化 Value. 禁止仅用 MemTable `contains_key` 代替. 用户读口径, 记入 BlockCache 和读统计.
+
+**key_exists_without_stats**: 与 `key_exists` 同一判定, 不记入 BlockCache 和读统计. `PutConditional` 未命中批内 overlay 时走它.
 
 **get**: 读取一个 key 的值, 按 MemTable → SSTable 层级顺序查找.
 
