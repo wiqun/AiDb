@@ -506,4 +506,34 @@ mod tests {
         );
         assert_eq!(task.output_level, 2);
     }
+
+    #[test]
+    fn bottom_level_is_not_a_score_source() {
+        let dir = tempdir().unwrap();
+        let mut opts = Options::for_testing();
+        opts.max_levels = 3;
+        opts.max_bytes_for_level_base = 500;
+        let picker = CompactionPicker::from_options(&opts);
+        let mut levels = empty_levels(3);
+        levels[2].push(big_file(dir.path(), 1, 2, b"z", 4000));
+        assert!(picker.pick_compaction(&levels).is_none());
+    }
+
+    #[test]
+    fn compaction_into_bottom_includes_overlapping_bottom_files() {
+        let dir = tempdir().unwrap();
+        let mut opts = Options::for_testing();
+        opts.max_levels = 3;
+        opts.max_bytes_for_level_base = 500;
+        let picker = CompactionPicker::from_options(&opts);
+        let mut levels = empty_levels(3);
+        levels[1].push(big_file(dir.path(), 1, 1, b"a", 4000));
+        levels[2].push(big_file(dir.path(), 2, 2, b"a", 64));
+        let task = picker
+            .pick_compaction(&levels)
+            .expect("level 1 compacts into bottom");
+        assert_eq!(task.level, 1);
+        assert_eq!(task.output_level, 2);
+        assert!(task.expanded_inputs.iter().any(|f| f.file_number() == 2));
+    }
 }
