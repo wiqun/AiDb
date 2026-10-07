@@ -6,9 +6,9 @@
 //!
 //! ```text
 //! inputs + expanded_inputs → MergeIterator (堆归并)
-//!   → 同一 user_key 分组: 最新版本无条件保留, 其余按 SnapshotDedupTracker 丢弃
+//!   → 同一 user_key 的 TypePut: 最新版本保留, 其余按 SnapshotDedupTracker 丢弃
 //!   → RangeTombstoneTracker 过滤被覆盖的点条目
-//!   → output_level > 0: 丢弃 TypeDelete tombstone
+//!   → 删除标记: 没有快照需要且没有幸存文件重叠时丢掉
 //!   → SSTableBuilder → .sst → CompactionResult (entry_count == 0 时 abandon)
 //! ```
 //!
@@ -16,10 +16,11 @@
 //!
 //! - 同一 user_key 保留最高 sequence 版本; 从新到旧扫描, 一旦遇到 `seq <= min_snapshot_sequence`
 //!   的 "边界穿越版本" 即保留之, 更老版本一律丢弃 (保证所有活跃 Snapshot 可见性).
-//! - 输出到 L1+ 时丢弃 `TypeDelete` tombstone: tombstone 作为某 user_key 的最新版本
-//!   (即无更新的存活点版本) 被跳过, 该 key 更老的重复版本也随之清除.
+//! - 没有幸存文件就丢掉删除标记: 点删除和范围删除使用同一条范围重叠判断.
+//!   快照还能看见的版本即使在最底层也留下.
 //! - 0 entry 的子任务输出空 `CompactionResult` (file_number = 0), 上层跳过 AddFile.
 
+use super::drop::{should_drop_delete_marker, UserKeyRange};
 use super::helpers::user_key_from_internal;
 use super::merge::MergeIterator;
 use super::trackers::{RangeTombstoneTracker, SnapshotDedupTracker};
@@ -44,6 +45,8 @@ pub struct CompactionJob {
     pub min_snapshot_sequence: u64,
     /// 可选的 compaction 过滤器.
     pub compaction_filter: Option<Arc<dyn CompactionFilter>>,
+    /// 这次不会重写的文件的 user key 闭区间.
+    surviving_user_ranges: Vec<UserKeyRange>,
 }
 
 pub struct CompactionResult {
@@ -80,7 +83,14 @@ impl CompactionJob {
             bloom_false_positive_rate,
             min_snapshot_sequence: u64::MAX, // 默认无活跃快照
             compaction_filter: None,
+            surviving_user_ranges: Vec::new(),
         }
+    }
+
+    /// 这次 compaction 之后仍然存在的文件范围. 默认空, 空则删除标记不留下.
+    pub fn with_surviving_user_ranges(mut self, ranges: Vec<UserKeyRange>) -> Self {
+        self.surviving_user_ranges = ranges;
+        self
     }
 
     /// 设置快照保护阈值: compaction 不会删除 `sequence >= min_snapshot_sequence` 的版本.
@@ -111,7 +121,7 @@ impl CompactionJob {
         let mut count = 0usize;
         let mut last_user_key: Option<Vec<u8>> = None;
         let mut tracker = SnapshotDedupTracker::default();
-        while let Some((key, _)) = merge_iter.next_entry()? {
+        while let Some((key, value)) = merge_iter.next_entry()? {
             let user_key = user_key_from_internal(&key)?;
             let seq = extract_sequence(&key)?;
             if last_user_key.as_deref() == Some(user_key) {
@@ -123,17 +133,14 @@ impl CompactionJob {
             }
             tracker.start_key();
             let value_type = extract_value_type(&key)?;
-            if value_type == ValueType::TypeRangeDelete {
-                last_user_key = Some(user_key.to_vec());
-                tracker.observe(seq, self.min_snapshot_sequence);
-                continue;
-            }
-            if self.output_level > 0
-                && matches!(
-                    value_type,
-                    ValueType::TypeDelete | ValueType::TypeRangeDelete
-                )
-            {
+            if drop_delete_marker(
+                value_type,
+                seq,
+                self.min_snapshot_sequence,
+                user_key,
+                &value,
+                &self.surviving_user_ranges,
+            ) {
                 last_user_key = Some(user_key.to_vec());
                 tracker.observe(seq, self.min_snapshot_sequence);
                 continue;
@@ -168,7 +175,7 @@ impl CompactionJob {
         let mut splits: Vec<Vec<u8>> = Vec::new();
         let mut tracker = SnapshotDedupTracker::default();
 
-        while let Some((key, _)) = merge_iter.next_entry()? {
+        while let Some((key, value)) = merge_iter.next_entry()? {
             let user_key = user_key_from_internal(&key)?;
             let seq = extract_sequence(&key)?;
             if last_user_key.as_deref() == Some(user_key) {
@@ -184,17 +191,14 @@ impl CompactionJob {
             }
             tracker.start_key();
             let value_type = extract_value_type(&key)?;
-            if value_type == ValueType::TypeRangeDelete {
-                last_user_key = Some(user_key.to_vec());
-                tracker.observe(seq, self.min_snapshot_sequence);
-                continue;
-            }
-            if self.output_level > 0
-                && matches!(
-                    value_type,
-                    ValueType::TypeDelete | ValueType::TypeRangeDelete
-                )
-            {
+            if drop_delete_marker(
+                value_type,
+                seq,
+                self.min_snapshot_sequence,
+                user_key,
+                &value,
+                &self.surviving_user_ranges,
+            ) {
                 last_user_key = Some(user_key.to_vec());
                 tracker.observe(seq, self.min_snapshot_sequence);
                 continue;
@@ -281,33 +285,22 @@ impl CompactionJob {
             tracker.start_key();
 
             if value_type == ValueType::TypeRangeDelete {
-                let end_key = value.to_vec();
-                range_tracker.add(user_key.to_vec(), end_key, seq);
-                if !self.should_filter(&key, &value) {
-                    builder.add(&key, &value)?;
-                    entry_count += 1;
-                    if smallest_key.is_none() {
-                        smallest_key = Some(key.clone());
-                    }
-                    largest_key = Some(key.clone());
-                }
+                range_tracker.add(user_key.to_vec(), value.clone(), seq);
+            }
+            if drop_delete_marker(
+                value_type,
+                seq,
+                self.min_snapshot_sequence,
+                user_key,
+                &value,
+                &self.surviving_user_ranges,
+            ) {
                 last_user_key = Some(user_key.to_vec());
                 tracker.observe(seq, self.min_snapshot_sequence);
                 continue;
             }
 
-            if range_tracker.covers(user_key, seq) {
-                last_user_key = Some(user_key.to_vec());
-                tracker.observe(seq, self.min_snapshot_sequence);
-                continue;
-            }
-
-            if self.output_level > 0
-                && matches!(
-                    value_type,
-                    ValueType::TypeDelete | ValueType::TypeRangeDelete
-                )
-            {
+            if value_type != ValueType::TypeRangeDelete && range_tracker.covers(user_key, seq) {
                 last_user_key = Some(user_key.to_vec());
                 tracker.observe(seq, self.min_snapshot_sequence);
                 continue;
@@ -411,6 +404,7 @@ impl CompactionJob {
                     total_count.saturating_sub(i * est_per_range)
                 };
 
+                let surviving = self.surviving_user_ranges.clone();
                 handles.push(scope.spawn(move || {
                     write_sub_compaction(
                         &readers,
@@ -426,6 +420,7 @@ impl CompactionJob {
                         min_snap_seq,
                         expected,
                         filter,
+                        surviving,
                     )
                 }));
             }
@@ -442,6 +437,29 @@ impl CompactionJob {
 #[allow(clippy::too_many_arguments)]
 /// 检查 entry 是否应被 compaction filter 丢弃.
 /// 与 `CompactionJob::should_filter` 语义相同, 但以函数形式供 `write_sub_compaction` 使用.
+fn drop_delete_marker(
+    value_type: ValueType,
+    sequence: u64,
+    min_snapshot_sequence: u64,
+    marker_start: &[u8],
+    value: &[u8],
+    surviving: &[UserKeyRange],
+) -> bool {
+    let marker_end = if value_type == ValueType::TypeRangeDelete {
+        Some(value)
+    } else {
+        None
+    };
+    should_drop_delete_marker(
+        value_type,
+        sequence,
+        min_snapshot_sequence,
+        marker_start,
+        marker_end,
+        surviving,
+    )
+}
+
 fn should_filter_impl(
     filter: &Option<Arc<dyn CompactionFilter>>,
     level: usize,
@@ -469,6 +487,7 @@ fn write_sub_compaction(
     min_snap_seq: u64,
     expected_keys: usize,
     compaction_filter: Option<Arc<dyn CompactionFilter>>,
+    surviving: Vec<UserKeyRange>,
 ) -> Result<CompactionResult> {
     let output_path = sstable_path(db_path, file_number, output_level);
 
@@ -541,33 +560,15 @@ fn write_sub_compaction(
         tracker.start_key();
 
         if value_type == ValueType::TypeRangeDelete {
-            let end_key = value.to_vec();
-            range_tracker.add(user_key.to_vec(), end_key, seq);
-            if !should_filter_impl(&compaction_filter, output_level, &key, &value) {
-                builder.add(&key, &value)?;
-                entry_count += 1;
-                if smallest_key.is_none() {
-                    smallest_key = Some(key.clone());
-                }
-                largest_key = Some(key.clone());
-            }
+            range_tracker.add(user_key.to_vec(), value.clone(), seq);
+        }
+        if drop_delete_marker(value_type, seq, min_snap_seq, user_key, &value, &surviving) {
             last_user_key = Some(user_key.to_vec());
             tracker.observe(seq, min_snap_seq);
             continue;
         }
 
-        if range_tracker.covers(user_key, seq) {
-            last_user_key = Some(user_key.to_vec());
-            tracker.observe(seq, min_snap_seq);
-            continue;
-        }
-
-        if output_level > 0
-            && matches!(
-                value_type,
-                ValueType::TypeDelete | ValueType::TypeRangeDelete
-            )
-        {
+        if value_type != ValueType::TypeRangeDelete && range_tracker.covers(user_key, seq) {
             last_user_key = Some(user_key.to_vec());
             tracker.observe(seq, min_snap_seq);
             continue;
@@ -635,6 +636,7 @@ mod tests {
         Arc::new(SSTableReader::open(&path, None).unwrap())
     }
 
+    /// 没有幸存文件就丢掉
     #[test]
     fn test_compaction_dedup_and_tombstone() {
         let dir = tempdir().unwrap();
@@ -727,6 +729,7 @@ mod tests {
         assert_eq!(out[0].filter_removed_user_keys, vec![b"k".to_vec()]);
     }
 
+    /// 没有幸存文件就丢掉
     #[test]
     fn test_compaction_all_tombstones_level1_no_output() {
         let dir = tempdir().unwrap();

@@ -20,9 +20,9 @@
 
 **Leveled Compaction**: 分层合并策略, 从 L0 逐层向下合并, 控制读放大与写放大.
 
-**Tombstone**: 删除标记, 表示一个 key 已被删除; Compaction 时清理过期 tombstone.
+**Tombstone**: 删除标记, 表示一个 key 已被删除. Compaction 在没有快照需要, 且没有幸存文件与这一个 user key 重叠时, 不把标记写入输出.
 
-**RangeTombstone**: `delete_range` 写入的范围删除标记, O(1) 写入 (不扫描区间); 读取时覆盖区间内全部 key, Compaction 时清理.
+**RangeTombstone**: `delete_range` 写入的范围删除标记, O(1) 写入 (不扫描区间); 读取时覆盖区间内全部 key. Compaction 在没有快照需要, 且没有幸存文件与标记的 `[start, end)` 重叠时, 不把标记写入输出. 范围是标记自己的 `[start, end)`, 不是所在文件的 smallest 到 largest.
 
 ## 共识层
 

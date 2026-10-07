@@ -3,7 +3,10 @@
 
 use aidb::config::CompressionType;
 use aidb::config::Options;
-use aidb::engine::compaction::{CompactionJob, CompactionPicker, MergeIterator};
+use aidb::engine::compaction::{
+    user_key_from_internal, CompactionJob, CompactionPicker, MergeIterator, UserKeyRange,
+};
+use aidb::engine::memtable::extract_value_type;
 use aidb::engine::memtable::{encode_internal_key, ValueType};
 use aidb::engine::sstable::{sstable_path, SSTableBuilder, SSTableReader};
 use std::sync::Arc;
@@ -35,7 +38,7 @@ fn test_merge_iterator_overlapping_keys() {
     assert_eq!(first.1, b"new");
 }
 
-/// 验证 CompactionJob 在 Level 1 压实中清理 Delete Tombstone
+/// 没有幸存文件就丢掉
 #[test]
 fn test_compaction_job_removes_tombstone_at_level1() {
     let dir = tempdir().unwrap();
@@ -135,7 +138,95 @@ fn test_level0_output_retains_tombstone() {
         0.0,
     );
     let results = job.run(&[10]).unwrap();
-    assert_eq!(results[0].entry_count, 2);
+    assert_eq!(results[0].entry_count, 1);
     assert!(!results[0].smallest_key.is_empty());
     assert!(!results[0].largest_key.is_empty());
+}
+
+fn level1_job(dir: &std::path::Path, input: Arc<SSTableReader>) -> CompactionJob {
+    CompactionJob::new(
+        vec![input],
+        vec![],
+        1,
+        dir.to_path_buf(),
+        512,
+        16,
+        CompressionType::None,
+        0.0,
+    )
+}
+
+fn output_markers(path: &std::path::Path) -> Vec<(Vec<u8>, ValueType, Vec<u8>)> {
+    let reader = Arc::new(SSTableReader::open(path, None).unwrap());
+    let mut it = MergeIterator::new(vec![reader]).unwrap();
+    let mut out = Vec::new();
+    while let Some((key, value)) = it.next_entry().unwrap() {
+        let ty = extract_value_type(&key).unwrap();
+        let uk = user_key_from_internal(&key).unwrap().to_vec();
+        out.push((uk, ty, value));
+    }
+    out
+}
+
+#[test]
+fn delete_marker_stays_when_surviving_file_overlaps() {
+    let dir = tempdir().unwrap();
+    let input = sst(dir.path(), 1, 0, &[(b"b", 2, ValueType::TypeDelete, b"")]);
+    let job = level1_job(dir.path(), input).with_surviving_user_ranges(vec![UserKeyRange {
+        start: b"b".to_vec(),
+        end: b"m".to_vec(),
+    }]);
+    let results = job.run(&[10]).unwrap();
+    assert_eq!(results[0].entry_count, 1);
+    let markers = output_markers(&results[0].output_path);
+    assert_eq!(markers.len(), 1);
+    assert_eq!(markers[0].0, b"b");
+    assert_eq!(markers[0].1, ValueType::TypeDelete);
+}
+
+#[test]
+fn delete_marker_range_stays_when_only_the_tail_overlaps() {
+    let dir = tempdir().unwrap();
+    let input = sst(
+        dir.path(),
+        1,
+        0,
+        &[(b"b", 1, ValueType::TypeRangeDelete, b"z")],
+    );
+    let job = level1_job(dir.path(), input).with_surviving_user_ranges(vec![UserKeyRange {
+        start: b"m".to_vec(),
+        end: b"m".to_vec(),
+    }]);
+    let results = job.run(&[10]).unwrap();
+    assert_eq!(results[0].entry_count, 1);
+    let markers = output_markers(&results[0].output_path);
+    assert_eq!(markers.len(), 1);
+    assert_eq!(markers[0].0, b"b");
+    assert_eq!(markers[0].1, ValueType::TypeRangeDelete);
+    assert_eq!(markers[0].2, b"z");
+}
+
+#[test]
+fn delete_marker_drops_when_nothing_survives() {
+    let dir = tempdir().unwrap();
+    let input = sst(
+        dir.path(),
+        1,
+        0,
+        &[
+            (b"b", 2, ValueType::TypeDelete, b""),
+            (b"b", 1, ValueType::TypeRangeDelete, b"z"),
+        ],
+    );
+    let results = level1_job(dir.path(), input).run(&[10]).unwrap();
+    assert_eq!(results[0].entry_count, 0);
+}
+
+#[test]
+fn delete_marker_bottom_keeps_when_snapshot_can_see() {
+    let dir = tempdir().unwrap();
+    let input = sst(dir.path(), 1, 0, &[(b"b", 4, ValueType::TypeDelete, b"")]);
+    let job = level1_job(dir.path(), input).with_snapshot_threshold(4);
+    let results = job.run(&[10]).unwrap();
+    assert_eq!(results[0].entry_count, 1);
 }

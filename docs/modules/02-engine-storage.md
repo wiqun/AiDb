@@ -56,7 +56,7 @@ description: AiDb 持久化层 — SSTable 布局、层级 compaction、布隆�
 - **L1+ 定位**: `find_sstable_for_key` 用 **user_key range**; picker 用 meta raw range 扩展 overlap.
 - **Bloom Filter**: 仅索引 user_key; block 内仍按 `seq <= max_seq` 过滤. miss → 免 I/O; decode 失败 → open **降级**为无 filter (记录 warn 日志, 不崩溃).
 - **Block CRC 与 Handle 长度**: 校验 **解压后** payload; trailer = `[compressed_data][type:1][crc:4]`. `BlockHandle.size` 必须记录压缩后 payload 的实际长度 (不含 5B trailer). MANIFEST CRC 失败 → `Error::Corruption`.
-- **Compaction dedup 与活跃快照保护**: 同 user_key 分组内最新版本无条件保留; 从新到旧扫描, 一旦出现 `seq <= min_snapshot_sequence` 的版本即保留它, 更老版本直接丢弃; L1+ 丢弃 tombstone.
+- **Compaction dedup 与删除标记**: `TypePut` 按 `SnapshotDedupTracker` 保留最新版本和 `seq <= min_snapshot_sequence` 的边界穿越版本, 更老版本丢弃. 点删除和范围删除在没有快照需要, 且没有幸存文件与标记范围重叠时不写入输出. 点删除的范围是那一个 user key. 范围删除的范围是 `[start, end)`.
 - **CompactionRemovalListener**: 仅在 Version 安装成功后回调 `filter_removed_user_keys`; 调用方须持 `Weak<DB>` (禁止 `Arc<DB>` 回指造成泄漏). `DB::close` 在 join compaction 后将 filter/listener 置 `None`.
 - **Trivial move**: rename 后若 reader open 失败, 文件自动 rename 回原位置.
 - **Checkpoint 互斥**: `checkpoint_in_progress` 阻止 `run_compaction_once`; `pin_sstables` 防止 unlink.
