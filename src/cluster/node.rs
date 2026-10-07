@@ -42,7 +42,7 @@ use std::time::Duration;
 use openraft::error::{ForwardToLeader, RaftError};
 use openraft::type_config::async_runtime::WatchReceiver;
 use openraft::{Config, Raft, RaftMetrics, RaftNetworkFactory, TryAsRef};
-use tracing::instrument;
+use tracing::Instrument;
 
 use crate::cluster::log_committer::spawn_committer;
 use crate::cluster::network::{RaftNetworkClientFactory, RaftServiceDispatcher, RaftServiceImpl};
@@ -231,7 +231,6 @@ impl OpenRaftNode {
     /// commit and follower `commit_index` propagation:
     /// 1. Wait for all new members to catch up on log replication
     /// 2. Confirm at least one other voter received the entry + heartbeat wait
-    #[instrument(skip(self), fields(group_id = self.group_id, member_count = members.len()))]
     pub async fn change_membership(&self, members: Vec<NodeId>) -> Result<()> {
         let set: std::collections::BTreeSet<NodeId> = members.into_iter().collect();
         let total_start = std::time::Instant::now();
@@ -380,8 +379,12 @@ impl OpenRaftNode {
         Ok(())
     }
 
-    #[instrument(level = "debug", skip(self))]
     pub async fn propose(&self, request: Request) -> Result<Response> {
+        let span = crate::observability::optional_span("raft_propose");
+        self.propose_inner(request).instrument(span).await
+    }
+
+    async fn propose_inner(&self, request: Request) -> Result<Response> {
         let t0 = std::time::Instant::now();
         self.check_entry_size(&request)?;
         let estimated_size = request.estimated_serialized_size() as u64;

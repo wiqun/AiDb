@@ -45,8 +45,6 @@ pub(super) use openraft::{
     RaftNetworkFactory, RaftNetworkV2,
 };
 
-pub(super) use tracing::instrument;
-
 pub(super) use crate::cluster::node::OpenRaftNode;
 pub(super) use crate::cluster::storage::OpenRaftStorage;
 pub(super) use crate::cluster::types::{ClusterError, NodeId, Request, Response, TypeConfig};

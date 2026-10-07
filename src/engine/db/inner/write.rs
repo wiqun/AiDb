@@ -190,7 +190,6 @@ impl DB {
         }
     }
 
-    #[tracing::instrument(level = "debug", name = "db_put", skip(self, key, value))]
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         let op_start = std::time::Instant::now();
         self.check_not_closed()?;
@@ -228,7 +227,6 @@ impl DB {
         Ok(())
     }
 
-    #[tracing::instrument(level = "debug", name = "db_delete", skip(self, key))]
     pub fn delete(&self, key: &[u8]) -> Result<()> {
         let op_start = std::time::Instant::now();
         self.check_not_closed()?;
@@ -266,7 +264,6 @@ impl DB {
         Ok(())
     }
 
-    #[tracing::instrument(level = "debug", name = "db_write_batch", skip(self, batch))]
     pub fn write(&self, batch: &WriteBatch) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
@@ -357,7 +354,6 @@ impl DB {
     }
 
     /// 写入 WriteBatch 但不经由 DB 自身的 WAL (适用于 StateMachine 写入, 避免双重 WAL 磁盘开销).
-    #[tracing::instrument(level = "debug", name = "db_write_batch_no_wal", skip(self, batch))]
     pub fn write_without_wal(&self, batch: &WriteBatch) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
@@ -422,7 +418,6 @@ impl DB {
     }
 
     /// 删除 `[start, end)` 半开区间内的全部 user key (RangeTombstone, O(1) 写入).
-    #[tracing::instrument(level = "debug", name = "db_delete_range", skip(self, start, end))]
     pub fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<()> {
         self.check_not_closed()?;
         if start >= end {

@@ -146,11 +146,6 @@ impl MemTable {
         self.rep.approximate_size()
     }
 
-    #[tracing::instrument(level = "debug",
-    name = "mem_put",
-    skip(self, key, value),
-    fields(key_size = key.len(), value_size = value.len())
-  )]
     pub fn put(&self, key: &[u8], value: &[u8], sequence: u64) -> Result<()> {
         check_sequence(sequence)?;
         let ik = InternalKeyBytes(encode_internal_key_arc(key, sequence, ValueType::TypePut));
@@ -162,7 +157,6 @@ impl MemTable {
         Ok(())
     }
 
-    #[tracing::instrument(level = "debug", name = "mem_delete", skip(self, key))]
     pub fn delete(&self, key: &[u8], sequence: u64) -> Result<()> {
         check_sequence(sequence)?;
         let ik = InternalKeyBytes(encode_internal_key_arc(
@@ -178,7 +172,6 @@ impl MemTable {
     }
 
     /// 写入 range tombstone: InternalKey=start, value=end, 半开区间 `[start, end)`.
-    #[tracing::instrument(name = "mem_delete_range", skip(self, start, end))]
     pub fn put_range_delete(&self, start: &[u8], end: &[u8], sequence: u64) -> Result<()> {
         check_sequence(sequence)?;
         let ik = InternalKeyBytes(encode_internal_key_arc(
@@ -238,7 +231,6 @@ impl MemTable {
             .collect())
     }
 
-    #[tracing::instrument(level = "debug", name = "mem_get", skip(self, key))]
     pub fn get(&self, key: &[u8], snapshot_seq: u64) -> Result<Option<Vec<u8>>> {
         let seek_key = encode_internal_key(key, snapshot_seq, ValueType::TypePut);
         match self.search(&seek_key)? {
@@ -257,7 +249,6 @@ impl MemTable {
         }
     }
 
-    #[tracing::instrument(level = "debug", name = "mem_search", skip(self, seek_key))]
     pub fn search(&self, seek_key: &[u8]) -> Result<Option<(Arc<[u8]>, ValueType)>> {
         let bound = InternalKeyBytes::from_slice(seek_key);
         let Some(entry) = self.rep.lower_bound(Bound::Included(&bound)) else {
@@ -286,11 +277,6 @@ impl MemTable {
         }
     }
 
-    #[tracing::instrument(
-    name = "mem_freeze",
-    skip(self),
-    fields(approximate_size = self.approximate_size())
-  )]
     pub fn freeze(self, flush_seq: u64) -> ImmutableMemTable {
         tracing::info!(target: "mem", "mem.freeze");
         if let Some(ref s) = self.stats {

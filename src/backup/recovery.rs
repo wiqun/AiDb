@@ -4,8 +4,6 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use tracing::instrument;
-
 use crate::backup::manager::{BackupId, BackupManifest};
 use crate::backup::storage::BackupStorage;
 use crate::backup::util;
@@ -36,7 +34,6 @@ impl RecoveryManager {
     /// 3. 逐文件恢复到临时目录, 验证 SHA256
     /// 4. 用 DB::open 验证 SSTable 完整性
     /// 5. 原子 rename 临时目录 → 目标目录
-    #[instrument(name = "backup_restore", skip(self), fields(backup_id = id))]
     pub fn restore(&self, id: BackupId, db_path: &Path) -> Result<()> {
         if db_path.exists() {
             let has_files = db_path
@@ -148,7 +145,6 @@ impl RecoveryManager {
     }
 
     /// 校验备份完整性 (不恢复).
-    #[instrument(name = "backup_verify", skip(self), fields(backup_id = id))]
     pub fn verify_backup(&self, id: BackupId) -> Result<bool> {
         let manifest_path = self.storage.backup_path(id).join("backup_manifest.json");
         if !manifest_path.exists() {

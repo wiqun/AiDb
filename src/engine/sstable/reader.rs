@@ -148,12 +148,6 @@ impl SSTableReader {
         self.properties.as_ref()
     }
 
-    #[tracing::instrument(
-    level = "debug",
-    name = "sst_seek",
-    skip(self, seek_key),
-    fields(file_number = self.file_number, level = self.level)
-  )]
     pub fn get(&self, seek_key: &[u8]) -> Result<Option<(Vec<u8>, ValueType)>> {
         let target_user = extract_user_key(seek_key);
 
@@ -165,8 +159,6 @@ impl SSTableReader {
               hit,
               "bloom_check"
             );
-            let _span =
-                tracing::trace_span!("bloom_check", file_number = self.file_number, hit).entered();
             if !hit {
                 if let Some(ref s) = self.stats {
                     s.bloom_useful.fetch_add(1, AtomicOrdering::Relaxed);
@@ -220,12 +212,6 @@ impl SSTableReader {
     }
 
     /// 点查只返回 `ValueType`, 不分配 value `Vec`.
-    #[tracing::instrument(
-    level = "debug",
-    name = "sst_value_type",
-    skip(self, seek_key),
-    fields(file_number = self.file_number, level = self.level)
-  )]
     pub fn value_type(&self, seek_key: &[u8]) -> Result<Option<ValueType>> {
         self.value_type_opt(seek_key, true)
     }

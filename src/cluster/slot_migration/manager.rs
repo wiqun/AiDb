@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::RwLock;
-use tracing::instrument;
 
 use crate::cluster::meta_raft_node::MetaRaftNode;
 use crate::cluster::meta_types::{MetaRequest, SlotMigrationState, SLOT_COUNT};
@@ -194,7 +193,6 @@ impl SlotMigrationManager {
     }
 
     /// Migrating → Frozen. 要求本节点已完成匹配的 execute.
-    #[instrument(skip(self))]
     pub async fn freeze_for_commit(&self) -> Result<()> {
         let (source_group, target_group, slots) = self.current_migration_signature()?;
         self.require_completed_run_matching(source_group, target_group, &slots)?;
@@ -223,7 +221,6 @@ impl SlotMigrationManager {
     }
 
     /// Frozen 后向 target propose 写屏障并短暂稳定观察, 再落盘 quiesce_token.
-    #[instrument(skip(self))]
     pub async fn quiesce_writes(&self) -> Result<()> {
         match self.meta_raft.get_migration_state() {
             Some(SlotMigrationState::Frozen { target_group, .. }) => {
@@ -275,7 +272,6 @@ impl SlotMigrationManager {
     /// (`quiesce_writes` 之后, `final_verify` 之前的收尾前置) —— 两次相隔
     /// `QUIESCE_STABLE_MS` 读到的 tip 相等即认为 drain 完成. tip 在
     /// `MigrationWrite` apply 内单调递增, Frozen 下没有新客户端写会自然稳定.
-    #[instrument(skip(self))]
     pub async fn drain_oplog_tip_stable(&self) -> Result<()> {
         let (source_group, target_group, slots) = match self.meta_raft.get_migration_state() {
             Some(SlotMigrationState::Frozen {
@@ -323,7 +319,6 @@ impl SlotMigrationManager {
     /// 不做 source⊆target 存在性比对, 也不做 PutConditional 补拷.
     /// FIX-0056-A1: 调用顺序上位于 `drain_oplog_tip_stable` 之后 (见
     /// `finish_migration`) —— 本函数不重复校验 tip 是否稳定, 只信任链路顺序.
-    #[instrument(skip(self))]
     pub async fn final_verify(&self) -> Result<()> {
         let (source_group, target_group, slots) = match self.meta_raft.get_migration_state() {
             Some(SlotMigrationState::Frozen {
@@ -352,7 +347,6 @@ impl SlotMigrationManager {
     }
 
     /// Frozen → ReadyToCommit. 要求 quiesce_token 已落盘 (选择 A: Manager 内校验).
-    #[instrument(skip(self))]
     pub async fn mark_ready(&self) -> Result<()> {
         self.final_verify().await?;
         if self.read_quiesce_token().is_none() {
@@ -381,7 +375,6 @@ impl SlotMigrationManager {
 
     /// 完整收尾链: freeze → quiesce → drain_oplog_tip_stable → final_verify
     /// → mark_ready → commit.
-    #[instrument(skip(self))]
     pub async fn finish_migration(&self) -> Result<()> {
         self.freeze_for_commit().await?;
         self.quiesce_writes().await?;
@@ -391,7 +384,6 @@ impl SlotMigrationManager {
         self.commit_migration().await
     }
 
-    #[instrument(skip(self))]
     pub async fn start_migration(
         &self,
         source_group: u64,
@@ -555,7 +547,6 @@ impl SlotMigrationManager {
     /// 1. Meta 相位必须为 `ReadyToCommit` (F-056; Meta validate 是权威, 此处双保险).
     /// 2. `executor` 仍然存在时拒绝 —— target 上必然没有完整拷贝.
     /// 3. 必须存在匹配 `(source, target, slots)` 且 `completed` 的 run record.
-    #[instrument(skip(self))]
     pub async fn commit_migration(&self) -> Result<()> {
         let (source_group, target_group, slots) = self.current_migration_signature()?;
 
@@ -597,7 +588,6 @@ impl SlotMigrationManager {
     ///
     /// F-056: Ready/Frozen 下读可能已指向 target; 必须先 Cancel 让读回 source,
     /// 再 `cleanup_target_residuals`, 避免读空洞.
-    #[instrument(skip(self))]
     pub async fn cancel_migration(&self) -> Result<()> {
         let (_source_group, target_group, slots) = self.current_migration_signature()?;
 

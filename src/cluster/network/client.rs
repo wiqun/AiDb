@@ -1,6 +1,6 @@
 use super::{
-    instrument, raft_rpc, timeout, vote_from_wire, AppendEntriesRequest, AppendEntriesResponse,
-    Arc, ClusterError, DashMap, Duration, Error, NetworkError, NodeId, RPCError, RPCOption,
+    raft_rpc, timeout, vote_from_wire, AppendEntriesRequest, AppendEntriesResponse, Arc,
+    ClusterError, DashMap, Duration, Error, NetworkError, NodeId, RPCError, RPCOption,
     RaftNetworkV2, RaftServiceClient, Request, Response, Result, SnapshotResponse, TonicRequest,
     TypeConfig, Unreachable, VoteRequest, VoteResponse,
 };
@@ -284,7 +284,6 @@ impl RaftNetworkClient {
 impl RaftNetworkV2<TypeConfig> for RaftNetworkClient {
     type SnapshotData = std::io::Cursor<Vec<u8>>;
 
-    #[instrument(level = "debug", name = "raft_rpc_ae", skip(self, rpc, _option))]
     async fn append_entries(
         &mut self,
         rpc: AppendEntriesRequest<TypeConfig>,
@@ -387,11 +386,6 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkClient {
         }
     }
 
-    #[instrument(
-        level = "debug",
-        name = "raft_rpc_full_snapshot",
-        skip(self, vote, snapshot, cancel, _option)
-    )]
     async fn full_snapshot(
         &mut self,
         vote: openraft::alias::VoteOf<TypeConfig>,
@@ -491,7 +485,6 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkClient {
         })
     }
 
-    #[instrument(level = "debug", name = "raft_rpc_vote", skip(self, rpc, _option))]
     async fn vote(
         &mut self,
         rpc: VoteRequest<TypeConfig>,

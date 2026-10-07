@@ -128,7 +128,6 @@ impl DB {
         Arc::clone(&self.stats)
     }
 
-    #[tracing::instrument(name = "db_open", skip(path, options), fields(path = %path.as_ref().display()))]
     pub fn open(path: impl AsRef<Path>, options: Options) -> Result<Arc<Self>> {
         options.validate()?;
 
@@ -542,7 +541,6 @@ impl DB {
         Ok(())
     }
 
-    #[tracing::instrument(name = "db_close", skip(self))]
     pub fn close(&self) -> Result<()> {
         if self.closed.load(AtomicOrdering::Acquire) {
             return Ok(());

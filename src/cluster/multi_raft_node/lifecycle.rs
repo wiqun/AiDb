@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 use tokio::sync::watch;
-use tracing::instrument;
 
 use openraft::type_config::async_runtime::WatchReceiver;
 
@@ -446,7 +445,6 @@ impl MultiRaftNode {
     ///
     /// 注意: 此方法**不**调用 `meta_raft.propose(ChangeGroupMembership)` —
     /// MetaRaft 元数据已经是期望状态, 此方法只执行 Raft 层面的操作.
-    #[instrument(skip(groups, cluster_meta))]
     async fn apply_membership_change(
         group_id: u64,
         expected: &BTreeSet<NodeId>,

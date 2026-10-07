@@ -283,7 +283,6 @@ impl VersionSet {
         self.next_file_number.fetch_add(1, Ordering::SeqCst)
     }
 
-    #[tracing::instrument(name = "cmp_apply", skip(self, edit))]
     pub fn apply_edit(&mut self, edit: &VersionEdit) -> Result<()> {
         write_manifest_record(&mut self.manifest_file, edit)?;
         self.manifest_file.flush()?;

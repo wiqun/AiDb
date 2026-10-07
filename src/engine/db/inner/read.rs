@@ -12,7 +12,6 @@ use crate::statistics::DbOp;
 use std::sync::Arc;
 
 impl DB {
-    #[tracing::instrument(level = "debug", name = "db_get", skip(self, key))]
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let op_start = std::time::Instant::now();
         self.check_not_closed()?;
@@ -232,7 +231,6 @@ impl DB {
         })
     }
 
-    #[tracing::instrument(name = "db_snapshot", skip(self))]
     pub fn snapshot(self: &Arc<Self>) -> Result<Snapshot> {
         self.check_not_closed()?;
         let _guard = self.write_lock.lock();
@@ -252,7 +250,6 @@ impl DB {
         let snapshot_id = self.snapshots.register(seq);
         drop(_guard);
         self.stats.operations[DbOp::Snapshot as usize].fetch_add(1, AtomicOrdering::Relaxed);
-        tracing::Span::current().record("sequence", seq);
         tracing::debug!(target: "db", sequence = seq, id = snapshot_id, "db.snapshot.create");
         Ok(Snapshot::new(Arc::clone(self), seq, snapshot_id))
     }
@@ -275,7 +272,6 @@ impl DB {
         ))
     }
 
-    #[tracing::instrument(level = "debug", name = "db_scan", skip(self, start, end))]
     pub fn scan(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<DbIterGuard> {
         self.check_not_closed()?;
         let seq = crate::engine::memtable::K_MAX_SEQUENCE;

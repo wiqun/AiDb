@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use parking_lot::RwLock;
 use tokio::sync::watch;
-use tracing::instrument;
 
 use openraft::rt::instant::Instant;
 
@@ -126,7 +125,6 @@ impl LeaderChangeWatcher {
 
     /// Execute one detection pass. Returns the set of group IDs whose
     /// leader changed since the last tick.
-    #[instrument(name = "leader_watch_tick", skip(self), fields(node_id = %self.node_id))]
     pub async fn tick(&self) -> Vec<u64> {
         // Collect group references first (under lock), then release the lock
         // before any .await to avoid deadlocks (parking_lot guards are not Send).
@@ -260,9 +258,6 @@ impl LeaderChangeWatcher {
     /// Propose a ChangeGroupMembership to update is_leader in MetaRaft.
     /// Returns `true` on success, `false` if the proposal should be retried.
     async fn update_meta_replica_info(&self, group_id: u64, new_leader_id: NodeId) -> bool {
-        tracing::Span::current().record("group_id", group_id);
-        tracing::Span::current().record("new_leader_id", new_leader_id);
-
         // 注册全部节点 RPC 地址, 确保 ForwardToLeader 可达 MetaRaft leader.
         let cluster_meta = self.meta_raft.get_cluster_meta();
         for (nid, node) in &cluster_meta.nodes {
@@ -335,7 +330,6 @@ impl LeaderChangeWatcher {
     /// Background run loop. Spawn as a tokio task.
     ///
     /// Exits when `shutdown_rx` signals.
-    #[instrument(skip(self))]
     pub async fn run(&self, mut shutdown_rx: watch::Receiver<bool>) {
         tracing::info!(
             node_id = %self.node_id,

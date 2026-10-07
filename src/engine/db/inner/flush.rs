@@ -15,8 +15,9 @@ impl DB {
         self.do_flush_with_span()
     }
 
-    #[tracing::instrument(name = "db_flush", skip(self))]
     fn do_flush_with_span(&self) -> Result<()> {
+        let span = crate::observability::optional_span("db_flush");
+        let _enter = span.enter();
         self.do_flush()
     }
 
@@ -78,7 +79,6 @@ impl DB {
         Ok(flushed)
     }
 
-    #[tracing::instrument(name = "db_flush_sst", skip(self, table))]
     fn flush_memtable_to_sstable(&self, table: &MemTable) -> Result<()> {
         let flush_start = std::time::Instant::now();
         let mut count = 0u64;

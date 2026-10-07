@@ -42,7 +42,6 @@ pub struct Reader {
 
 impl Reader {
     /// 打开 WAL 文件进行读取
-    #[tracing::instrument(skip(path))]
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path)?;
         Ok(Reader {
@@ -53,7 +52,6 @@ impl Reader {
     }
 
     /// 打开 WAL 文件进行读取 (strict 模式: CRC 损坏返回 CorruptionFatal)
-    #[tracing::instrument(skip(path))]
     pub fn open_strict(path: &Path) -> Result<Self> {
         let file = File::open(path)?;
         Ok(Reader {
@@ -75,7 +73,6 @@ impl Reader {
     /// 顺序读取一条 Record.
     ///
     /// 返回 `ReadStatus` 区分正常记录、文件尾部、CRC 损坏等.
-    #[tracing::instrument(skip(self))]
     pub fn read_record(&mut self) -> Result<ReadStatus> {
         // 检查是否需要跳过 block trailer padding
         if self.block_offset + HEADER_SIZE > BLOCK_SIZE {

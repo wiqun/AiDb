@@ -90,7 +90,6 @@ pub fn read_block_from_file(file: &std::fs::File, handle: &BlockHandle) -> Resul
     parse_block_bytes(&raw, handle)
 }
 
-#[tracing::instrument(level = "debug", name = "sst_block_read", skip(file, handle), fields(block_size = handle.size))]
 fn read_block_from_file_traced(file: &std::fs::File, handle: &BlockHandle) -> Result<Vec<u8>> {
     read_block_from_file(file, handle)
 }

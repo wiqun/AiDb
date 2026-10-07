@@ -151,7 +151,7 @@ SSTable 一经生成即为只读不可变文件. `Checkpoint` 在强制 Flush �
 
 ### 为什么使用 tracing 而非 log crate?
 
-`tracing` 提供结构化 Span 上下文, 支持零成本静态过滤. 热路径埋点设为 `level = "debug"`, 在生产 `RUST_LOG=info` 下零性能开销; 同时支持跨线程与跨异步上下文追踪.
+`tracing` 提供结构化 Span 上下文. 只允许 `db_flush`, `cmp_run`, `raft_propose`, 且采样关闭时不创建.
 
 ### 库内指标注册而非自建 HTTP Exporter
 

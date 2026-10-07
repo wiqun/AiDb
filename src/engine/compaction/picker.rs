@@ -59,7 +59,6 @@ impl CompactionPicker {
         level.iter().map(|r| r.file_size()).sum()
     }
 
-    #[tracing::instrument(name = "cmp_pick", skip(self, levels))]
     pub fn pick_compaction(&self, levels: &[Vec<Arc<SSTableReader>>]) -> Option<CompactionTask> {
         if levels.is_empty() {
             return None;

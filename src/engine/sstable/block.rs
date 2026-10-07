@@ -192,7 +192,6 @@ impl BlockIterator {
     }
 
     /// 线性扫描直到 `key >= target` (InternalKey 比较).
-    #[tracing::instrument(level = "debug", name = "sst_block_seek", skip(self, target))]
     pub fn seek(&mut self, target: &[u8]) {
         if self.block.num_restarts == 0 {
             self.valid = false;

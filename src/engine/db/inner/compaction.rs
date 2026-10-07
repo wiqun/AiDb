@@ -57,6 +57,8 @@ impl DB {
             Some(t) => t,
             None => return Ok(false),
         };
+        let span = crate::observability::optional_span("cmp_run");
+        let _enter = span.enter();
         self.stats.compaction_phases[CompactionPhase::Pick as usize]
             .fetch_add(1, AtomicOrdering::Relaxed);
         self.stats.compaction_durations[CompactionPhase::Pick as usize]
@@ -351,11 +353,6 @@ pub(super) fn compaction_background_loop(
         let Some(db) = weak.upgrade() else {
             break;
         };
-        let pending = db
-            .compaction_picker
-            .pick_compaction(&db.sstables.read().iter().cloned().collect::<Vec<_>>())
-            .is_some();
-        let _bg = tracing::debug_span!("cmp_background", pending).entered();
         match db.run_compaction_once() {
             Ok(true) => continue,
             Ok(false) => {

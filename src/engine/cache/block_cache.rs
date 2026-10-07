@@ -214,12 +214,6 @@ impl BlockCache {
         cache
     }
 
-    #[tracing::instrument(
-    level = "debug",
-    name = "cache_get",
-    skip(self),
-    fields(file_number = key.file_number, offset = key.offset, hit)
-  )]
     pub fn get(&self, key: CacheKey) -> Option<Bytes> {
         self.lookups.fetch_add(1, Ordering::Relaxed);
         if self.capacity_per_shard == 0 {
@@ -227,7 +221,6 @@ impl BlockCache {
             if let Some(ref s) = self.stats {
                 s.block_cache_misses.fetch_add(1, Ordering::Relaxed);
             }
-            tracing::Span::current().record("hit", false);
             tracing::debug!(target: "cache", "cache.miss");
             return None;
         }
@@ -260,7 +253,6 @@ impl BlockCache {
             if let Some(ref s) = self.stats {
                 s.block_cache_hits.fetch_add(1, Ordering::Relaxed);
             }
-            tracing::Span::current().record("hit", true);
             tracing::debug!(target: "cache", "cache.hit");
             Some(result)
         } else {
@@ -269,18 +261,11 @@ impl BlockCache {
             if let Some(ref s) = self.stats {
                 s.block_cache_misses.fetch_add(1, Ordering::Relaxed);
             }
-            tracing::Span::current().record("hit", false);
             tracing::debug!(target: "cache", "cache.miss");
             None
         }
     }
 
-    #[tracing::instrument(
-    level = "debug",
-    name = "cache_insert",
-    skip(self, value),
-    fields(file_number = key.file_number, offset = key.offset, bytes = value.len())
-  )]
     pub fn insert(&self, key: CacheKey, value: Bytes) {
         if self.capacity_per_shard == 0 {
             return;

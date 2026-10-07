@@ -14,7 +14,6 @@ use std::sync::Arc;
 impl DB {
     /// 完整存在性判定: key 在当前 sequence 下是否可见为 Put (不物化 Value).
     /// 此为用户公开 API，走用户读口径（记入 block_read_bytes，计入 BlockCache）。
-    #[tracing::instrument(level = "debug", name = "db_key_exists", skip(self, key))]
     pub fn key_exists(&self, key: &[u8]) -> Result<bool> {
         self.check_not_closed()?;
         Self::validate_user_key(key)?;

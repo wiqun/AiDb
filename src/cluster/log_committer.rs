@@ -23,7 +23,6 @@ use openraft::vote::leader_id_std::{CommittedLeaderId, LeaderId};
 use openraft::{LogId, Vote};
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot};
-use tracing::instrument;
 
 use crate::cluster::pending_log::PendingLogOverlay;
 use crate::cluster::types::TypeConfig;
@@ -248,7 +247,6 @@ pub(crate) fn spawn_committer(
     handle
 }
 
-#[instrument(skip(rx, db, metrics, _fatal, overlay), fields(group_id))]
 async fn run_committer(
     group_id: u64,
     db: Arc<DB>,

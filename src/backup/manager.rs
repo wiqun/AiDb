@@ -7,7 +7,6 @@ use std::time::Instant;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use tracing::instrument;
 
 use crate::backup::storage::BackupStorage;
 use crate::backup::util;
@@ -162,7 +161,6 @@ impl BackupManager {
             })
     }
 
-    #[instrument(name = "backup_create", skip(self, db), fields(backup_id))]
     fn create_backup_inner(
         &self,
         db: &DB,
@@ -257,8 +255,6 @@ impl BackupManager {
         // 应用保留策略
         self.apply_retention_policy()?;
 
-        tracing::Span::current().record("backup_id", backup_id);
-
         let stats = self.stats.clone().unwrap_or_else(|| db.statistics());
         stats.backup_total[BackupOp::Create as usize].fetch_add(1, Ordering::Relaxed);
         stats
@@ -279,7 +275,6 @@ impl BackupManager {
         Ok(backup_id)
     }
 
-    #[instrument(name = "backup_list", skip(self))]
     pub fn list_backups(&self) -> Result<Vec<BackupMetadata>> {
         let entries = self.storage.list("backup_")?;
         let mut backups = Vec::new();
@@ -312,7 +307,6 @@ impl BackupManager {
         Ok(manifest.metadata)
     }
 
-    #[instrument(name = "backup_delete", skip(self), fields(backup_id = id))]
     pub fn delete_backup(&self, id: BackupId) -> Result<()> {
         let path = self.storage.backup_path(id);
         let result = self.storage.delete(&path);
@@ -323,7 +317,6 @@ impl BackupManager {
         result
     }
 
-    #[instrument(name = "backup_retention", skip(self))]
     pub fn apply_retention_policy(&self) -> Result<Vec<BackupId>> {
         let backups = self.list_backups()?;
         let to_delete = self.policy.select_for_deletion(&backups);

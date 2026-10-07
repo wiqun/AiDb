@@ -86,7 +86,6 @@ pub struct WALManager {
 
 impl WALManager {
     /// 打开或创建 WAL 目录
-    #[tracing::instrument(name = "wal_open", skip(path, options))]
     pub fn open(
         path: &Path,
         next_file_number: u64,
@@ -192,7 +191,6 @@ impl WALManager {
     }
 
     /// 追加一条编码后的 WalEntry 到当前活跃 WAL
-    #[tracing::instrument(level = "debug", name = "wal_write", skip(self, data))]
     pub fn append(&mut self, data: &[u8]) -> Result<()> {
         self.append_record(data)?;
         self.maybe_auto_rotate()?;
@@ -250,21 +248,18 @@ impl WALManager {
     }
 
     /// 刷新当前 WAL 缓冲区
-    #[tracing::instrument(level = "debug", name = "wal_flush", skip(self))]
     pub fn flush(&mut self) -> Result<()> {
         self.writer.flush()?;
         Ok(())
     }
 
     /// fsync 当前 WAL
-    #[tracing::instrument(level = "debug", name = "wal_sync", skip(self))]
     pub fn sync(&mut self) -> Result<()> {
         self.writer.sync_data()?;
         Ok(())
     }
 
     /// 轮转到新 WAL 文件: 关闭旧文件, 创建新文件, 写入 FileHeader
-    #[tracing::instrument(name = "wal_rotate", skip(self))]
     pub fn rotate(&mut self, next_sequence: u64) -> Result<()> {
         tracing::debug!(target: "wal", "wal.rotate: old={} new={}", self.file_number, self.file_number + 1);
         // 关闭当前 WAL (sync + 记录元数据)
@@ -306,7 +301,6 @@ impl WALManager {
     }
 
     /// 关闭当前 WAL
-    #[tracing::instrument(name = "wal_close", skip(self))]
     pub fn close(&mut self) -> Result<()> {
         // 在文件末尾写入自校验 trailer: max_seq (8B) || !max_seq (8B)
         // 替代原有的 CRC 回填两步操作, 消除 CRC 重算的崩溃窗口.
@@ -328,7 +322,6 @@ impl WALManager {
     }
 
     /// 计算可清理的 WAL 文件 (max_seq < watermark), 删除并返回删除列表
-    #[tracing::instrument(name = "wal_cleanup", skip(self))]
     pub fn cleanup(&mut self, watermark: u64) -> Result<Vec<u64>> {
         let mut removed = Vec::new();
         let mut remaining = Vec::new();
@@ -404,7 +397,6 @@ impl WALManager {
     }
 
     /// 从所有 WAL 文件恢复 WalEntry
-    #[tracing::instrument(name = "wal_replay", skip(path, options))]
     pub fn recover(path: &Path, options: Arc<Options>) -> Result<RecoveryResult> {
         let mut all_entries = Vec::new();
         let mut max_sequence: u64 = 0;

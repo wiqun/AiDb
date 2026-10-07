@@ -109,7 +109,6 @@ impl MergeIterator {
         })
     }
 
-    #[tracing::instrument(level = "debug", name = "cmp_merge", skip(self))]
     pub fn next_entry(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         while let Some(entry) = self.heap.pop() {
             if let Some(ref end) = self.range_end {

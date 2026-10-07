@@ -221,7 +221,6 @@ impl CompactionJob {
     /// `file_numbers` 中元素个数表示分裂数: 1 = 不分裂, N = N 个子任务.
     /// 每个子任务使用 `file_numbers[i]` 作为输出文件编号.
     /// 调用方需预先分配所有文件编号, 避免并发分配冲突.
-    #[tracing::instrument(name = "cmp_run", skip(self))]
     pub fn run(&self, file_numbers: &[u64]) -> Result<Vec<CompactionResult>> {
         if file_numbers.len() <= 1 {
             let fnum = file_numbers.first().copied().unwrap_or(0);

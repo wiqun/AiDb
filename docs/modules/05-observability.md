@@ -23,7 +23,7 @@ description: AiDb 可观测性 — OTel 指标 (monitoring feature)、tracing sp
 | `src/lib.rs` | `#[cfg(feature = "monitoring")] pub mod metrics` 声明 | — |
 | `tests/common/observability.rs` | `EventCatcher`、tracing 捕获与测试锁 | 跨模块 tracing 验收 |
 | `tests/metrics.rs` | cache / bloom / DB histogram 指标导出测试 (InMemory exporter) | `--test metrics` |
-| `tests/span_contract.rs` | 热路径 span `level = "debug"` 静态源码扫描契约测试 | `--test span_contract` |
+| `tests/span_contract.rs` | 只允许 `db_flush`, `cmp_run`, `raft_propose` 的源码扫描 | `--test span_contract` |
 
 **嵌入集成机制**: 下游应用 (AiKv) 设置全局 `MeterProvider` 后调用 `aidb::metrics::init()`; 与上层业务指标共用 OTLP 导出管道, 由 Collector 转发至 Prometheus / Grafana.
 
@@ -99,24 +99,18 @@ flowchart LR
 
 ## Tracing Span 索引
 
-| 模块域 | Instrument Span 名 | 主要 Event (`target`) |
+| 模块域 | Span 名 | 主要 Event (`target`) |
 | --- | --- | --- |
-| **WAL** | `wal_open`, `wal_write`, `wal_replay` | `wal`: `wal.write.*`, `wal.sync.*` |
-| **MemTable** | `mem_put`, `mem_get`, `mem_freeze` | `mem`: `mem.put`, `mem.get.hit/miss` |
-| **SSTable** | `sst_seek`, `sst_block_read`, `sst_build_add` | `sst`: `sst.seek.result`; `bloom_build` |
-| **Cache** | `cache_get`, `cache_insert` | — |
-| **DB 核心** | `db_open`, `db_put`, `db_get`, `db_scan`, `db_flush`, `db_close` | `db`: `db.put`, `db.get.result`, `db.flush.complete` |
-| **Compaction** | `cmp_pick`, `cmp_run`, `cmp_merge`, `cmp_apply` | — |
-| **Checkpoint** | `bgsave_checkpoint` | `db`: `checkpoint.create.complete` |
-| **Backup** | `backup_create`, `backup_restore`, `backup_list`, `backup_delete` | — |
-| **Raft 存储** | `raft_save_vote`, `raft_recv_snapshot`, `raft_install_snapshot` | `raft_append_log` (`target: "perf"`) |
-| **Raft RPC** | `raft_rpc_ae`, `raft_rpc_vote`, `raft_rpc_full_snapshot` | — |
-| **Meta 控制面**| `meta_propose`, `meta_apply`, `meta_slot_query` | — |
+| **DB 核心** | `db_flush` | `db`: `db.flush.complete` |
+| **Compaction** | `cmp_run` | `cmp`: `compaction start`, `compaction end` |
+| **Raft propose** | `raft_propose` | `forward retry` |
 
-### 热路径 Span 级别硬约束
+只允许这三个 span. 采样率为 0 或未配置 OTLP 端点时不创建它们. block 解码, WAL 记录, get, put, backup 和 Raft RPC 没有 span.
 
-- **约束原则**: 生产环境默认 `RUST_LOG=info`. 为防止高频热路径 (put/get/scan/wal/block/raft RPC 等) 产生海量无用 Span 拖慢性能, 热路径 `#[tracing::instrument]` **必须显式声明 `level = "debug"`**.
-- **契约测试保障**: 通过 `tests/span_contract.rs` 源码静态 AST 扫描强制执行该约束, 违反规则将直接导致 CI 报错:
+### Span 允许名单
+
+- **约束原则**: 除 `db_flush`, `cmp_run`, `raft_propose` 外不得创建 span.
+- **契约测试保障**: `tests/span_contract.rs` 扫描源码, 出现 `#[instrument]` 或其他 span 名字时失败:
 
 ```bash
 cargo test --test span_contract -- --test-threads=1
@@ -164,7 +158,7 @@ cargo test --test span_contract -- --test-threads=1
 | 测试集 | 覆盖 |
 | --- | --- |
 | `tests/metrics.rs` | BlockCache 命中/未命中 Counter、Bloom 假阳性 Counter、DB 操作与 Flush 耗时 Histogram |
-| `tests/span_contract.rs` | 源码扫描契约: 强制校验所有热路径 Span 必须为 Debug 级别 |
+| `tests/span_contract.rs` | 源码扫描契约: 只允许 `db_flush`, `cmp_run`, `raft_propose` |
 
 ## 已知限制
 
