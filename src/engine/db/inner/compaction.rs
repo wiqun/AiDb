@@ -102,7 +102,8 @@ impl DB {
             .chain(task.expanded_inputs.iter())
             .map(|f| f.file_number())
             .collect();
-        let surviving = deeper_and_sibling_user_ranges(&levels, task.output_level, &consumed);
+        let start = surviving_start_level(task.level, task.output_level);
+        let surviving = deeper_and_sibling_user_ranges(&levels, start, &consumed);
         let results = CompactionJob::new(
             task.inputs.clone(),
             task.expanded_inputs.clone(),
@@ -360,6 +361,10 @@ pub(super) fn compaction_background_loop(
     }
 }
 
+pub(crate) fn surviving_start_level(source_level: usize, _output_level: usize) -> usize {
+    source_level
+}
+
 pub(crate) fn deeper_and_sibling_user_ranges(
     levels: &[Vec<Arc<SSTableReader>>],
     output_level: usize,
@@ -388,7 +393,7 @@ pub(crate) fn deeper_and_sibling_user_ranges(
 
 #[cfg(test)]
 mod tests {
-    use super::deeper_and_sibling_user_ranges;
+    use super::{deeper_and_sibling_user_ranges, surviving_start_level};
     use crate::config::CompressionType;
     use crate::engine::memtable::{encode_internal_key, ValueType};
     use crate::engine::sstable::{sstable_path, SSTableBuilder, SSTableReader};
@@ -421,5 +426,19 @@ mod tests {
         assert!(starts.contains(&b"m".to_vec()));
         assert!(starts.contains(&b"z".to_vec()));
         assert!(!starts.iter().any(|s| s == b"a"));
+    }
+
+    #[test]
+    fn source_level_sibling_survives_when_output_is_deeper() {
+        let dir = tempdir().unwrap();
+        let mut levels = vec![Vec::new(), Vec::new(), Vec::new()];
+        levels[1].push(one_key(dir.path(), 10, 1, b"a"));
+        levels[1].push(one_key(dir.path(), 11, 1, b"m"));
+        levels[2].push(one_key(dir.path(), 20, 2, b"z"));
+        let from_source = deeper_and_sibling_user_ranges(&levels, 1, &[10]);
+        let from_output = deeper_and_sibling_user_ranges(&levels, 2, &[10]);
+        assert!(from_source.iter().any(|r| r.start == b"m"));
+        assert!(!from_output.iter().any(|r| r.start == b"m"));
+        assert_eq!(surviving_start_level(1, 2), 1);
     }
 }

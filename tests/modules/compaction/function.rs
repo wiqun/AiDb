@@ -223,6 +223,57 @@ fn delete_marker_drops_when_nothing_survives() {
 }
 
 #[test]
+fn delete_marker_stays_when_newer_than_snapshot() {
+    let dir = tempdir().unwrap();
+    let input = sst(
+        dir.path(),
+        1,
+        0,
+        &[
+            (b"b", 2, ValueType::TypeDelete, b""),
+            (b"b", 1, ValueType::TypePut, b"old"),
+        ],
+    );
+    let job = level1_job(dir.path(), input).with_snapshot_threshold(1);
+    let results = job.run(&[10]).unwrap();
+    assert_eq!(results[0].entry_count, 2);
+    let markers = output_markers(&results[0].output_path);
+    assert!(markers
+        .iter()
+        .any(|(uk, ty, _)| uk == b"b" && *ty == ValueType::TypeDelete));
+    assert!(markers
+        .iter()
+        .any(|(uk, ty, val)| uk == b"b" && *ty == ValueType::TypePut && val == b"old"));
+}
+
+#[test]
+fn dropped_range_delete_hides_key_in_later_split() {
+    let dir = tempdir().unwrap();
+    let input = sst(
+        dir.path(),
+        1,
+        0,
+        &[
+            (b"a", 2, ValueType::TypeRangeDelete, b"z"),
+            (b"m", 1, ValueType::TypePut, b"v"),
+        ],
+    );
+    let results = level1_job(dir.path(), input).run(&[10, 11]).unwrap();
+    for result in &results {
+        if result.entry_count == 0 {
+            continue;
+        }
+        let markers = output_markers(&result.output_path);
+        assert!(
+            !markers
+                .iter()
+                .any(|(uk, ty, _)| uk == b"m" && *ty == ValueType::TypePut),
+            "later split wrote the covered put"
+        );
+    }
+}
+
+#[test]
 fn delete_marker_bottom_keeps_when_snapshot_can_see() {
     let dir = tempdir().unwrap();
     let input = sst(dir.path(), 1, 0, &[(b"b", 4, ValueType::TypeDelete, b"")]);

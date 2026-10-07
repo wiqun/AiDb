@@ -535,9 +535,13 @@ fn write_sub_compaction(
         let value_type = extract_value_type(&key)?;
         let seq = extract_sequence(&key)?;
 
-        // 跳过 range_start 之前的条目 (由前一个子任务处理)
+        // 跳过 range_start 之前的条目 (由前一个子任务处理).
+        // 起点在本段之前、终点伸进本段的范围删除仍要记进 tracker, 否则标记被丢掉后本段的 key 会写出来.
         if let Some(ref start) = range_start {
-            if user_key < &start[..] {
+            if user_key < start.as_slice() {
+                if value_type == ValueType::TypeRangeDelete && value.as_slice() > start.as_slice() {
+                    range_tracker.add(user_key.to_vec(), value.clone(), seq);
+                }
                 continue;
             }
         }

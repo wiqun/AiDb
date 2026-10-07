@@ -109,7 +109,13 @@ impl DB {
         self.get_from_sstables(key, max_seq)
     }
 
-    fn max_range_seq_across_indexes(&self, key: &[u8], max_seq: u64) -> Option<u64> {
+    fn max_range_seq_across_indexes(
+        &self,
+        l0: &[Arc<SSTableReader>],
+        l1_plus: &[Vec<Arc<SSTableReader>>],
+        key: &[u8],
+        max_seq: u64,
+    ) -> Option<u64> {
         let mut records = Vec::new();
         if let Ok(found) = self.memtable.read().collect_range_tombstones() {
             push_range_records(&mut records, found);
@@ -119,7 +125,10 @@ impl DB {
                 push_range_records(&mut records, found);
             }
         }
-        for level in self.sstables.read().iter() {
+        for reader in l0 {
+            push_range_records(&mut records, reader.collect_range_tombstones());
+        }
+        for level in l1_plus {
             for reader in level {
                 push_range_records(&mut records, reader.collect_range_tombstones());
             }
@@ -207,7 +216,12 @@ impl DB {
                 absorb_point(reader.point_state(key, max_seq)?);
             }
         }
-        absorb_range(self.max_range_seq_across_indexes(key, max_seq));
+        absorb_range(self.max_range_seq_across_indexes(
+            &l0_readers,
+            &l1_plus_readers,
+            key,
+            max_seq,
+        ));
 
         let tombstone = match (best_delete, best_range) {
             (Some(d), Some(r)) => Some(d.max(r)),

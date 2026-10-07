@@ -24,7 +24,10 @@ pub fn should_drop_delete_marker(
     ) {
         return false;
     }
-    if min_snapshot_sequence != u64::MAX && sequence <= min_snapshot_sequence {
+    let _ = sequence;
+    // 只要还有快照, 删除标记先留下. 比快照更新的删除若被丢掉,
+    // 同 key 更老的版本仍会写出, 当前读会看到已删除的值.
+    if min_snapshot_sequence != u64::MAX {
         return false;
     }
     let overlaps = surviving
