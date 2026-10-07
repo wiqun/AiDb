@@ -494,9 +494,9 @@ impl WALManager {
                                         &mut batch_needed,
                                         &mut batch_count,
                                     );
+                                } else {
+                                    note_wal_fragment_discarded();
                                 }
-                                // 若 pending_fragments 为 None, 孤立 Last — 丢弃
-                                note_wal_fragment_discarded();
                             }
                             RecordType::Full => {
                                 pending_fragments = None;
@@ -763,6 +763,43 @@ mod tests {
         assert_eq!(parse_wal_filename("other.log"), None);
         assert_eq!(parse_wal_filename("wal_abc.log"), None);
         assert_eq!(parse_wal_filename("wal_1.txt"), None);
+    }
+
+    #[test]
+    fn reassembled_wal_fragment_does_not_warn() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::prelude::*;
+        use tracing_subscriber::Registry;
+
+        let dir = tempdir().unwrap();
+        let mut mgr = WALManager::open(dir.path(), 1, 100, test_options()).unwrap();
+        let entry = WalEntry {
+            sequence: 100,
+            op_type: OpType::TypePut,
+            has_value: true,
+            key: b"k".to_vec(),
+            value: Some(vec![1u8; crate::engine::wal::writer::BLOCK_SIZE]),
+        };
+        mgr.append(&entry.encode()).unwrap();
+        mgr.sync().unwrap();
+        mgr.close().unwrap();
+        drop(mgr);
+
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let layer = DiscardLayer {
+            hits: Arc::clone(&hits),
+        };
+        let result = tracing::subscriber::with_default(Registry::default().with(layer), || {
+            WALManager::recover(dir.path(), test_options()).unwrap()
+        });
+        assert_eq!(result.entries.len(), 1);
+        let discards = hits
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|hit| hit.1 == "wal fragment discarded")
+            .count();
+        assert_eq!(discards, 0);
     }
 
     #[test]
