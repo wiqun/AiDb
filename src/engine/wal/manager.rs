@@ -504,6 +504,7 @@ impl WALManager {
                                     );
                                 }
                                 // 若 pending_fragments 为 None, 孤立 Last — 丢弃
+                                note_wal_fragment_discarded();
                             }
                             RecordType::Full => {
                                 pending_fragments = None;
@@ -519,6 +520,9 @@ impl WALManager {
                         }
                     }
                     ReadStatus::Eof => {
+                        if pending_fragments.is_some() {
+                            note_wal_fragment_discarded();
+                        }
                         // 若 batch 未完成, 回滚
                         if let Some(batch_pos) = batch_start {
                             all_entries.truncate(batch_pos);
@@ -626,11 +630,16 @@ fn current_timestamp() -> u64 {
         .as_secs()
 }
 
+fn note_wal_fragment_discarded() {
+    tracing::warn!(target: "wal", "wal fragment discarded");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Options;
     use tempfile::tempdir;
+    use tracing::Subscriber;
 
     fn test_options() -> Arc<Options> {
         Arc::new(Options::for_testing())
@@ -762,5 +771,72 @@ mod tests {
         assert_eq!(parse_wal_filename("other.log"), None);
         assert_eq!(parse_wal_filename("wal_abc.log"), None);
         assert_eq!(parse_wal_filename("wal_1.txt"), None);
+    }
+
+    #[test]
+    fn wal_fragment_discard_warns_without_bytes() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::prelude::*;
+        use tracing_subscriber::Registry;
+
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let layer = DiscardLayer {
+            hits: Arc::clone(&hits),
+        };
+        tracing::subscriber::with_default(Registry::default().with(layer), || {
+            super::note_wal_fragment_discarded();
+        });
+        let hits = hits.lock().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, tracing::Level::WARN);
+        assert_eq!(hits[0].1, "wal fragment discarded");
+        assert!(!hits[0].2.contains("data"));
+    }
+
+    struct DiscardLayer {
+        hits: std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String, String)>>>,
+    }
+
+    impl<S: Subscriber> tracing_subscriber::Layer<S> for DiscardLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut message = String::new();
+            let mut fields = String::new();
+            event.record(&mut Grab {
+                message: &mut message,
+                fields: &mut fields,
+            });
+            self.hits
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), message, fields));
+        }
+    }
+
+    struct Grab<'a> {
+        message: &'a mut String,
+        fields: &'a mut String,
+    }
+
+    impl tracing::field::Visit for Grab<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                *self.message = format!("{value:?}").trim_matches('"').to_string();
+            } else {
+                self.fields
+                    .push_str(&format!("{}={value:?} ", field.name()));
+            }
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                *self.message = value.to_string();
+            } else {
+                self.fields.push_str(&format!("{}={value} ", field.name()));
+            }
+        }
     }
 }

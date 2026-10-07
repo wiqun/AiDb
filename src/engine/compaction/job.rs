@@ -335,13 +335,6 @@ impl CompactionJob {
         }
 
         let file_size = builder.finish()?;
-        let files_merged = self.inputs.len() + self.expanded_inputs.len();
-        tracing::info!(
-            level = self.output_level,
-            files_merged,
-            bytes_written = file_size,
-            "compaction_complete"
-        );
         Ok(CompactionResult {
             file_number,
             entry_count,

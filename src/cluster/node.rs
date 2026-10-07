@@ -434,6 +434,11 @@ impl OpenRaftNode {
                                         "forward propose to leader failed, will retry"
                                     );
                                     if attempt < 2 {
+                                        tracing::warn!(
+                                            group_id = self.group_id,
+                                            attempt,
+                                            "forward retry"
+                                        );
                                         tokio::time::sleep(std::time::Duration::from_millis(200))
                                             .await;
                                         continue;
@@ -448,6 +453,7 @@ impl OpenRaftNode {
                             }
                         }
                         if attempt < 2 {
+                            tracing::warn!(group_id = self.group_id, attempt, "forward retry");
                             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                             continue;
                         }

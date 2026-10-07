@@ -149,15 +149,28 @@ impl BackupManager {
         self.create_backup_with_description(db, None)
     }
 
-    #[instrument(name = "backup_create", skip(self, db), fields(backup_id))]
     pub fn create_backup_with_description(
         &self,
         db: &DB,
         description: Option<&str>,
     ) -> Result<BackupId> {
+        let backup_id = timestamp_nanos();
+        self.create_backup_inner(db, backup_id, description)
+            .map_err(|e| {
+                note_backup_failed(backup_id, &e.to_string());
+                e
+            })
+    }
+
+    #[instrument(name = "backup_create", skip(self, db), fields(backup_id))]
+    fn create_backup_inner(
+        &self,
+        db: &DB,
+        backup_id: BackupId,
+        description: Option<&str>,
+    ) -> Result<BackupId> {
         use std::fs;
 
-        let backup_id = timestamp_nanos();
         let start = Instant::now();
 
         // 在临时位置创建 checkpoint
@@ -328,9 +341,14 @@ fn timestamp_nanos() -> u64 {
         .as_nanos() as u64
 }
 
+fn note_backup_failed(backup_id: u64, error: &str) {
+    tracing::error!(backup_id, error, "backup failed");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing::Subscriber;
 
     fn make_backup(id: u64, age_secs: u64) -> BackupMetadata {
         let now = SystemTime::now()
@@ -443,5 +461,82 @@ mod tests {
         assert_eq!(to_delete.len(), 2);
         assert_eq!(to_delete[0], 0);
         assert_eq!(to_delete[1], 1);
+    }
+
+    #[test]
+    fn backup_failure_logs_error() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::prelude::*;
+        use tracing_subscriber::Registry;
+
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let stored = Arc::clone(&hits);
+        tracing::subscriber::with_default(
+            Registry::default().with(ErrLayer { hits: stored }),
+            || {
+                super::note_backup_failed(7, "disk full");
+            },
+        );
+        let hits = hits.lock().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, tracing::Level::ERROR);
+        assert_eq!(hits[0].1, "backup failed");
+        assert!(hits[0].2.contains("backup_id=7"));
+        assert!(!hits[0].2.contains("user-key"));
+    }
+
+    struct ErrLayer {
+        hits: std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String, String)>>>,
+    }
+
+    impl<S: Subscriber> tracing_subscriber::Layer<S> for ErrLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut message = String::new();
+            let mut fields = String::new();
+            event.record(&mut Grab {
+                message: &mut message,
+                fields: &mut fields,
+            });
+            self.hits
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), message, fields));
+        }
+    }
+
+    struct Grab<'a> {
+        message: &'a mut String,
+        fields: &'a mut String,
+    }
+
+    impl tracing::field::Visit for Grab<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                *self.message = format!("{value:?}").trim_matches('"').to_string();
+            } else {
+                self.fields
+                    .push_str(&format!("{}={value:?} ", field.name()));
+            }
+        }
+
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            self.fields.push_str(&format!("{}={value} ", field.name()));
+        }
+
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.fields.push_str(&format!("{}={value} ", field.name()));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                *self.message = value.to_string();
+            } else {
+                self.fields.push_str(&format!("{}={value} ", field.name()));
+            }
+        }
     }
 }

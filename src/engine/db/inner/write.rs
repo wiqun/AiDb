@@ -52,6 +52,7 @@ impl DB {
 
         if mt_mem > mt_limit.saturating_mul(4) / 5 {
             // stop: MemTable 总内存超过 80% 量级硬上限, 主动 freeze + flush 释放.
+            note_stall_start(WriteStallKind::MemTableStop);
             let start = std::time::Instant::now();
             let mut fail_count = 0u32;
             loop {
@@ -95,6 +96,7 @@ impl DB {
                 0
             };
             if sleep_ms > 0 {
+                note_stall_start(WriteStallKind::MemTableSlowdown);
                 let start = std::time::Instant::now();
                 std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
                 let elapsed_us = start.elapsed().as_micros() as u64;
@@ -108,6 +110,7 @@ impl DB {
 
         // stop: 轮询等待 until L0 回到 slowdown 阈值以下
         if l0_count >= opts.level0_stop_writes_trigger {
+            note_stall_start(WriteStallKind::L0FilesStop);
             let start = std::time::Instant::now();
             while self.sstables.read()[0].len() >= opts.level0_slowdown_writes_trigger {
                 std::thread::sleep(std::time::Duration::from_millis(opts.write_stall_poll_ms));
@@ -130,6 +133,7 @@ impl DB {
                 0
             };
             if sleep_ms > 0 {
+                note_stall_start(WriteStallKind::L0FilesSlowdown);
                 let start = std::time::Instant::now();
                 std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
                 let elapsed_us = start.elapsed().as_micros() as u64;
@@ -149,6 +153,7 @@ impl DB {
             }
 
             if actual > target.saturating_mul(4) {
+                note_stall_start(WriteStallKind::LevelSizeStop);
                 let start = std::time::Instant::now();
                 // stop: 轮询等待, 主动触发 compaction
                 while {
@@ -174,6 +179,7 @@ impl DB {
                     0
                 };
                 if sleep_ms > 0 {
+                    note_stall_start(WriteStallKind::LevelSizeSlowdown);
                     let start = std::time::Instant::now();
                     std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
                     let elapsed_us = start.elapsed().as_micros() as u64;
@@ -614,6 +620,11 @@ fn wal_entry_for_op(op: &WriteOp, seq: u64) -> Result<WalEntry> {
     }
 }
 
+fn note_stall_start(kind: WriteStallKind) {
+    let (cause, kind_name) = kind.cause_and_type();
+    tracing::warn!(target: "db", cause, kind = kind_name, "write stall start");
+}
+
 #[cfg(test)]
 mod sequence_tests {
     use super::*;
@@ -621,6 +632,7 @@ mod sequence_tests {
     use crate::engine::memtable::SEQUENCE_LIMIT;
     use crate::error::Error;
     use tempfile::tempdir;
+    use tracing::Subscriber;
 
     #[test]
     fn test_sequence_overflow_on_put() {
@@ -633,5 +645,75 @@ mod sequence_tests {
             Err(Error::InvalidState(_))
         ));
         db.close().unwrap();
+    }
+
+    #[test]
+    fn write_stall_start_warns_once() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::prelude::*;
+        use tracing_subscriber::Registry;
+
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let layer = MessageLayer {
+            messages: Arc::clone(&messages),
+        };
+        let subscriber = Registry::default().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            super::note_stall_start(WriteStallKind::L0FilesStop);
+        });
+        let messages = messages.lock().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].0, tracing::Level::WARN);
+        assert_eq!(messages[0].1, "write stall start");
+        assert!(messages[0].2.contains("cause=l0"));
+        assert!(messages[0].2.contains("kind=stop"));
+        assert!(!messages[0].2.contains("key="));
+    }
+
+    struct MessageLayer {
+        messages: std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String, String)>>>,
+    }
+
+    impl<S: Subscriber> tracing_subscriber::Layer<S> for MessageLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = String::new();
+            let mut message = String::new();
+            event.record(&mut FieldGrab {
+                message: &mut message,
+                fields: &mut fields,
+            });
+            self.messages
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), message, fields));
+        }
+    }
+
+    struct FieldGrab<'a> {
+        message: &'a mut String,
+        fields: &'a mut String,
+    }
+
+    impl tracing::field::Visit for FieldGrab<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                *self.message = format!("{value:?}").trim_matches('"').to_string();
+            } else {
+                self.fields
+                    .push_str(&format!("{}={value:?} ", field.name()));
+            }
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                *self.message = value.to_string();
+            } else {
+                self.fields.push_str(&format!("{}={value} ", field.name()));
+            }
+        }
     }
 }

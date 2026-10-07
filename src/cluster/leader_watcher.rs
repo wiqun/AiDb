@@ -34,6 +34,7 @@ pub struct LeaderChangeWatcher {
     /// group_id → 本节点 (作为该 group leader) 是否仍保有 quorum.
     /// 仅在本节点是 leader 时存在; follower 上不判定 (entry 被移除).
     quorum_status: RwLock<HashMap<u64, bool>>,
+    role_cache: RwLock<HashMap<u64, String>>,
     tick_interval: Duration,
     /// leader lease 时长 (= election_timeout_max), 用于判定 quorum 是否失效.
     lease: Duration,
@@ -58,6 +59,7 @@ impl LeaderChangeWatcher {
             meta_raft,
             leader_cache: RwLock::new(HashMap::new()),
             quorum_status: RwLock::new(HashMap::new()),
+            role_cache: RwLock::new(HashMap::new()),
             tick_interval,
             lease,
         }
@@ -141,6 +143,19 @@ impl LeaderChangeWatcher {
 
         for (gid, node) in &group_snapshots {
             let metrics = node.metrics().await;
+            let current_role = role_name(metrics.state);
+            let previous_role = self.role_cache.read().get(gid).cloned();
+            if role_changed(previous_role.as_deref(), current_role) {
+                tracing::info!(
+                    group_id = *gid,
+                    from = previous_role.as_deref().unwrap_or("none"),
+                    to = current_role,
+                    "raft role changed"
+                );
+                self.role_cache
+                    .write()
+                    .insert(*gid, current_role.to_string());
+            }
             let current_leader = metrics.current_leader;
 
             if let Some(changed_gid) = self.detect_leader_transition(*gid, current_leader).await {
@@ -351,6 +366,20 @@ impl LeaderChangeWatcher {
     }
 }
 
+fn role_changed(previous: Option<&str>, current: &str) -> bool {
+    previous != Some(current)
+}
+
+fn role_name(state: openraft::ServerState) -> &'static str {
+    match state {
+        openraft::ServerState::Leader => "leader",
+        openraft::ServerState::Follower => "follower",
+        openraft::ServerState::Candidate => "candidate",
+        openraft::ServerState::Learner => "learner",
+        openraft::ServerState::Shutdown => "shutdown",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,5 +398,12 @@ mod tests {
     fn test_tick_interval_getter() {
         let tick = Duration::from_millis(500);
         assert_eq!(tick.as_millis(), 500);
+    }
+
+    #[test]
+    fn role_changed_only_when_the_name_differs() {
+        assert!(super::role_changed(None, "leader"));
+        assert!(!super::role_changed(Some("leader"), "leader"));
+        assert!(super::role_changed(Some("follower"), "leader"));
     }
 }

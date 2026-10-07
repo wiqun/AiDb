@@ -67,9 +67,14 @@ impl DB {
             return Ok(true);
         }
 
+        let level = task.level;
+        tracing::info!(target: "cmp", level, "compaction start");
+
         // --- TRIVIAL MOVE FAST PATH ---
         if task.is_trivial_move {
-            return self.run_trivial_move(task);
+            let moved = self.run_trivial_move(task)?;
+            tracing::info!(target: "cmp", level, "compaction end");
+            return Ok(moved);
         }
         // --- END TRIVIAL MOVE ---
 
@@ -229,6 +234,7 @@ impl DB {
         }
 
         self.release_files(&task);
+        tracing::info!(target: "cmp", level = task.level, "compaction end");
         Ok(true)
     }
 
@@ -400,7 +406,9 @@ mod tests {
     use crate::engine::memtable::{encode_internal_key, ValueType};
     use crate::engine::sstable::{sstable_path, SSTableBuilder, SSTableReader};
     use std::sync::Arc;
+    use std::sync::Mutex;
     use tempfile::tempdir;
+    use tracing::Subscriber;
 
     fn one_key(
         dir: &std::path::Path,
@@ -442,5 +450,125 @@ mod tests {
         assert!(from_source.iter().any(|r| r.start == b"m"));
         assert!(!from_output.iter().any(|r| r.start == b"m"));
         assert_eq!(surviving_start_level(1, 2), 1);
+    }
+
+    #[test]
+    fn flush_and_compaction_log_once_without_user_key() {
+        use std::sync::Arc;
+        use tracing_subscriber::prelude::*;
+        use tracing_subscriber::Registry;
+
+        use crate::config::Options;
+        use crate::DB;
+
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let layer = LogLayer {
+            messages: Arc::clone(&messages),
+        };
+        let subscriber = Registry::default()
+            .with(layer.with_filter(tracing_subscriber::filter::LevelFilter::INFO));
+        let dir = tempdir().unwrap();
+        let db = DB::open(dir.path(), Options::for_testing()).unwrap();
+        let key = b"user-key-should-stay-out";
+        let _guard = tracing::subscriber::set_default(subscriber);
+        db.put(key, b"v").unwrap();
+        db.flush().unwrap();
+        let flush_logs = messages
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, message, _)| message == "db.flush.complete")
+            .count();
+        assert_eq!(flush_logs, 1);
+        let dumped = messages
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, _, fields)| fields.clone())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(!dumped.contains("user-key-should-stay-out"));
+        db.put(key, b"v2").unwrap();
+        db.flush().unwrap();
+        db.run_compaction_once().unwrap();
+        let start = messages
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, message, _)| message == "compaction start")
+            .count();
+        let end = messages
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, message, _)| message == "compaction end")
+            .count();
+        assert_eq!(start, 1);
+        assert_eq!(end, 1);
+        let dumped = messages
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, _, fields)| fields.clone())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(!dumped.contains("user-key-should-stay-out"));
+        drop(_guard);
+        db.close().unwrap();
+    }
+
+    struct LogLayer {
+        messages: Arc<Mutex<Vec<(tracing::Level, String, String)>>>,
+    }
+
+    impl<S: Subscriber> tracing_subscriber::Layer<S> for LogLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut message = String::new();
+            let mut fields = String::new();
+            event.record(&mut Grab {
+                message: &mut message,
+                fields: &mut fields,
+            });
+            self.messages
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), message, fields));
+        }
+    }
+
+    struct Grab<'a> {
+        message: &'a mut String,
+        fields: &'a mut String,
+    }
+
+    impl tracing::field::Visit for Grab<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                *self.message = format!("{value:?}").trim_matches('"').to_string();
+            } else {
+                self.fields
+                    .push_str(&format!("{}={value:?} ", field.name()));
+            }
+        }
+
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.fields.push_str(&format!("{}={value} ", field.name()));
+        }
+
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            self.fields.push_str(&format!("{}={value} ", field.name()));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                *self.message = value.to_string();
+            } else {
+                self.fields.push_str(&format!("{}={value} ", field.name()));
+            }
+        }
     }
 }
