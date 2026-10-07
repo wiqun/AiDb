@@ -72,7 +72,7 @@ flowchart LR
 | `aidb_engine_write_duration_seconds` | Histogram | — | 每个用户写批次一次真实耗时, 不重放桶中点 |
 | `db.client.operations` | Counter | `db.system`, `db.operation.name` | OpenTelemetry 标准语义双写 |
 | `aidb_flush_last_duration_seconds` | Gauge | — | 最近一次 flush 耗时 |
-| `aidb_flush_total` | Counter | — | MemTable flush 完成时累加 |
+| `aidb_flush_total` | Counter | — | flush 完成时内部累加. `INFO storage` 可读. 生产导出快照不包含这条, 只有测试调用 `sync_to_otel` 才登记到旧 meter |
 | `aidb_compaction_last_duration_seconds` | Gauge | — | 最近一次 compaction 耗时 |
 | `aidb_block_cache_size_bytes` | Gauge | — | 16 分片 LRU 当前缓存占用 |
 | `aidb_block_cache_capacity_bytes` | Gauge | — | BlockCache 总容量上限 |
@@ -80,7 +80,7 @@ flowchart LR
 | `aidb_block_cache_misses_total` | Counter | — | BlockCache 读取未命中 |
 | `aidb_bloom_false_positive_total` | Counter | — | Bloom Filter 假阳性穿透判定 |
 | `aidb_sequence` | Gauge | — | 最新已分配的全局 Sequence 编号 |
-| `aidb_compaction_total` | Counter | `aidb.compaction.phase=pick\|run\|apply` | Compaction 各阶段累加 |
+| `aidb_compaction_total` | Counter | `aidb.compaction.phase=pick\|run\|apply` | 各阶段内部累加. 生产导出快照不包含这条, 只有测试调用 `sync_to_otel` 才登记到旧 meter |
 | `aidb_write_stall_total` | Counter | `cause`, `kind` | 六种写停顿次数 |
 | `aidb_write_stall_window_max_us` | Gauge | — | 本导出周期最大停顿微秒, 读出后清零 |
 
@@ -90,7 +90,7 @@ flowchart LR
 | --- | --- | --- | --- |
 | `aidb_raft_apply_lag_entries` | Gauge | `group` | 导出时 `commit - applied`, 不在请求路径计算 |
 | `aidb_raft_replication_lag_entries` | Gauge | `group` | leader 上 `last_log - max matched`, 其他角色是 0 |
-| `aidb_raft_leader_contact_age_seconds` | Gauge | `group` | follower 距上次心跳的秒数, leader 是 0 |
+| `aidb_raft_leader_contact_age_seconds` | Gauge | `group` | 导出值固定为 0. follower 距上次心跳的秒数尚未接入 |
 | `aidb_raft_role` | Gauge | `group`, `role` | 只输出当前角色, 值是 1 |
 | `aidb_raft_rpc_total` | Counter | `aidb.raft.rpc.type=vote\|append_entries\|install_snapshot`<br>`aidb.raft.rpc.direction=incoming\|outgoing` | Raft RPC 消息收发计数 |
 | `aidb_raft_log_entries_total` | Counter | — | AppendEntries 入站 entry 数量累加 |

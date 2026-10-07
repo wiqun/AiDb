@@ -21,7 +21,7 @@
 - **存储原语支持事务**: 支持原子批量写 (`WriteBatch`)、MVCC 快照读 (`Snapshot`) 及目录级 Checkpoint.
 - **原生分布式共识**: 基于 OpenRaft 实现 MetaRaft + MultiRaft, 内置 16384 槽路由与在线迁移.
 - **高度模块化设计**: 核心引擎零外部可选依赖; 集群、备份、压缩与监控等能力均通过 Cargo Feature 解耦.
-- **云原生可观测性**: 支持基于 OpenTelemetry 的指标导出 (`aidb_*`) 与全链路 tracing span 跟踪.
+- **云原生可观测性**: 指标由宿主经 OpenTelemetry 导出 (`aidb_*`). span 只允许 `db_flush`, `cmp_run`, `raft_propose`, 采样关闭时不创建.
 
 ## 架构概览 (Architecture at a Glance)
 

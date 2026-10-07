@@ -176,4 +176,4 @@ AiDb 内部仅通过 OpenTelemetry 注册标准 `aidb_*` 指标, 不自建 HTTP 
 | **节点间通信** | gRPC (tonic + prost) | HTTP/2 多路复用, 类型安全 | 自定义私有二进制协议 |
 | **分片拓扑** | 16384 固定槽位 (CRC16) | 兼容 Redis 槽模型与 Hash Tag | 动态分片分裂合并 |
 | **全量备份** | Checkpoint 硬链接 + SHA256 | 零拷贝秒级快照, 一致性自检 | 在线物理热拷贝无锁 |
-| **可观测性** | tracing debug span + OTel 指标 | 零性能损耗, 宿主统一 OTLP 导出 | 库内自建 HTTP scrape 端口 |
+| **可观测性** | `db_flush`, `cmp_run`, `raft_propose` 与宿主 OTel 指标 | 采样关闭时不创建 span, 宿主统一 OTLP 导出 | 热路径 debug span, 库内自建 HTTP scrape 端口 |

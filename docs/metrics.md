@@ -18,7 +18,7 @@ description: AiDb 全量 OTel 指标总表 (仅当前已存在指标). 查指标
 - `db.client.*` 为 OTel semconv 双写指标, 其 Prometheus 渲染名 (是否追加 `_total` / 单位后缀) 取决于 Collector 转换配置, 以实际导出为准.
 - 类型统一按 Prometheus 口径标注 (Counter / Gauge / Histogram); 单位为代码中声明的 UCUM 单位.
 - 全部指标需 `--features monitoring` 编译; 集群指标额外需 `--features cluster`.
-- aidb 为嵌入库, 无独立 OTLP 出口; 核心指标体系采用 Atomic-first 架构, 引擎热路径无锁直写实例级原子字典 (`Arc<Statistics>`), 消除全部全局读锁争用与堆内存分配. OTel instrument 集中于 `src/metrics.rs` (`OtelMetrics`), 由嵌入方 (如 aikv) 在后台定时调用 `sync_to_otel` 执行差分同步并导出.
+- aidb 为嵌入库, 无独立 OTLP 出口; 核心指标体系采用 Atomic-first 架构, 引擎热路径无锁直写实例级原子字典 (`Arc<Statistics>`), 消除全部全局读锁争用与堆内存分配. aikv 生产导出走导出快照, 不调用 `sync_to_otel`. `sync_to_otel` 只在测试里把差分登记到 `src/metrics.rs` 的旧 meter. 快照不含 `aidb_flush_total` 与 `aidb_compaction_total`.
 - 双通道对账契约:
   - 快照直读 (`INFO storage`): 返回无 `_total` 后缀的即时快照值 (如 `aidb_wal_written_bytes`, `aidb_write_stall_requests`), 适合压测前后单轮差分计算.
   - OTel 导出: 返回符合 Prometheus 命名规范的单调 Counter (`_total`), 标签化 Histogram (`_seconds_bucket`) 与 Gauge.
@@ -53,10 +53,10 @@ description: AiDb 全量 OTel 指标总表 (仅当前已存在指标). 查指标
 | `aidb_operations_total` | Counter | 1 | `aidb_operation_name(6: put\|delete\|write_batch\|write_batch_no_wal\|get\|snapshot)` | 引擎热路径原子直写 + `sync_to_otel` 差分同步<br>`stats.operations` | `stall_stop` 与 `stall_slowdown` 不再导出 | `sum by (aidb_operation_name) (rate(aidb_operations_total[1m]))` |
 | `aidb_engine_write_duration_seconds` | Histogram | s | — (基数 1) | 每个用户写批次结束记一次真实耗时<br>`stats.engine_write_duration` | 不含 flush 与 get. 累计桶与观测值之和, 不按桶中点重放 | `histogram_quantile(0.99, rate(aidb_engine_write_duration_seconds_bucket[1m]))` |
 | `aidb_logical_write_bytes_total` | Counter | By | — (基数 1) | 写路径原子累加 user_key + value 字节<br>`stats.logical_write_bytes`; `engine/db/inner/write.rs` | 引擎级逻辑写入字节; 集群模式白名单 `\x01sm/` 过滤 Raft log; 主口径建议配合协议级交叉验证 | 写放大 (WA) 分母:<br>`rate(aidb_logical_write_bytes_total[1m])` |
-| `aidb_flush_total` | Counter | 1 | — (基数 1) | flush 完成时原子累加<br>`stats.flush_total`; `engine/db/inner/flush.rs` | 按轮计数 (每轮刷掉的 immutable memtable 批次 +1) | Flush 执行频率:<br>`rate(aidb_flush_total[1m])` |
+| `aidb_flush_total` | Counter | 1 | — (基数 1) | flush 完成时原子累加<br>`stats.flush_total`; `engine/db/inner/flush.rs` | 内部按轮累加. `INFO storage` 有这个字段. 生产导出快照没有这条序列 | 不作为 Grafana 频率. flush 看字节速率和最近一次耗时:<br>`rate(aidb_flush_written_bytes_total[$rate_window])`<br>`aidb_flush_last_duration_seconds` |
 | `aidb_flush_written_bytes_total` | Counter | By | — (基数 1) | MemTable 刷盘 SSTable 完成时原子累加<br>`stats.flush_written_bytes`; `engine/db/inner/flush.rs` | Flush 物理生成 SSTable 字节数 (空 memtable 提前返回不计入) | 写放大 (WA) 分子组成:<br>`rate(aidb_flush_written_bytes_total[1m])` |
 | `aidb_flush_last_duration_seconds` | Gauge | s | — (基数 1) | flush 结束时覆盖写入<br>`stats.flush_last_duration_us` | 最近一次耗时, 不是直方图 | `aidb_flush_last_duration_seconds` |
-| `aidb_compaction_total` | Counter | 1 | `aidb_compaction_phase(3: pick\|run\|apply)`<br>基数 3 | Compaction 各阶段原子累加<br>`stats.compaction_phases`; `engine/db/inner/compaction.rs` | **trivial move 只记 `pick` 阶段** (无 run/apply) | Compaction 执行频次:<br>`sum by (aidb_compaction_phase) (rate(aidb_compaction_total[1m]))` |
+| `aidb_compaction_total` | Counter | 1 | `aidb_compaction_phase(3: pick\|run\|apply)`<br>基数 3 | Compaction 各阶段原子累加<br>`stats.compaction_phases`; `engine/db/inner/compaction.rs` | **trivial move 只记 `pick` 阶段** (无 run/apply). 生产导出快照没有这条序列 | 不作为 Grafana 频次. compaction 看字节速率和最近一次耗时:<br>`rate(aidb_compaction_written_bytes_total[$rate_window])`<br>`aidb_compaction_last_duration_seconds` |
 | `aidb_compaction_read_bytes_total` | Counter | By | — (基数 1) | Compaction 开始时一次性累加输入 SST 文件大小<br>`stats.compaction_read_bytes`; `engine/db/inner/compaction.rs` | Compaction 逻辑输入读盘字节 (排除 trivial move, 多个 split 共享输入只计一次) | 后台 Compaction 读 I/O 速率:<br>`rate(aidb_compaction_read_bytes_total[1m])` |
 | `aidb_compaction_written_bytes_total` | Counter | By | — (基数 1) | Compaction 生成新 SSTable 完成后累加文件大小<br>`stats.compaction_written_bytes`; `engine/db/inner/compaction.rs` | Compaction 物理输出写盘字节 (排除 trivial move) | 写放大 (WA) 分子组成:<br>`rate(aidb_compaction_written_bytes_total[1m])` |
 | `aidb_compaction_last_duration_seconds` | Gauge | s | — (基数 1) | compaction 一轮结束时覆盖写入<br>`stats.compaction_last_duration_us` | 最近一次耗时, 不是直方图 | `aidb_compaction_last_duration_seconds` |
@@ -85,7 +85,7 @@ description: AiDb 全量 OTel 指标总表 (仅当前已存在指标). 查指标
 
 | 指标名 | 类型 | 单位 | 标签与基数 | 数据源与代码位置 | 说明 (实现陷阱与口径) | 用途与典型 PromQL |
 | --- | --- | --- | --- | --- | --- | --- |
-| `aikv_recovery_rebuild_counters_duration_seconds` | Gauge | s | — (基数 1) | 存储层键计数器全库重建耗时 (微秒转秒)<br>`storage.rebuild_counters_duration_us()`; `server/config.rs:295` 挂载 | 最近一次键计数器重建耗时 (16 个逻辑 DB 全库双次扫描与物化); 周期刷新同步至 OTel Gauge | 键计数器恢复耗时定位:<br>`aikv_recovery_rebuild_counters_duration_seconds` |
+| `aikv_recovery_rebuild_counters_duration_seconds` | Gauge | s | — (基数 1) | `KvStorage::rebuild_counters_duration_us` 固定返回 0<br>`server/config.rs` 的 `refresh_runtime_metrics` 仍写入旧 gauge | 全库重扫已去掉. 值保持 0, 不再表示 16 个逻辑库的扫描耗时 | 不要把它读成恢复耗时. 序列若仍出现, 读数是 0 |
 | `aikv_process_threads` | Gauge | 1 | — (基数 1) | 周期读取 `/proc/self/status` 的 `Threads:` 字段<br>`ServerMetrics`; `server/metrics.rs` | 进程当前 OS 线程总数; 零 node-exporter 依赖 | 线程数监控 / 线程泄漏与膨胀预警:<br>`aikv_process_threads` |
 | `aikv_process_context_switches_total` | Counter | 1 | `aikv_context_switch_type(2: voluntary\|nonvoluntary)`<br>基数 2 | 周期读取 `/proc/self/status` 上下文切换累计值后差分累加<br>`ServerMetrics`; `server/metrics.rs` | 进程级自愿与非自愿上下文切换次数; 先 add 差分后更新基线 (崩溃安全) | 上下文切换速率 (判断 CPU 争用与阻塞):<br>`sum by (aikv_context_switch_type) (rate(aikv_process_context_switches_total[1m]))` |
 
