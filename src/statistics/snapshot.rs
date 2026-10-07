@@ -43,7 +43,6 @@ pub struct StatsSnapshot {
     pub block_cache_size: u64,
     pub block_cache_capacity: u64,
     pub sequence: u64,
-    pub total_key_count: u64,
     pub backup_size_bytes: u64,
 
     // === Phase 2 完整预留字段镜像 (确保基线架构一步到位) ===

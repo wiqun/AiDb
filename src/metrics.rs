@@ -59,7 +59,6 @@ struct OtelMetrics {
     bloom_false_positive_total: Counter<u64>,
     flush_total: Counter<u64>,
     sequence: Gauge<f64>,
-    total_key_count: Gauge<f64>,
     compaction_total: Counter<u64>,
     compaction_duration_seconds: Histogram<f64>,
     backup_total: Counter<u64>,
@@ -188,11 +187,6 @@ impl OtelMetrics {
                 .f64_gauge("aidb_sequence")
                 .with_description("当前 DB sequence")
                 .with_unit("{sequence}")
-                .build(),
-            total_key_count: meter
-                .f64_gauge("aidb_total_key_count")
-                .with_description("近似存活 key 数")
-                .with_unit("{key}")
                 .build(),
             compaction_total: meter
                 .u64_counter("aidb_compaction_total")
@@ -543,8 +537,6 @@ pub fn sync_to_otel(stats: &crate::statistics::Statistics) {
         &[kv(ATTR_MEMTABLE_STATE, "frozen")],
     );
     m.sequence.record(current.sequence as f64, &[]);
-    m.total_key_count
-        .record(current.total_key_count as f64, &[]);
     m.live_bytes.record(current.live_bytes as f64, &[]);
 
     for (level, (&count, &size)) in current

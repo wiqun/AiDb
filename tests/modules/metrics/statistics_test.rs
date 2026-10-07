@@ -120,7 +120,6 @@ fn test_statistics_reset_behavior() {
     stats.sstable_size_bytes[0].store(65536, Ordering::Relaxed);
     stats.block_cache_size.store(2048, Ordering::Relaxed);
     stats.block_cache_capacity.store(65536, Ordering::Relaxed);
-    stats.total_key_count.store(999, Ordering::Relaxed);
     stats.backup_size_bytes.store(50000, Ordering::Relaxed);
 
     // 执行 Reset
@@ -191,7 +190,6 @@ fn test_statistics_reset_behavior() {
     assert_eq!(stats.sstable_size_bytes[0].load(Ordering::Relaxed), 65536);
     assert_eq!(stats.block_cache_size.load(Ordering::Relaxed), 2048);
     assert_eq!(stats.block_cache_capacity.load(Ordering::Relaxed), 65536);
-    assert_eq!(stats.total_key_count.load(Ordering::Relaxed), 999);
     assert_eq!(stats.backup_size_bytes.load(Ordering::Relaxed), 50000);
 
     // 快照也必须与原子字段保持一致

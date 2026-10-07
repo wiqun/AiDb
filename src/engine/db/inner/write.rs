@@ -4,18 +4,10 @@
 //! 冻结逻辑 (`maybe_freeze` / `wait_for_memtable_slot`) 也在此维护.
 
 use super::{
-    Arc, AtomicOrdering, CompactionPicker, Duration, EngineWriteStats, Error, MemTable, OpType,
-    Result, WalEntry, WriteBatch, WriteOp, DB, SEQUENCE_LIMIT,
+    Arc, AtomicOrdering, CompactionPicker, Duration, Error, MemTable, OpType, Result, WalEntry,
+    WriteBatch, WriteOp, DB, SEQUENCE_LIMIT,
 };
 use crate::statistics::{DbOp, WriteStallKind};
-use std::collections::HashMap;
-
-/// 批内分类用的操作种类 (key 为 DB 中实际 key).
-#[derive(Clone, Copy)]
-enum ClassifyOp {
-    Put,
-    Delete,
-}
 
 impl DB {
     fn alloc_sequence(&self, count: u64) -> Result<u64> {
@@ -193,7 +185,7 @@ impl DB {
     }
 
     #[tracing::instrument(level = "debug", name = "db_put", skip(self, key, value))]
-    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<bool> {
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         let op_start = std::time::Instant::now();
         self.check_not_closed()?;
         Self::validate_user_key(key)?;
@@ -217,23 +209,15 @@ impl DB {
         }
 
         // Phase 3: MemTable (after WAL is durable)
-        let existed = self.key_exists_for_write(key)?;
         self.memtable.read().put(key, value, seq)?;
         self.committed_sequence
             .fetch_max(seq, AtomicOrdering::SeqCst);
 
-        let inserted = !existed;
-        if inserted {
-            let count = self.total_key_count.fetch_add(1, AtomicOrdering::Relaxed) + 1;
-            self.stats
-                .total_key_count
-                .store(count as u64, AtomicOrdering::Relaxed);
-        }
         self.maybe_freeze()?;
         tracing::debug!(target: "db", "db.put");
         self.stats.operation_durations[DbOp::Put as usize]
             .record(op_start.elapsed().as_micros() as u64);
-        Ok(inserted)
+        Ok(())
     }
 
     #[tracing::instrument(level = "debug", name = "db_delete", skip(self, key))]
@@ -246,8 +230,6 @@ impl DB {
         self.stats
             .logical_write_bytes
             .fetch_add(key.len() as u64, AtomicOrdering::Relaxed);
-
-        let existed = self.key_exists_for_write(key)?;
 
         // Phase 1: WAL append (in write_lock, no sync)
         let seq;
@@ -267,17 +249,6 @@ impl DB {
         self.committed_sequence
             .fetch_max(seq, AtomicOrdering::SeqCst);
 
-        if existed {
-            if let Ok(prev) = self.total_key_count.fetch_update(
-                AtomicOrdering::Relaxed,
-                AtomicOrdering::Relaxed,
-                |c| Some(c.saturating_sub(1)),
-            ) {
-                self.stats
-                    .total_key_count
-                    .store(prev.saturating_sub(1) as u64, AtomicOrdering::Relaxed);
-            }
-        }
         self.maybe_freeze()?;
         tracing::debug!(target: "db", "db.delete");
         self.stats.operation_durations[DbOp::Delete as usize]
@@ -286,9 +257,9 @@ impl DB {
     }
 
     #[tracing::instrument(level = "debug", name = "db_write_batch", skip(self, batch))]
-    pub fn write(&self, batch: &WriteBatch) -> Result<EngineWriteStats> {
+    pub fn write(&self, batch: &WriteBatch) -> Result<()> {
         if batch.is_empty() {
-            return Ok(EngineWriteStats::default());
+            return Ok(());
         }
         let t0 = std::time::Instant::now();
         let op_start = std::time::Instant::now();
@@ -328,7 +299,6 @@ impl DB {
             wal.append_encoded_write_batch(&encoded, base)?;
         }
 
-        let stats = self.classify_ops_with_overlay(batch_ops_iter(batch))?;
         {
             let mt = self.memtable.read();
             for (i, op) in batch.operations.iter().enumerate() {
@@ -359,7 +329,6 @@ impl DB {
         }
 
         let lock_hold_us = lock_acquired.elapsed().as_micros();
-        self.apply_key_count_delta(&stats);
         self.maybe_freeze()?;
         let total_us = t0.elapsed().as_micros();
         tracing::debug!(
@@ -372,14 +341,14 @@ impl DB {
         tracing::debug!(target: "db", op_count = batch.len(), "db.write_batch");
         self.stats.operation_durations[DbOp::WriteBatch as usize]
             .record(op_start.elapsed().as_micros() as u64);
-        Ok(stats)
+        Ok(())
     }
 
     /// 写入 WriteBatch 但不经由 DB 自身的 WAL (适用于 StateMachine 写入, 避免双重 WAL 磁盘开销).
     #[tracing::instrument(level = "debug", name = "db_write_batch_no_wal", skip(self, batch))]
-    pub fn write_without_wal(&self, batch: &WriteBatch) -> Result<EngineWriteStats> {
+    pub fn write_without_wal(&self, batch: &WriteBatch) -> Result<()> {
         if batch.is_empty() {
-            return Ok(EngineWriteStats::default());
+            return Ok(());
         }
         let t0 = std::time::Instant::now();
         let op_start = std::time::Instant::now();
@@ -402,7 +371,6 @@ impl DB {
         let lock_acquired = std::time::Instant::now();
         let base = self.alloc_sequence(n)?;
 
-        let stats = self.classify_ops_with_overlay(batch_ops_iter(batch))?;
         {
             let mt = self.memtable.read();
             for (i, op) in batch.operations.iter().enumerate() {
@@ -426,7 +394,6 @@ impl DB {
         drop(_guard);
 
         let lock_hold_us = lock_acquired.elapsed().as_micros();
-        self.apply_key_count_delta(&stats);
         self.maybe_freeze()?;
         let total_us = t0.elapsed().as_micros();
         tracing::debug!(
@@ -439,61 +406,7 @@ impl DB {
         tracing::debug!(target: "db", op_count = batch.len(), "db.write_batch_no_wal");
         self.stats.operation_durations[DbOp::WriteBatchNoWal as usize]
             .record(op_start.elapsed().as_micros() as u64);
-        Ok(stats)
-    }
-
-    /// 用 `key_exists` + 批内 overlay 判定每条 op 的 insert/delete, 供 stats 与 `total_key_count` 同源.
-    fn classify_ops_with_overlay<'a, I>(&self, ops: I) -> Result<EngineWriteStats>
-    where
-        I: IntoIterator<Item = (&'a [u8], ClassifyOp)>,
-    {
-        let mut overlay: HashMap<Vec<u8>, bool> = HashMap::new();
-        let mut stats = EngineWriteStats::default();
-        for (key, kind) in ops {
-            let existed = match overlay.get(key) {
-                Some(present) => *present,
-                None => self.key_exists_for_write(key)?,
-            };
-            match kind {
-                ClassifyOp::Put => {
-                    overlay.insert(key.to_vec(), true);
-                    if !existed {
-                        stats.inserted += 1;
-                    }
-                }
-                ClassifyOp::Delete => {
-                    overlay.insert(key.to_vec(), false);
-                    if existed {
-                        stats.deleted += 1;
-                    }
-                }
-            }
-        }
-        Ok(stats)
-    }
-
-    fn apply_key_count_delta(&self, stats: &EngineWriteStats) {
-        let key_delta = stats.inserted as i64 - stats.deleted as i64;
-        if key_delta > 0 {
-            let count = self
-                .total_key_count
-                .fetch_add(key_delta as usize, AtomicOrdering::Relaxed)
-                + key_delta as usize;
-            self.stats
-                .total_key_count
-                .store(count as u64, AtomicOrdering::Relaxed);
-        } else if key_delta < 0 {
-            let sub = (-key_delta) as usize;
-            if let Ok(prev) = self.total_key_count.fetch_update(
-                AtomicOrdering::Relaxed,
-                AtomicOrdering::Relaxed,
-                |c| Some(c.saturating_sub(sub)),
-            ) {
-                self.stats
-                    .total_key_count
-                    .store(prev.saturating_sub(sub) as u64, AtomicOrdering::Relaxed);
-            }
-        }
+        Ok(())
     }
 
     /// 删除 `[start, end)` 半开区间内的全部 user key (RangeTombstone, O(1) 写入).
@@ -674,13 +587,6 @@ impl DB {
         self.immutable_memtables.write().push(old.freeze(flush_seq));
         Ok(())
     }
-}
-
-fn batch_ops_iter(batch: &WriteBatch) -> impl Iterator<Item = (&[u8], ClassifyOp)> + '_ {
-    batch.operations.iter().map(|op| match op {
-        WriteOp::Put { key, .. } => (key.as_slice(), ClassifyOp::Put),
-        WriteOp::Delete { key } => (key.as_slice(), ClassifyOp::Delete),
-    })
 }
 
 fn wal_entry_for_op(op: &WriteOp, seq: u64) -> Result<WalEntry> {

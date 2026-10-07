@@ -50,7 +50,7 @@ pub(super) use super::iterator::DbIterGuard;
 pub(super) use super::numbers::scan_next_wal_file_number;
 pub(super) use super::replay::replay_entries;
 pub(super) use super::snapshot::{Snapshot, SnapshotList};
-pub(super) use super::write_batch::{EngineWriteStats, WriteBatch, WriteOp};
+pub(super) use super::write_batch::{WriteBatch, WriteOp};
 pub(super) use crate::config::Options;
 pub(super) use crate::engine::cache::{BlockCache, CacheStats};
 pub(super) use crate::engine::compaction::{
@@ -110,7 +110,6 @@ pub struct DB {
     /// 最新 Put 被 filter Remove 时的监听器 (filter 保持无副作用).
     compaction_removal_listener: RwLock<Option<Arc<dyn CompactionRemovalListener>>>,
     checkpoint_in_progress: AtomicBool,
-    total_key_count: AtomicUsize,
     block_cache: Arc<BlockCache>,
     pub(crate) snapshots: Arc<SnapshotList>,
     /// Group commit: leader election mutex
@@ -288,7 +287,6 @@ impl DB {
             compaction_filter: RwLock::new(None),
             compaction_removal_listener: RwLock::new(None),
             checkpoint_in_progress: AtomicBool::new(false),
-            total_key_count: AtomicUsize::new(0),
             block_cache,
             snapshots: SnapshotList::new(),
             group_commit_lock: Mutex::new(()),

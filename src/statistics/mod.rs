@@ -55,7 +55,6 @@ pub struct Statistics {
     pub block_cache_size: AtomicU64,
     pub block_cache_capacity: AtomicU64,
     pub sequence: AtomicU64,
-    pub total_key_count: AtomicU64,
     pub backup_size_bytes: AtomicU64,
 
     // === 4. Phase 2 缺口指标预留 (一步到位, 锁定基线) ===
@@ -130,7 +129,6 @@ impl Statistics {
             block_cache_size: AtomicU64::new(0),
             block_cache_capacity: AtomicU64::new(0),
             sequence: AtomicU64::new(0),
-            total_key_count: AtomicU64::new(0),
             backup_size_bytes: AtomicU64::new(0),
 
             wal_written_bytes: AtomicU64::new(0),
@@ -270,7 +268,6 @@ impl Statistics {
             block_cache_size: self.block_cache_size.load(Ordering::Relaxed),
             block_cache_capacity: self.block_cache_capacity.load(Ordering::Relaxed),
             sequence: self.sequence.load(Ordering::Relaxed),
-            total_key_count: self.total_key_count.load(Ordering::Relaxed),
             backup_size_bytes: self.backup_size_bytes.load(Ordering::Relaxed),
 
             wal_written_bytes: self.wal_written_bytes.load(Ordering::Relaxed),

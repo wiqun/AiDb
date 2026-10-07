@@ -22,14 +22,6 @@ impl DB {
         self.key_exists_internal(key, max_seq, true)
     }
 
-    /// 内部写路径专用存在性判定: 不物化 Value, 绕过 BlockCache, 不累加 block_read_bytes 与 bloom 统计.
-    pub(crate) fn key_exists_for_write(&self, key: &[u8]) -> Result<bool> {
-        self.check_not_closed()?;
-        Self::validate_user_key(key)?;
-        let max_seq = self.sequence.load(AtomicOrdering::SeqCst);
-        self.key_exists_internal(key, max_seq, false)
-    }
-
     /// 在给定 `max_seq` 边界下判定 key 是否存在 (不物化 Value).
     #[allow(dead_code)]
     pub(crate) fn key_exists_at_sequence(&self, key: &[u8], max_seq: u64) -> Result<bool> {
