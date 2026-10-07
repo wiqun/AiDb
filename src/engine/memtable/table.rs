@@ -26,7 +26,7 @@ use crate::error::Result;
 use crate::statistics::Statistics;
 use parking_lot::RwLock;
 use std::ops::Bound;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// 同 user_key 的 point 状态 (不含 range tombstone).
@@ -94,6 +94,10 @@ impl ImmutableMemTable {
     pub(crate) fn inner(&self) -> &MemTable {
         &self.table
     }
+
+    pub fn entry_count(&self) -> u64 {
+        self.table.entry_count()
+    }
 }
 
 /// 可变 MemTable.
@@ -102,6 +106,8 @@ pub struct MemTable {
     /// Range tombstone 索引 — 仅含 delete_range 写入, 避免 GET 扫描全表.
     range_index: RwLock<Vec<RangeTombstoneRecord>>,
     stats: Option<Arc<Statistics>>,
+    /// 成功插入的内部记录数, 含覆盖写, 点删除和范围删除. flush 不减少.
+    entry_count: AtomicU64,
 }
 
 impl Default for MemTable {
@@ -120,7 +126,12 @@ impl MemTable {
             rep: SkipMapRep::new(),
             range_index: RwLock::new(Vec::new()),
             stats,
+            entry_count: AtomicU64::new(0),
         }
+    }
+
+    pub fn entry_count(&self) -> u64 {
+        self.entry_count.load(Ordering::Relaxed)
     }
 
     pub fn has_range_tombstones(&self) -> bool {
@@ -145,6 +156,7 @@ impl MemTable {
         let ik = InternalKeyBytes(encode_internal_key_arc(key, sequence, ValueType::TypePut));
         let val = Arc::from(value);
         self.rep.insert(ik, val);
+        self.entry_count.fetch_add(1, Ordering::Relaxed);
         tracing::debug!(target: "mem", "mem.put");
         self.sync_active_metric();
         Ok(())
@@ -159,6 +171,7 @@ impl MemTable {
             ValueType::TypeDelete,
         ));
         self.rep.insert(ik, Arc::from(&[] as &[u8]));
+        self.entry_count.fetch_add(1, Ordering::Relaxed);
         tracing::debug!(target: "mem", "mem.delete");
         self.sync_active_metric();
         Ok(())
@@ -175,6 +188,7 @@ impl MemTable {
         ));
         let val = Arc::from(end);
         self.rep.insert(ik, val);
+        self.entry_count.fetch_add(1, Ordering::Relaxed);
         self.range_index.write().push(RangeTombstoneRecord {
             start: start.to_vec(),
             end: end.to_vec(),
