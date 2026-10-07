@@ -58,7 +58,7 @@
 
 **MVCC**: 多版本并发控制, 通过快照实现隔离读取.
 
-**estimate_entry_count**: 已打开 SSTable 的 `num_entries` 与活跃, 不可变 MemTable 的 `entry_count` 之和. 含旧版本, 点删除, 范围删除. 写路径不为这个数做存在性判断.
+**estimate_entry_count**: 已打开 SSTable 的 `num_entries` 与活跃, 不可变 MemTable 的 `entry_count` 之和. 含旧版本, 点删除, 范围删除. 写路径不为这个数做存在性判断. `DBSIZE` 与 INFO `keys_estimate` 使用这个估值, 不随逻辑 DB 改变.
 
 ## 数据路径
 
