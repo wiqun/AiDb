@@ -19,8 +19,9 @@
 //! - 本迭代器面向读路径; compaction 归并使用 `compaction::MergeIterator`, 勿混用.
 
 use crate::engine::memtable::{
-    encode_internal_key, extract_sequence, extract_user_key, extract_value_type, range_covers,
-    ImmutableMemTable, InternalKeyBytes, MemTable, MemTableIterator, ValueType, K_MAX_SEQUENCE,
+    encode_internal_key, extract_sequence, extract_user_key, extract_value_type,
+    max_covering_range_tombstone_seq, ImmutableMemTable, InternalKeyBytes, MemTable,
+    MemTableIterator, RangeTombstoneRecord, ValueType, K_MAX_SEQUENCE,
 };
 use crate::engine::sstable::{SSTableIterator, SSTableReader};
 use crate::error::Result;
@@ -249,7 +250,7 @@ pub struct DBIterator {
     sequence: u64,
     layers: Vec<LayerIter>,
     end_key: Option<Vec<u8>>,
-    range_tombstones: Vec<(Vec<u8>, Vec<u8>, u64)>,
+    range_tombstones: Vec<RangeTombstoneRecord>,
     stats: Option<Arc<Statistics>>,
 }
 
@@ -257,22 +258,32 @@ fn collect_all_range_tombstones(
     memtable: &MemTable,
     immutables: &[ImmutableMemTable],
     sstables: &[Vec<Arc<SSTableReader>>],
-) -> Vec<(Vec<u8>, Vec<u8>, u64)> {
+) -> Vec<RangeTombstoneRecord> {
     let mut out = Vec::new();
-    if let Ok(mut v) = memtable.collect_range_tombstones() {
-        out.append(&mut v);
+    if let Ok(v) = memtable.collect_range_tombstones() {
+        push_range_records(&mut out, v);
     }
     for imm in immutables {
-        if let Ok(mut v) = imm.collect_range_tombstones() {
-            out.append(&mut v);
+        if let Ok(v) = imm.collect_range_tombstones() {
+            push_range_records(&mut out, v);
         }
     }
     for level in sstables {
         for reader in level {
-            out.extend(reader.collect_range_tombstones());
+            push_range_records(&mut out, reader.collect_range_tombstones());
         }
     }
     out
+}
+
+fn push_range_records(out: &mut Vec<RangeTombstoneRecord>, records: Vec<(Vec<u8>, Vec<u8>, u64)>) {
+    for (start, end, sequence) in records {
+        out.push(RangeTombstoneRecord {
+            start,
+            end,
+            sequence,
+        });
+    }
 }
 
 impl DBIterator {
@@ -370,11 +381,7 @@ impl DBIterator {
     }
 
     fn max_covering_range_seq(&self, user_key: &[u8]) -> Option<u64> {
-        self.range_tombstones
-            .iter()
-            .filter(|(start, end, seq)| *seq <= self.sequence && range_covers(start, end, user_key))
-            .map(|(_, _, seq)| *seq)
-            .max()
+        max_covering_range_tombstone_seq(&self.range_tombstones, user_key, self.sequence)
     }
 
     fn load_next_valid(&mut self) {

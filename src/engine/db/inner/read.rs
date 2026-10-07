@@ -7,6 +7,7 @@ use super::{
     encode_internal_key_buffered, extract_sequence, AtomicOrdering, DbIterGuard, Error, MemTable,
     PointState, Result, SSTableReader, Snapshot, ValueType, DB,
 };
+use crate::engine::memtable::{max_covering_range_tombstone_seq, RangeTombstoneRecord};
 use crate::statistics::DbOp;
 use std::sync::Arc;
 
@@ -108,6 +109,24 @@ impl DB {
         self.get_from_sstables(key, max_seq)
     }
 
+    fn max_range_seq_across_indexes(&self, key: &[u8], max_seq: u64) -> Option<u64> {
+        let mut records = Vec::new();
+        if let Ok(found) = self.memtable.read().collect_range_tombstones() {
+            push_range_records(&mut records, found);
+        }
+        for imm in self.immutable_memtables.read().iter() {
+            if let Ok(found) = imm.collect_range_tombstones() {
+                push_range_records(&mut records, found);
+            }
+        }
+        for level in self.sstables.read().iter() {
+            for reader in level {
+                push_range_records(&mut records, reader.collect_range_tombstones());
+            }
+        }
+        max_covering_range_tombstone_seq(&records, key, max_seq)
+    }
+
     fn get_from_sstables(&self, key: &[u8], max_seq: u64) -> Result<Option<Vec<u8>>> {
         encode_internal_key_buffered(key, max_seq, ValueType::TypePut, |seek_key| {
             let tables = self.sstables.read();
@@ -167,11 +186,9 @@ impl DB {
         };
 
         absorb_point(self.memtable.read().point_state(key, max_seq)?);
-        absorb_range(self.memtable.read().max_range_tombstone_seq(key, max_seq)?);
 
         for imm in self.immutable_memtables.read().iter().rev() {
             absorb_point(imm.point_state(key, max_seq)?);
-            absorb_range(imm.max_range_tombstone_seq(key, max_seq)?);
         }
 
         let l0_readers: Vec<Arc<SSTableReader>>;
@@ -184,14 +201,13 @@ impl DB {
 
         for reader in &l0_readers {
             absorb_point(reader.point_state(key, max_seq)?);
-            absorb_range(reader.max_range_tombstone_seq(key, max_seq));
         }
         for level in &l1_plus_readers {
             if let Some(reader) = find_sstable_for_key(level, key) {
                 absorb_point(reader.point_state(key, max_seq)?);
-                absorb_range(reader.max_range_tombstone_seq(key, max_seq));
             }
         }
+        absorb_range(self.max_range_seq_across_indexes(key, max_seq));
 
         let tombstone = match (best_delete, best_range) {
             (Some(d), Some(r)) => Some(d.max(r)),
@@ -280,6 +296,16 @@ pub(super) fn min_sequence_in_memtable(mt: &MemTable) -> Option<u64> {
     min
 }
 
+fn push_range_records(out: &mut Vec<RangeTombstoneRecord>, records: Vec<(Vec<u8>, Vec<u8>, u64)>) {
+    for (start, end, sequence) in records {
+        out.push(RangeTombstoneRecord {
+            start,
+            end,
+            sequence,
+        });
+    }
+}
+
 pub(super) fn find_sstable_for_key<'a>(
     level: &'a [Arc<SSTableReader>],
     user_key: &[u8],
@@ -297,4 +323,66 @@ fn user_key_in_sstable_range(user_key: &[u8], smallest: &[u8], largest: &[u8]) -
     let s_user = &smallest[..smallest.len() - 8];
     let l_user = &largest[..largest.len() - 8];
     user_key >= s_user && user_key <= l_user
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DB;
+    use crate::config::{CompressionType, Options};
+    use crate::engine::memtable::{encode_internal_key, ValueType};
+    use crate::engine::sstable::{sstable_path, SSTableBuilder, SSTableReader};
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    fn one_entry(
+        dir: &std::path::Path,
+        num: u64,
+        user_key: &[u8],
+        seq: u64,
+        ty: ValueType,
+        value: &[u8],
+    ) -> Arc<SSTableReader> {
+        let path = sstable_path(dir, num, 1);
+        let mut b = SSTableBuilder::new(&path, 512, 16, CompressionType::None, 0.0).unwrap();
+        b.add(&encode_internal_key(user_key, seq, ty), value)
+            .unwrap();
+        b.finish().unwrap();
+        Arc::new(SSTableReader::open(&path, None).unwrap())
+    }
+
+    #[test]
+    fn get_and_scan_hide_key_covered_outside_marker_file() {
+        let dir = tempdir().unwrap();
+        let db = DB::open(dir.path(), Options::for_testing()).unwrap();
+        db.sequence.store(3, Ordering::SeqCst);
+        let file_a = one_entry(dir.path(), 1, b"a", 2, ValueType::TypeRangeDelete, b"z");
+        let file_b = one_entry(dir.path(), 2, b"m", 1, ValueType::TypePut, b"v");
+        let mut levels = vec![Vec::new(); db.options.max_levels];
+        levels[1].push(file_a);
+        levels[1].push(file_b);
+        db.replace_sstables_for_test(levels);
+        assert_eq!(db.get(b"m").unwrap(), None);
+        let keys: Vec<Vec<u8>> = db
+            .scan(None, None)
+            .unwrap()
+            .map(|item| item.unwrap().0)
+            .collect();
+        assert!(!keys.iter().any(|k| k == b"m"));
+    }
+
+    #[test]
+    fn unsorted_level_still_finds_both_keys() {
+        let dir = tempdir().unwrap();
+        let db = DB::open(dir.path(), Options::for_testing()).unwrap();
+        db.sequence.store(3, Ordering::SeqCst);
+        let file_m = one_entry(dir.path(), 1, b"m", 1, ValueType::TypePut, b"m");
+        let file_a = one_entry(dir.path(), 2, b"a", 1, ValueType::TypePut, b"a");
+        let mut levels = vec![Vec::new(); db.options.max_levels];
+        levels[1].push(file_m);
+        levels[1].push(file_a);
+        db.replace_sstables_for_test(levels);
+        assert_eq!(db.get(b"a").unwrap().as_deref(), Some(b"a".as_slice()));
+        assert_eq!(db.get(b"m").unwrap().as_deref(), Some(b"m".as_slice()));
+    }
 }

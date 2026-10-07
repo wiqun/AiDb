@@ -7,7 +7,7 @@
 //!   ├─ Bloom: may_contain(extract_user_key)      miss → 直接 None (免 I/O)
 //!   ├─ Index: find_block_handle 二分定位 Data Block
 //!   ├─ BlockCache hit → Block; miss → 文件读取 + CRC 校验
-//!   └─ Block 内扫描: user_key 匹配且 seq <= seek_seq
+//!   └─ BlockIterator::seek: user_key 匹配且 seq <= seek_seq
 //!        → get: 返回 (value, ValueType); value_type: 仅返回 ValueType
 //! ```
 //!
@@ -16,7 +16,6 @@
 //! - Bloom 仅索引 user_key; block 内仍按 `seq <= seek_seq` 过滤.
 //! - Bloom 缺失或解码失败 → warn 降级为无 filter, 不影响读正确性.
 
-use std::cmp::Ordering;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -190,27 +189,20 @@ impl SSTableReader {
         )?;
         let block = Block::new(block_data)?;
         let mut it = block.iter();
+        it.seek(seek_key);
         let seek_seq = extract_sequence(seek_key)?;
 
         while it.valid() {
             let key = it.key();
-            match extract_user_key(key).cmp(target_user) {
-                Ordering::Greater => break,
-                Ordering::Less => {
-                    if !it.advance() {
-                        break;
-                    }
-                    continue;
-                }
-                Ordering::Equal => {
-                    let seq = extract_sequence(key)?;
-                    if seq <= seek_seq {
-                        let ty = extract_value_type(key)?;
-                        let val = it.value().to_vec();
-                        tracing::debug!(target: "sst", found = true, "sst.seek.result");
-                        return Ok(Some((val, ty)));
-                    }
-                }
+            if extract_user_key(key) != target_user {
+                break;
+            }
+            let seq = extract_sequence(key)?;
+            if seq <= seek_seq {
+                let ty = extract_value_type(key)?;
+                let val = it.value().to_vec();
+                tracing::debug!(target: "sst", found = true, "sst.seek.result");
+                return Ok(Some((val, ty)));
             }
             if !it.advance() {
                 break;
@@ -274,26 +266,19 @@ impl SSTableReader {
         let block_data = read_block_cached(&self.file, self.file_number, &handle, cache, stats)?;
         let block = Block::new(block_data)?;
         let mut it = block.iter();
+        it.seek(seek_key);
         let seek_seq = extract_sequence(seek_key)?;
 
         while it.valid() {
             let key = it.key();
-            match extract_user_key(key).cmp(target_user) {
-                Ordering::Greater => break,
-                Ordering::Less => {
-                    if !it.advance() {
-                        break;
-                    }
-                    continue;
-                }
-                Ordering::Equal => {
-                    let seq = extract_sequence(key)?;
-                    if seq <= seek_seq {
-                        let ty = extract_value_type(key)?;
-                        tracing::debug!(target: "sst", found = true, "sst.value_type.result");
-                        return Ok(Some(ty));
-                    }
-                }
+            if extract_user_key(key) != target_user {
+                break;
+            }
+            let seq = extract_sequence(key)?;
+            if seq <= seek_seq {
+                let ty = extract_value_type(key)?;
+                tracing::debug!(target: "sst", found = true, "sst.value_type.result");
+                return Ok(Some(ty));
             }
             if !it.advance() {
                 break;
@@ -338,36 +323,29 @@ impl SSTableReader {
         let block_data = read_block_cached(&self.file, self.file_number, &handle, cache, stats)?;
         let block = Block::new(block_data)?;
         let mut it = block.iter();
+        it.seek(&seek_key);
         let mut best = PointState::Absent;
 
         while it.valid() {
             let ik = it.key();
-            match extract_user_key(ik).cmp(target_user) {
-                Ordering::Greater => break,
-                Ordering::Less => {
-                    if !it.advance() {
-                        break;
-                    }
-                    continue;
-                }
-                Ordering::Equal => {
-                    let seq = extract_sequence(ik)?;
-                    if seq <= seek_seq {
-                        let ty = extract_value_type(ik)?;
-                        let state = match ty {
-                            ValueType::TypePut => PointState::Put(it.value().to_vec(), seq),
-                            ValueType::TypeDelete => PointState::Delete(seq),
-                            ValueType::TypeRangeDelete => PointState::Absent,
-                        };
-                        if let PointState::Put(_, s) | PointState::Delete(s) = &state {
-                            let replace = match &best {
-                                PointState::Put(_, bs) | PointState::Delete(bs) => s > bs,
-                                PointState::Absent => true,
-                            };
-                            if replace {
-                                best = state;
-                            }
-                        }
+            if extract_user_key(ik) != target_user {
+                break;
+            }
+            let seq = extract_sequence(ik)?;
+            if seq <= seek_seq {
+                let ty = extract_value_type(ik)?;
+                let state = match ty {
+                    ValueType::TypePut => PointState::Put(it.value().to_vec(), seq),
+                    ValueType::TypeDelete => PointState::Delete(seq),
+                    ValueType::TypeRangeDelete => PointState::Absent,
+                };
+                if let PointState::Put(_, s) | PointState::Delete(s) = &state {
+                    let replace = match &best {
+                        PointState::Put(_, bs) | PointState::Delete(bs) => s > bs,
+                        PointState::Absent => true,
+                    };
+                    if replace {
+                        best = state;
                     }
                 }
             }

@@ -554,6 +554,11 @@ impl DB {
         tracing::info!(target: "db", "db.close");
         Ok(())
     }
+
+    #[cfg(test)]
+    pub(super) fn replace_sstables_for_test(&self, levels: Vec<Vec<Arc<SSTableReader>>>) {
+        *self.sstables.write() = levels;
+    }
 }
 
 fn max_sequence_in_memtable(mt: &MemTable) -> u64 {

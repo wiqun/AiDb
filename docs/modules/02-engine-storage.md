@@ -53,7 +53,8 @@ description: AiDb 持久化层 — SSTable 布局、层级 compaction、布隆�
 
 - **SST 键序**: 文件内 InternalKey **严格递增**; 非排序 key → `Error::InvalidArgument`; 空 SST `finish` 拒绝; restart point 存完整 key (`shared=0`).
 - **L0 overlap**: L0 允许多文件 overlap; 新 flush 的文件插入在 `sstables[0]` **头部** (读时新→旧全扫). **L1+** 同层目标文件 range 绝不重叠.
-- **L1+ 定位**: `find_sstable_for_key` 用 **user_key range**; picker 用 meta raw range 扩展 overlap.
+- **L1+ 定位**: `find_sstable_for_key` 用 **user_key range**, 线性扫描, 不按 `smallest_key` 二分. picker 用 meta raw range 扩展 overlap.
+- **范围删除覆盖**: `get` 与 `scan` 用打开时装入的范围删除索引调用 `max_covering_range_tombstone_seq`. 索引都空时点查不收集索引. L1+ 点数据仍用 `find_sstable_for_key`, 范围覆盖看每一层每一个文件.
 - **Bloom Filter**: 仅索引 user_key; block 内仍按 `seq <= max_seq` 过滤. miss → 免 I/O; decode 失败 → open **降级**为无 filter (记录 warn 日志, 不崩溃).
 - **Block CRC 与 Handle 长度**: 校验 **解压后** payload; trailer = `[compressed_data][type:1][crc:4]`. `BlockHandle.size` 必须记录压缩后 payload 的实际长度 (不含 5B trailer). MANIFEST CRC 失败 → `Error::Corruption`.
 - **Compaction dedup 与删除标记**: `TypePut` 按 `SnapshotDedupTracker` 保留最新版本和 `seq <= min_snapshot_sequence` 的边界穿越版本, 更老版本丢弃. 点删除和范围删除在没有快照需要, 且没有幸存文件与标记范围重叠时不写入输出. 点删除的范围是那一个 user key. 范围删除的范围是 `[start, end)`.
