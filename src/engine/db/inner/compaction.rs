@@ -6,6 +6,7 @@ use super::{
     sstable_path, update_sstable_metrics, AtomicBool, AtomicOrdering, CompactionJob,
     CompactionTask, Duration, Error, Receiver, Result, SSTableReader, VersionEdit, Weak, DB,
 };
+use crate::engine::compaction::{user_key_from_internal, UserKeyRange};
 use crate::statistics::CompactionPhase;
 use std::sync::Arc;
 
@@ -95,6 +96,13 @@ impl DB {
         let file_numbers: Vec<u64> = (0..num_splits)
             .map(|_| self.version_set.read().allocate_file_number())
             .collect();
+        let consumed: Vec<u64> = task
+            .inputs
+            .iter()
+            .chain(task.expanded_inputs.iter())
+            .map(|f| f.file_number())
+            .collect();
+        let surviving = deeper_and_sibling_user_ranges(&levels, task.output_level, &consumed);
         let results = CompactionJob::new(
             task.inputs.clone(),
             task.expanded_inputs.clone(),
@@ -106,6 +114,7 @@ impl DB {
             self.options.bloom_false_positive_rate,
         )
         .with_snapshot_threshold(min_snap_seq)
+        .with_surviving_user_ranges(surviving)
         .with_filter(self.compaction_filter.read().clone())
         .run(&file_numbers)?;
 
@@ -348,5 +357,69 @@ pub(super) fn compaction_background_loop(
                 let _ = signal.recv_timeout(Duration::from_millis(db.options.compaction_poll_ms));
             }
         }
+    }
+}
+
+pub(crate) fn deeper_and_sibling_user_ranges(
+    levels: &[Vec<Arc<SSTableReader>>],
+    output_level: usize,
+    consumed: &[u64],
+) -> Vec<UserKeyRange> {
+    let mut ranges = Vec::new();
+    for files in levels.iter().skip(output_level) {
+        for file in files {
+            if consumed.contains(&file.file_number()) {
+                continue;
+            }
+            let Ok(start) = user_key_from_internal(file.smallest_key()) else {
+                continue;
+            };
+            let Ok(end) = user_key_from_internal(file.largest_key()) else {
+                continue;
+            };
+            ranges.push(UserKeyRange {
+                start: start.to_vec(),
+                end: end.to_vec(),
+            });
+        }
+    }
+    ranges
+}
+
+#[cfg(test)]
+mod tests {
+    use super::deeper_and_sibling_user_ranges;
+    use crate::config::CompressionType;
+    use crate::engine::memtable::{encode_internal_key, ValueType};
+    use crate::engine::sstable::{sstable_path, SSTableBuilder, SSTableReader};
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    fn one_key(
+        dir: &std::path::Path,
+        num: u64,
+        level: usize,
+        user_key: &[u8],
+    ) -> Arc<SSTableReader> {
+        let path = sstable_path(dir, num, level);
+        let mut b = SSTableBuilder::new(&path, 512, 16, CompressionType::None, 0.0).unwrap();
+        b.add(&encode_internal_key(user_key, 1, ValueType::TypePut), b"v")
+            .unwrap();
+        b.finish().unwrap();
+        Arc::new(SSTableReader::open(&path, None).unwrap())
+    }
+
+    #[test]
+    fn deeper_and_sibling_user_ranges_keeps_unconsumed_output_and_deeper() {
+        let dir = tempdir().unwrap();
+        let mut levels = vec![Vec::new(), Vec::new(), Vec::new()];
+        levels[1].push(one_key(dir.path(), 10, 1, b"a"));
+        levels[1].push(one_key(dir.path(), 11, 1, b"m"));
+        levels[2].push(one_key(dir.path(), 20, 2, b"z"));
+        let ranges = deeper_and_sibling_user_ranges(&levels, 1, &[10]);
+        let starts: Vec<Vec<u8>> = ranges.into_iter().map(|r| r.start).collect();
+        assert!(starts.contains(&b"m".to_vec()));
+        assert!(starts.contains(&b"z".to_vec()));
+        assert!(!starts.iter().any(|s| s == b"a"));
     }
 }
