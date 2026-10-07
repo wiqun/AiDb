@@ -22,7 +22,7 @@ pub fn optional_span(name: &'static str) -> Span {
         "db_flush" => tracing::info_span!("db_flush"),
         "cmp_run" => tracing::info_span!("cmp_run"),
         "raft_propose" => tracing::info_span!("raft_propose"),
-        "kv_command" => tracing::info_span!("kv_command"),
+        "kv_command" => tracing::info_span!("kv_command", cmd = tracing::field::Empty),
         _ => Span::none(),
     }
 }
