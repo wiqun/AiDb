@@ -419,6 +419,28 @@ impl DB {
         self.sstables.read()[0].len()
     }
 
+    /// 引擎条目估值: 已打开 SSTable 的 `num_entries` 加上活跃和不可变 MemTable 的 `entry_count`.
+    /// 不扫描 key. `properties` 缺失的文件按 0.
+    pub fn estimate_entry_count(&self) -> u64 {
+        let sst_entries = {
+            let levels = self.sstables.read();
+            levels
+                .iter()
+                .flatten()
+                .map(|reader| reader.properties().map(|p| p.num_entries).unwrap_or(0))
+                .fold(0u64, u64::saturating_add)
+        };
+        let mem_entries = self.memtable.read().entry_count();
+        let imm_entries = self
+            .immutable_memtables
+            .read()
+            .iter()
+            .fold(0u64, |sum, imm| sum.saturating_add(imm.entry_count()));
+        sst_entries
+            .saturating_add(mem_entries)
+            .saturating_add(imm_entries)
+    }
+
     /// 待 Compaction 积压量 (Pending Bytes) 纯内存现算.
     pub fn pending_compaction_bytes(&self) -> u64 {
         self.version_set
