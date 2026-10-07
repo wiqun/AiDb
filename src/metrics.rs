@@ -8,7 +8,7 @@ use parking_lot::RwLock;
 use std::sync::Arc;
 
 #[cfg(feature = "monitoring")]
-use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter};
+use opentelemetry::metrics::{Counter, Gauge, Meter};
 #[cfg(feature = "monitoring")]
 use opentelemetry::KeyValue;
 
@@ -20,11 +20,7 @@ const ATTR_OP: &str = "aidb.operation.name";
 #[cfg(feature = "monitoring")]
 const ATTR_COMPACTION_PHASE: &str = "aidb.compaction.phase";
 #[cfg(feature = "monitoring")]
-const ATTR_MEMTABLE_STATE: &str = "aidb.memtable.state";
-#[cfg(feature = "monitoring")]
-const ATTR_SSTABLE_LEVEL: &str = "aidb.sstable.level";
-#[cfg(feature = "monitoring")]
-const ATTR_BACKUP_OP: &str = "aidb.backup.operation";
+const ATTR_SSTABLE_LEVEL: &str = "level";
 #[cfg(all(feature = "monitoring", feature = "cluster"))]
 const ATTR_RAFT_RPC_TYPE: &str = "aidb.raft.rpc.type";
 #[cfg(all(feature = "monitoring", feature = "cluster"))]
@@ -36,22 +32,26 @@ const ATTR_DB_SYSTEM: &str = "db.system";
 #[cfg(feature = "monitoring")]
 const ATTR_DB_OPERATION: &str = "db.operation.name";
 #[cfg(feature = "monitoring")]
-const ATTR_WRITE_STALL_CAUSE: &str = "aidb_write_stall_cause";
+const ATTR_WRITE_STALL_CAUSE: &str = "cause";
 #[cfg(feature = "monitoring")]
-const ATTR_WRITE_STALL_TYPE: &str = "aidb_write_stall_type";
+const ATTR_WRITE_STALL_KIND: &str = "kind";
 
 #[cfg(feature = "monitoring")]
 struct OtelMetrics {
     wal_size_bytes: Gauge<f64>,
-    memtable_size_bytes: Gauge<f64>,
+    memtable_active_bytes: Gauge<f64>,
+    memtable_frozen_bytes: Gauge<f64>,
+    memtable_limit_bytes: Gauge<f64>,
+    l0_files: Gauge<f64>,
+    l0_compaction_trigger: Gauge<f64>,
+    l0_slowdown_writes_trigger: Gauge<f64>,
+    l0_stop_writes_trigger: Gauge<f64>,
     sstable_count: Gauge<f64>,
     sstable_size_bytes: Gauge<f64>,
     live_bytes: Gauge<f64>,
     operations_total: Counter<u64>,
-    operation_duration_seconds: Histogram<f64>,
     db_client_operations: Counter<u64>,
-    db_client_operation_duration: Histogram<f64>,
-    flush_duration_seconds: Histogram<f64>,
+    flush_last_duration_seconds: Gauge<f64>,
     block_cache_size_bytes: Gauge<f64>,
     block_cache_capacity_bytes: Gauge<f64>,
     block_cache_hits_total: Counter<u64>,
@@ -60,10 +60,7 @@ struct OtelMetrics {
     flush_total: Counter<u64>,
     sequence: Gauge<f64>,
     compaction_total: Counter<u64>,
-    compaction_duration_seconds: Histogram<f64>,
-    backup_total: Counter<u64>,
-    backup_size_bytes: Gauge<f64>,
-    backup_duration_seconds: Histogram<f64>,
+    compaction_last_duration_seconds: Gauge<f64>,
     #[cfg(feature = "cluster")]
     raft_rpc_total: Counter<u64>,
     #[cfg(feature = "cluster")]
@@ -82,9 +79,8 @@ struct OtelMetrics {
     logical_read_count_total: Counter<u64>,
     compaction_read_bytes_total: Counter<u64>,
     bloom_useful_total: Counter<u64>,
-    write_stall_requests_total: Counter<u64>,
-    write_stall_duration_seconds: Histogram<f64>,
-    write_stall_max_duration_seconds: Gauge<f64>,
+    write_stall_total: Counter<u64>,
+    write_stall_window_max_us: Gauge<f64>,
     compaction_pending_bytes: Gauge<f64>,
     recovery_wal_replay_duration_seconds: Gauge<f64>,
     recovery_wal_replayed_bytes: Gauge<f64>,
@@ -101,10 +97,40 @@ impl OtelMetrics {
                 .with_description("WAL 文件总大小")
                 .with_unit("By")
                 .build(),
-            memtable_size_bytes: meter
-                .f64_gauge("aidb_memtable_size_bytes")
-                .with_description("MemTable 近似大小 (user_key+value 字节)")
+            memtable_active_bytes: meter
+                .f64_gauge("aidb_memtable_active_bytes")
+                .with_description("活跃 MemTable 近似大小")
                 .with_unit("By")
+                .build(),
+            memtable_frozen_bytes: meter
+                .f64_gauge("aidb_memtable_frozen_bytes")
+                .with_description("已冻结 MemTable 近似大小")
+                .with_unit("By")
+                .build(),
+            memtable_limit_bytes: meter
+                .f64_gauge("aidb_memtable_limit_bytes")
+                .with_description("启动时的 MemTable 上限")
+                .with_unit("By")
+                .build(),
+            l0_files: meter
+                .f64_gauge("aidb_l0_files")
+                .with_description("L0 文件数")
+                .with_unit("1")
+                .build(),
+            l0_compaction_trigger: meter
+                .f64_gauge("aidb_l0_compaction_trigger")
+                .with_description("启动时的 L0 compaction 触发文件数")
+                .with_unit("1")
+                .build(),
+            l0_slowdown_writes_trigger: meter
+                .f64_gauge("aidb_l0_slowdown_writes_trigger")
+                .with_description("启动时的 L0 写减速文件数")
+                .with_unit("1")
+                .build(),
+            l0_stop_writes_trigger: meter
+                .f64_gauge("aidb_l0_stop_writes_trigger")
+                .with_description("启动时的 L0 写停止文件数")
+                .with_unit("1")
                 .build(),
             sstable_count: meter
                 .f64_gauge("aidb_sstable_count")
@@ -126,32 +152,15 @@ impl OtelMetrics {
                 .with_description("DB 操作总数")
                 .with_unit("1")
                 .build(),
-            operation_duration_seconds: meter
-                .f64_histogram("aidb_operation_duration_seconds")
-                .with_description("DB 操作耗时")
-                .with_unit("s")
-                .with_boundaries(vec![
-                    0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0,
-                ])
-                .build(),
             db_client_operations: meter
                 .u64_counter("db.client.operations")
                 .with_description("DB client operations (OTel semconv)")
                 .with_unit("{operation}")
                 .build(),
-            db_client_operation_duration: meter
-                .f64_histogram("db.client.operation.duration")
-                .with_description("DB client operation duration (OTel semconv)")
+            flush_last_duration_seconds: meter
+                .f64_gauge("aidb_flush_last_duration_seconds")
+                .with_description("最近一次 flush 耗时")
                 .with_unit("s")
-                .with_boundaries(vec![
-                    0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0,
-                ])
-                .build(),
-            flush_duration_seconds: meter
-                .f64_histogram("aidb_flush_duration_seconds")
-                .with_description("MemTable flush 耗时")
-                .with_unit("s")
-                .with_boundaries(vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0])
                 .build(),
             block_cache_size_bytes: meter
                 .f64_gauge("aidb_block_cache_size_bytes")
@@ -193,27 +202,10 @@ impl OtelMetrics {
                 .with_description("Compaction 次数")
                 .with_unit("1")
                 .build(),
-            compaction_duration_seconds: meter
-                .f64_histogram("aidb_compaction_duration_seconds")
-                .with_description("Compaction 各阶段耗时")
+            compaction_last_duration_seconds: meter
+                .f64_gauge("aidb_compaction_last_duration_seconds")
+                .with_description("最近一次 compaction 耗时")
                 .with_unit("s")
-                .with_boundaries(vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0])
-                .build(),
-            backup_total: meter
-                .u64_counter("aidb_backup_total")
-                .with_description("备份操作计数")
-                .with_unit("1")
-                .build(),
-            backup_size_bytes: meter
-                .f64_gauge("aidb_backup_size_bytes")
-                .with_description("备份文件总大小（字节）")
-                .with_unit("By")
-                .build(),
-            backup_duration_seconds: meter
-                .f64_histogram("aidb_backup_duration_seconds")
-                .with_description("备份操作耗时（秒）")
-                .with_unit("s")
-                .with_boundaries(vec![0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0])
                 .build(),
             #[cfg(feature = "cluster")]
             raft_rpc_total: meter
@@ -289,21 +281,15 @@ impl OtelMetrics {
                 .with_description("Bloom Filter 成功判定 key 不存在 (真阴性 TN) 次数")
                 .with_unit("1")
                 .build(),
-            write_stall_requests_total: meter
-                .u64_counter("aidb_write_stall_requests_total")
-                .with_description("受写停顿 (Write Stall) 影响的写入请求次数")
+            write_stall_total: meter
+                .u64_counter("aidb_write_stall_total")
+                .with_description("写停顿次数")
                 .with_unit("1")
                 .build(),
-            write_stall_duration_seconds: meter
-                .f64_histogram("aidb_write_stall_duration_seconds")
-                .with_description("写停顿 (Write Stall) 单次耗时分布")
-                .with_unit("s")
-                .with_boundaries(vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0])
-                .build(),
-            write_stall_max_duration_seconds: meter
-                .f64_gauge("aidb_write_stall_max_duration_seconds")
-                .with_description("单次最大写停顿耗时 (秒)")
-                .with_unit("s")
+            write_stall_window_max_us: meter
+                .f64_gauge("aidb_write_stall_window_max_us")
+                .with_description("本导出周期内最大写停顿")
+                .with_unit("us")
                 .build(),
             compaction_pending_bytes: meter
                 .f64_gauge("aidb_compaction_pending_bytes")
@@ -382,28 +368,11 @@ pub fn init() {
 /// 3. 获取 `stats.snapshot()` 截面;
 /// 4. 遍历各项指标差分与 Gauge 导出至 OTel;
 /// 5. 原子推进基线 `*baseline = current`;
-#[inline]
-fn histogram_bucket_rep_val_secs(b: usize) -> f64 {
-    if let Some(&val) = crate::statistics::histogram::BUCKET_MID_POINTS_SECS.get(b) {
-        val
-    } else {
-        crate::statistics::histogram::OVERFLOW_BUCKET_VALUE_SECS
-    }
-}
-
-/// 将无锁原子 Statistics 差分同步至全局 OTel instruments.
-///
-/// 锁内全链路串行化:
-/// 1. 获取 `stats.sync_baseline` 锁;
-/// 2. 若全局 OTel 尚未初始化 (`metrics()` 为 None), 立即返回且不推进基线 (防数据未导出即丢);
-/// 3. 获取 `stats.snapshot()` 截面;
-/// 4. 遍历各项指标差分与 Gauge 导出至 OTel;
-/// 5. 原子推进基线 `*baseline = current`;
 /// 6. 释放锁.
 #[cfg(feature = "monitoring")]
 pub fn sync_to_otel(stats: &crate::statistics::Statistics) {
-    use crate::statistics::histogram::NUM_HISTOGRAM_BUCKETS;
-    use crate::statistics::types::{BackupOp, CompactionPhase, DbOp};
+    use crate::statistics::types::{CompactionPhase, DbOp};
+    use std::sync::atomic::Ordering;
 
     let mut baseline = stats.sync_baseline.lock();
     let Some(m) = metrics() else {
@@ -413,6 +382,9 @@ pub fn sync_to_otel(stats: &crate::statistics::Statistics) {
 
     // 1. DB Operations Counters & Histograms
     for op in DbOp::ALL {
+        if matches!(op, DbOp::StallStop | DbOp::StallSlowdown) {
+            continue;
+        }
         let op_idx = op as usize;
         let delta = current.operations[op_idx].saturating_sub(baseline.operations[op_idx]);
         if delta > 0 {
@@ -421,38 +393,12 @@ pub fn sync_to_otel(stats: &crate::statistics::Statistics) {
             m.db_client_operations
                 .add(delta, &db_client_attrs(op.as_str()));
         }
-
-        for b in 0..NUM_HISTOGRAM_BUCKETS {
-            let b_delta = current.operation_duration_buckets[op_idx][b]
-                .saturating_sub(baseline.operation_duration_buckets[op_idx][b]);
-            if b_delta > 0 {
-                let rep_val = histogram_bucket_rep_val_secs(b);
-                let attr = kv(ATTR_OP, op.as_str());
-                let client_attrs = db_client_attrs(op.as_str());
-                for _ in 0..b_delta {
-                    m.operation_duration_seconds
-                        .record(rep_val, std::slice::from_ref(&attr));
-                    m.db_client_operation_duration
-                        .record(rep_val, &client_attrs);
-                }
-            }
-        }
     }
 
     // 2. Flush Counter & Histogram
     let flush_delta = current.flush_total.saturating_sub(baseline.flush_total);
     if flush_delta > 0 {
         m.flush_total.add(flush_delta, &[]);
-    }
-    for b in 0..NUM_HISTOGRAM_BUCKETS {
-        let b_delta =
-            current.flush_duration_buckets[b].saturating_sub(baseline.flush_duration_buckets[b]);
-        if b_delta > 0 {
-            let rep_val = histogram_bucket_rep_val_secs(b);
-            for _ in 0..b_delta {
-                m.flush_duration_seconds.record(rep_val, &[]);
-            }
-        }
     }
 
     // 3. Compaction Phases Counter & Histograms
@@ -464,42 +410,7 @@ pub fn sync_to_otel(stats: &crate::statistics::Statistics) {
             m.compaction_total
                 .add(p_delta, &[kv(ATTR_COMPACTION_PHASE, phase.as_str())]);
         }
-
-        for b in 0..NUM_HISTOGRAM_BUCKETS {
-            let b_delta = current.compaction_duration_buckets[p_idx][b]
-                .saturating_sub(baseline.compaction_duration_buckets[p_idx][b]);
-            if b_delta > 0 {
-                let rep_val = histogram_bucket_rep_val_secs(b);
-                let attr = kv(ATTR_COMPACTION_PHASE, phase.as_str());
-                for _ in 0..b_delta {
-                    m.compaction_duration_seconds
-                        .record(rep_val, std::slice::from_ref(&attr));
-                }
-            }
-        }
     }
-
-    // 4. Backup Counters, Histogram & Gauge
-    for op in BackupOp::ALL {
-        let b_idx = op as usize;
-        let delta = current.backup_total[b_idx].saturating_sub(baseline.backup_total[b_idx]);
-        if delta > 0 {
-            m.backup_total
-                .add(delta, &[kv(ATTR_BACKUP_OP, op.as_str())]);
-        }
-    }
-    for b in 0..NUM_HISTOGRAM_BUCKETS {
-        let b_delta =
-            current.backup_duration_buckets[b].saturating_sub(baseline.backup_duration_buckets[b]);
-        if b_delta > 0 {
-            let rep_val = histogram_bucket_rep_val_secs(b);
-            for _ in 0..b_delta {
-                m.backup_duration_seconds.record(rep_val, &[]);
-            }
-        }
-    }
-    m.backup_size_bytes
-        .record(current.backup_size_bytes as f64, &[]);
 
     // 5. Block Cache & Bloom Filter
     let hit_delta = current
@@ -528,13 +439,37 @@ pub fn sync_to_otel(stats: &crate::statistics::Statistics) {
 
     // 6. Gauges (物理绝对值直写)
     m.wal_size_bytes.record(current.wal_size_bytes as f64, &[]);
-    m.memtable_size_bytes.record(
-        current.memtable_size_bytes[0] as f64,
-        &[kv(ATTR_MEMTABLE_STATE, "active")],
+    m.memtable_active_bytes
+        .record(current.memtable_size_bytes[0] as f64, &[]);
+    m.memtable_frozen_bytes
+        .record(current.memtable_size_bytes[1] as f64, &[]);
+    m.memtable_limit_bytes.record(
+        stats.memtable_limit_bytes.load(Ordering::Relaxed) as f64,
+        &[],
     );
-    m.memtable_size_bytes.record(
-        current.memtable_size_bytes[1] as f64,
-        &[kv(ATTR_MEMTABLE_STATE, "frozen")],
+    m.l0_files.record(
+        current.sstable_count.first().copied().unwrap_or(0) as f64,
+        &[],
+    );
+    m.l0_compaction_trigger.record(
+        stats.l0_compaction_trigger.load(Ordering::Relaxed) as f64,
+        &[],
+    );
+    m.l0_slowdown_writes_trigger.record(
+        stats.l0_slowdown_writes_trigger.load(Ordering::Relaxed) as f64,
+        &[],
+    );
+    m.l0_stop_writes_trigger.record(
+        stats.l0_stop_writes_trigger.load(Ordering::Relaxed) as f64,
+        &[],
+    );
+    m.flush_last_duration_seconds.record(
+        stats.flush_last_duration_us.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+        &[],
+    );
+    m.compaction_last_duration_seconds.record(
+        stats.compaction_last_duration_us.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+        &[],
     );
     m.sequence.record(current.sequence as f64, &[]);
     m.live_bytes.record(current.live_bytes as f64, &[]);
@@ -663,29 +598,17 @@ pub fn sync_to_otel(stats: &crate::statistics::Statistics) {
         let (cause, stall_type) = kind.cause_and_type();
         let attrs = [
             kv(ATTR_WRITE_STALL_CAUSE, cause),
-            kv(ATTR_WRITE_STALL_TYPE, stall_type),
+            kv(ATTR_WRITE_STALL_KIND, stall_type),
         ];
         let req_delta =
             current.write_stall_requests[idx].saturating_sub(baseline.write_stall_requests[idx]);
         if req_delta > 0 {
-            m.write_stall_requests_total.add(req_delta, &attrs);
-        }
-        for b in 0..NUM_HISTOGRAM_BUCKETS {
-            let b_delta = current.write_stall_duration_buckets[idx][b]
-                .saturating_sub(baseline.write_stall_duration_buckets[idx][b]);
-            if b_delta > 0 {
-                let rep_val = histogram_bucket_rep_val_secs(b);
-                for _ in 0..b_delta {
-                    m.write_stall_duration_seconds.record(rep_val, &attrs);
-                }
-            }
+            m.write_stall_total.add(req_delta, &attrs);
         }
     }
 
-    m.write_stall_max_duration_seconds.record(
-        current.write_stall_max_duration_us as f64 / 1_000_000.0,
-        &[],
-    );
+    m.write_stall_window_max_us
+        .record(stats.take_write_stall_window_max_us() as f64, &[]);
     m.compaction_pending_bytes
         .record(current.compaction_pending_bytes as f64, &[]);
     m.recovery_wal_replay_duration_seconds.record(

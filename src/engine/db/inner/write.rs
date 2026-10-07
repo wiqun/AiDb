@@ -33,6 +33,9 @@ impl DB {
         self.stats
             .write_stall_max_duration_us
             .fetch_max(elapsed_us, AtomicOrdering::Relaxed);
+        self.stats
+            .write_stall_window_max_us
+            .fetch_max(elapsed_us, AtomicOrdering::Relaxed);
     }
 
     fn check_write_stall(&self) {
@@ -106,7 +109,6 @@ impl DB {
         // stop: 轮询等待 until L0 回到 slowdown 阈值以下
         if l0_count >= opts.level0_stop_writes_trigger {
             let start = std::time::Instant::now();
-            self.stats.operations[DbOp::StallStop as usize].fetch_add(1, AtomicOrdering::Relaxed);
             while self.sstables.read()[0].len() >= opts.level0_slowdown_writes_trigger {
                 std::thread::sleep(std::time::Duration::from_millis(opts.write_stall_poll_ms));
                 self.maybe_trigger_compaction();
@@ -128,8 +130,6 @@ impl DB {
                 0
             };
             if sleep_ms > 0 {
-                self.stats.operations[DbOp::StallSlowdown as usize]
-                    .fetch_add(1, AtomicOrdering::Relaxed);
                 let start = std::time::Instant::now();
                 std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
                 let elapsed_us = start.elapsed().as_micros() as u64;
@@ -217,6 +217,8 @@ impl DB {
         tracing::debug!(target: "db", "db.put");
         self.stats.operation_durations[DbOp::Put as usize]
             .record(op_start.elapsed().as_micros() as u64);
+        self.stats
+            .note_engine_write(op_start.elapsed().as_micros() as u64);
         Ok(())
     }
 
@@ -253,6 +255,8 @@ impl DB {
         tracing::debug!(target: "db", "db.delete");
         self.stats.operation_durations[DbOp::Delete as usize]
             .record(op_start.elapsed().as_micros() as u64);
+        self.stats
+            .note_engine_write(op_start.elapsed().as_micros() as u64);
         Ok(())
     }
 
@@ -341,6 +345,8 @@ impl DB {
         tracing::debug!(target: "db", op_count = batch.len(), "db.write_batch");
         self.stats.operation_durations[DbOp::WriteBatch as usize]
             .record(op_start.elapsed().as_micros() as u64);
+        self.stats
+            .note_engine_write(op_start.elapsed().as_micros() as u64);
         Ok(())
     }
 

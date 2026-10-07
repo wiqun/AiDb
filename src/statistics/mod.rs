@@ -76,6 +76,15 @@ pub struct Statistics {
     pub write_stall_requests: [AtomicU64; NUM_WRITE_STALL_KINDS],
     pub write_stall_durations: [AtomicHistogram; NUM_WRITE_STALL_KINDS],
     pub write_stall_max_duration_us: AtomicU64,
+    /// 本导出周期内的最大停顿微秒. `take_write_stall_window_max_us` 读出后清零.
+    pub write_stall_window_max_us: AtomicU64,
+    pub l0_compaction_trigger: AtomicU64,
+    pub l0_slowdown_writes_trigger: AtomicU64,
+    pub l0_stop_writes_trigger: AtomicU64,
+    pub memtable_limit_bytes: AtomicU64,
+    pub flush_last_duration_us: AtomicU64,
+    pub compaction_last_duration_us: AtomicU64,
+    pub engine_write_duration: duration::LatencyHistogram,
     pub compaction_pending_bytes: AtomicU64,
     pub bloom_useful: AtomicU64,
     pub recovery_wal_replay_duration_us: AtomicU64,
@@ -147,6 +156,14 @@ impl Statistics {
             write_stall_requests: std::array::from_fn(|_| AtomicU64::new(0)),
             write_stall_durations: std::array::from_fn(|_| AtomicHistogram::default()),
             write_stall_max_duration_us: AtomicU64::new(0),
+            write_stall_window_max_us: AtomicU64::new(0),
+            l0_compaction_trigger: AtomicU64::new(0),
+            l0_slowdown_writes_trigger: AtomicU64::new(0),
+            l0_stop_writes_trigger: AtomicU64::new(0),
+            memtable_limit_bytes: AtomicU64::new(0),
+            flush_last_duration_us: AtomicU64::new(0),
+            compaction_last_duration_us: AtomicU64::new(0),
+            engine_write_duration: duration::LatencyHistogram::default(),
             compaction_pending_bytes: AtomicU64::new(0),
             bloom_useful: AtomicU64::new(0),
             recovery_wal_replay_duration_us: AtomicU64::new(0),
@@ -357,9 +374,129 @@ impl Statistics {
             h.reset();
         }
         self.write_stall_max_duration_us.store(0, Ordering::Relaxed);
+        self.write_stall_window_max_us.store(0, Ordering::Relaxed);
+        self.flush_last_duration_us.store(0, Ordering::Relaxed);
+        self.compaction_last_duration_us.store(0, Ordering::Relaxed);
+        self.engine_write_duration.reset();
         self.bloom_useful.store(0, Ordering::Relaxed);
 
         // 重置基线为默认零状态
         *baseline = StatsSnapshot::default();
+    }
+
+    /// 读出本周期最大停顿微秒并清零. 没有停顿时是 0.
+    pub fn take_write_stall_window_max_us(&self) -> u64 {
+        self.write_stall_window_max_us.swap(0, Ordering::Relaxed)
+    }
+
+    /// 只加返回的 value 长度. miss 传 0.
+    pub fn note_logical_read(&self, value_len: usize) {
+        self.logical_read_bytes
+            .fetch_add(value_len as u64, Ordering::Relaxed);
+        self.logical_read_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// compaction 读到的字节不进用户块读.
+    pub fn note_compaction_read(&self, bytes: u64) {
+        self.compaction_read_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn note_engine_write(&self, duration_us: u64) {
+        self.engine_write_duration.record(duration_us);
+    }
+}
+
+#[cfg(test)]
+fn export_catalog() -> &'static str {
+    "\
+aidb_write_stall_total
+aidb_write_stall_window_max_us
+aidb_l0_files
+aidb_l0_compaction_trigger
+aidb_l0_slowdown_writes_trigger
+aidb_l0_stop_writes_trigger
+aidb_memtable_active_bytes
+aidb_memtable_frozen_bytes
+aidb_memtable_limit_bytes
+aidb_wal_size_bytes
+aidb_wal_written_bytes_total
+aidb_flush_written_bytes_total
+aidb_compaction_written_bytes_total
+aidb_compaction_read_bytes_total
+aidb_block_read_bytes_total
+aidb_flush_last_duration_seconds
+aidb_compaction_last_duration_seconds
+aidb_engine_write_duration_seconds
+aidb_compaction_pending_bytes
+aidb_sstable_size_bytes
+aidb_block_cache_size_bytes
+aidb_block_cache_capacity_bytes
+aidb_block_cache_hits_total
+aidb_block_cache_misses_total
+aidb_bloom_false_positive_total
+aidb_bloom_useful_total
+aidb_block_seek_count_total
+aidb_logical_read_count_total
+aidb_logical_read_bytes_total
+aidb_recovery_wal_replay_duration_seconds
+"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{export_catalog, Statistics};
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn write_stall_window_resets_after_take() {
+        let stats = Statistics::default();
+        stats
+            .write_stall_window_max_us
+            .fetch_max(2_000_000, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(stats.take_write_stall_window_max_us(), 2_000_000);
+        assert_eq!(stats.take_write_stall_window_max_us(), 0);
+    }
+
+    #[test]
+    fn compaction_bytes_do_not_enter_user_block_reads() {
+        let stats = Statistics::new(4);
+        stats.note_compaction_read(64);
+        assert_eq!(stats.compaction_read_bytes.load(Ordering::Relaxed), 64);
+        assert_eq!(stats.block_read_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn l0_triggers_follow_startup_options() {
+        use crate::config::Options;
+        use crate::engine::db::DB;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let mut opts = Options::for_testing();
+        opts.level0_compaction_trigger = 3;
+        opts.level0_slowdown_writes_trigger = 9;
+        opts.level0_stop_writes_trigger = 20;
+        let db = DB::open(dir.path(), opts).unwrap();
+        assert_eq!(db.stats.l0_compaction_trigger.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            db.stats.l0_slowdown_writes_trigger.load(Ordering::Relaxed),
+            9
+        );
+        assert_eq!(db.stats.l0_stop_writes_trigger.load(Ordering::Relaxed), 20);
+    }
+
+    #[test]
+    fn export_omits_backup_lua_and_eviction() {
+        let text = export_catalog();
+        for forbidden in [
+            "aidb_backup_",
+            "used_memory_lua",
+            "evicted_keys",
+            "instantaneous_ops",
+            "avg_ttl",
+        ] {
+            assert!(!text.contains(forbidden), "{forbidden} in {text}");
+        }
     }
 }

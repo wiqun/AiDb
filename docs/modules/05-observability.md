@@ -62,15 +62,18 @@ flowchart LR
 | 指标全名 | 类型 | 标签 (Labels) | 触发与采集时机 |
 | --- | --- | --- | --- |
 | `aidb_wal_size_bytes` | Gauge | — | WAL 追加与轮转清理时刷新 |
-| `aidb_memtable_size_bytes` | Gauge | `aidb.memtable.state=active\|frozen` | MemTable 写入与冻结时统计 |
-| `aidb_sstable_count` | Gauge | `aidb.sstable.level` | flush 与 compaction 产生/删除 SST 时更新 |
-| `aidb_sstable_size_bytes` | Gauge | `aidb.sstable.level` | 同上 |
-| `aidb_operations_total` | Counter | `aidb.operation.name` | `put`, `get`, `delete`, `write_batch`, `write_batch_no_wal`, `snapshot`, `stall_stop`, `stall_slowdown` |
-| `aidb_operation_duration_seconds` | Histogram | `aidb.operation.name` | 核心同步操作耗时分布 |
+| `aidb_memtable_active_bytes` | Gauge | — | 活跃 MemTable |
+| `aidb_memtable_frozen_bytes` | Gauge | — | 已冻结 MemTable |
+| `aidb_memtable_limit_bytes` | Gauge | — | 启动时的 MemTable 上限 |
+| `aidb_l0_files` | Gauge | — | L0 文件数 |
+| `aidb_sstable_count` | Gauge | `level` | flush 与 compaction 产生/删除 SST 时更新 |
+| `aidb_sstable_size_bytes` | Gauge | `level` | 同上. 未启用 Raft 时没有 `group` |
+| `aidb_operations_total` | Counter | `aidb.operation.name` | `put`, `get`, `delete`, `write_batch`, `write_batch_no_wal`, `snapshot`. 不含 stall |
+| `aidb_engine_write_duration_seconds` | Histogram | — | 每个用户写批次一次真实耗时, 不重放桶中点 |
 | `db.client.operations` | Counter | `db.system`, `db.operation.name` | OpenTelemetry 标准语义双写 |
-| `db.client.operation.duration` | Histogram | `db.system`, `db.operation.name` | OpenTelemetry 标准语义双写 |
+| `aidb_flush_last_duration_seconds` | Gauge | — | 最近一次 flush 耗时 |
 | `aidb_flush_total` | Counter | — | MemTable flush 完成时累加 |
-| `aidb_flush_duration_seconds` | Histogram | — | MemTable flush 执行耗时 |
+| `aidb_compaction_last_duration_seconds` | Gauge | — | 最近一次 compaction 耗时 |
 | `aidb_block_cache_size_bytes` | Gauge | — | 16 分片 LRU 当前缓存占用 |
 | `aidb_block_cache_capacity_bytes` | Gauge | — | BlockCache 总容量上限 |
 | `aidb_block_cache_hits_total` | Counter | — | BlockCache 读取命中 |
@@ -78,10 +81,8 @@ flowchart LR
 | `aidb_bloom_false_positive_total` | Counter | — | Bloom Filter 假阳性穿透判定 |
 | `aidb_sequence` | Gauge | — | 最新已分配的全局 Sequence 编号 |
 | `aidb_compaction_total` | Counter | `aidb.compaction.phase=pick\|run\|apply` | Compaction 各阶段累加 |
-| `aidb_compaction_duration_seconds` | Histogram | `aidb.compaction.phase=pick\|run\|apply` | Compaction 各阶段耗时分布 |
-| `aidb_backup_total` | Counter | `aidb.backup.operation=create\|delete\|restore` | 备份与恢复操作统计 |
-| `aidb_backup_size_bytes` | Gauge | — | 最近一次备份总大小 |
-| `aidb_backup_duration_seconds` | Histogram | — | 备份打包耗时分布 |
+| `aidb_write_stall_total` | Counter | `cause`, `kind` | 六种写停顿次数 |
+| `aidb_write_stall_window_max_us` | Gauge | — | 本导出周期最大停顿微秒, 读出后清零 |
 
 ### 集群指标 (`src/cluster/metrics.rs`, 需 `monitoring` + `cluster`)
 

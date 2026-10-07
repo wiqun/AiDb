@@ -48,6 +48,14 @@ impl LatencyHistogram {
         self.sum_us.fetch_add(duration_us, Ordering::Relaxed);
     }
 
+    pub fn reset(&self) {
+        for slot in &self.buckets {
+            slot.store(0, Ordering::Relaxed);
+        }
+        self.count.store(0, Ordering::Relaxed);
+        self.sum_us.store(0, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> LatencySnapshot {
         let mut buckets = [0u64; NUM_BUCKETS];
         for (i, slot) in self.buckets.iter().enumerate() {

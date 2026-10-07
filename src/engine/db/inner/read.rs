@@ -32,13 +32,8 @@ impl DB {
         } else {
             self.get_at_sequence_fast(key, max_seq)?
         };
-        let bytes = key.len() as u64 + r.as_ref().map(|v| v.len() as u64).unwrap_or(0);
-        self.stats
-            .logical_read_bytes
-            .fetch_add(bytes, AtomicOrdering::Relaxed);
-        self.stats
-            .logical_read_count
-            .fetch_add(1, AtomicOrdering::Relaxed);
+        let bytes = r.as_ref().map(|v| v.len()).unwrap_or(0);
+        self.stats.note_logical_read(bytes);
         Ok(r)
     }
 
@@ -398,5 +393,20 @@ mod tests {
         db.replace_sstables_for_test(levels);
         assert_eq!(db.get(b"a").unwrap().as_deref(), Some(b"a".as_slice()));
         assert_eq!(db.get(b"m").unwrap().as_deref(), Some(b"m".as_slice()));
+    }
+
+    #[test]
+    fn miss_does_not_add_key_length_to_logical_read() {
+        let dir = tempdir().unwrap();
+        let db = DB::open(dir.path(), Options::for_testing()).unwrap();
+        let before = db.stats.logical_read_bytes.load(Ordering::Relaxed);
+        assert_eq!(db.get(b"missing-key").unwrap(), None);
+        let after_miss = db.stats.logical_read_bytes.load(Ordering::Relaxed);
+        assert_eq!(after_miss - before, 0);
+        db.put(b"k", b"v").unwrap();
+        let before_hit = db.stats.logical_read_bytes.load(Ordering::Relaxed);
+        assert_eq!(db.get(b"k").unwrap().as_deref(), Some(b"v".as_slice()));
+        let after_hit = db.stats.logical_read_bytes.load(Ordering::Relaxed);
+        assert_eq!(after_hit - before_hit, 1);
     }
 }

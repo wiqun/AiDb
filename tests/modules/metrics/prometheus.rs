@@ -113,23 +113,30 @@ fn test_db_operation_and_flush_duration_histograms() {
     opts.background_compaction = false;
     let db = DB::open(dir.path(), opts).unwrap();
 
-    let op_before = testutil::histogram_count(&exporter, "aidb_operation_duration_seconds");
     let client_before = testutil::counter_sum(&exporter, "db.client.operations");
-    let flush_before = testutil::histogram_count(&exporter, "aidb_flush_duration_seconds");
 
     db.put(b"k", b"v").unwrap();
     aidb::metrics::sync_to_otel(&db.statistics());
-    assert!(testutil::histogram_count(&exporter, "aidb_operation_duration_seconds") > op_before);
+    assert_eq!(
+        testutil::histogram_count(&exporter, "aidb_operation_duration_seconds"),
+        0
+    );
     assert!(testutil::counter_sum(&exporter, "db.client.operations") > client_before);
 
-    let op_mid = testutil::histogram_count(&exporter, "aidb_operation_duration_seconds");
     db.get(b"k").unwrap();
     aidb::metrics::sync_to_otel(&db.statistics());
-    assert!(testutil::histogram_count(&exporter, "aidb_operation_duration_seconds") > op_mid);
+    assert_eq!(
+        testutil::histogram_count(&exporter, "aidb_operation_duration_seconds"),
+        0
+    );
 
     db.flush().unwrap();
     aidb::metrics::sync_to_otel(&db.statistics());
-    assert!(testutil::histogram_count(&exporter, "aidb_flush_duration_seconds") > flush_before);
+    assert!(testutil::gauge_value(&exporter, "aidb_flush_last_duration_seconds") >= 0.0);
+    assert_eq!(
+        testutil::histogram_count(&exporter, "aidb_flush_duration_seconds"),
+        0
+    );
 
     db.close().unwrap();
 }

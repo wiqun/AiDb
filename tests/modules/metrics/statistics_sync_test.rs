@@ -32,11 +32,10 @@ fn test_sync_to_otel_counter_difference() {
 
 #[test]
 #[serial_test::serial]
-fn test_sync_to_otel_histogram_replay_and_twin_instrument() {
+fn test_sync_to_otel_does_not_replay_operation_histogram() {
     let exporter = testutil::init_in_memory();
     let stats = Arc::new(Statistics::default());
 
-    // 注入耗时: 50us (bucket 0: < 100us) 3 次; 200us (bucket 1: 100~500us) 2 次
     for _ in 0..3 {
         stats.operation_durations[DbOp::Put as usize].record(50);
     }
@@ -44,52 +43,31 @@ fn test_sync_to_otel_histogram_replay_and_twin_instrument() {
         stats.operation_durations[DbOp::Put as usize].record(200);
     }
 
-    let h_before = testutil::histogram_count(&exporter, "aidb_operation_duration_seconds");
-    let twin_before = testutil::histogram_count(&exporter, "db.client.operation.duration");
-
     sync_to_otel(&stats);
 
-    // 断言计数增加 5
     assert_eq!(
-        testutil::histogram_count(&exporter, "aidb_operation_duration_seconds") - h_before,
-        5
+        testutil::histogram_count(&exporter, "aidb_operation_duration_seconds"),
+        0
     );
-    // 断言孪生 instrument 同步增加 5
     assert_eq!(
-        testutil::histogram_count(&exporter, "db.client.operation.duration") - twin_before,
-        5
+        testutil::histogram_count(&exporter, "db.client.operation.duration"),
+        0
     );
-
-    // 断言桶分布: bucket 0 应包含 3 个, bucket 1 应包含 2 个
-    let buckets =
-        testutil::histogram_bucket_counts(&exporter, "aidb_operation_duration_seconds").unwrap();
-    assert!(buckets.len() >= 10);
-    // 注意: SDK 累加前若有历史可能非 0, 需校验当前桶的增量分布或在新 exporter 下精准分布
-    assert!(buckets[0] >= 3);
-    assert!(buckets[1] >= 2);
 }
 
 #[test]
 #[serial_test::serial]
-fn test_sync_to_otel_histogram_overflow_bucket_2s() {
+fn test_sync_to_otel_does_not_replay_overflow_bucket() {
     let exporter = testutil::init_in_memory();
     let stats = Arc::new(Statistics::default());
-
-    // 注入超长耗时 1.5s (1_500_000 us), 落入 bucket 9 (> 1.0s 溢出桶)
     stats.operation_durations[DbOp::Put as usize].record(1_500_000);
 
-    let h_before = testutil::histogram_count(&exporter, "aidb_operation_duration_seconds");
     sync_to_otel(&stats);
 
     assert_eq!(
-        testutil::histogram_count(&exporter, "aidb_operation_duration_seconds") - h_before,
-        1
+        testutil::histogram_count(&exporter, "aidb_operation_duration_seconds"),
+        0
     );
-
-    // 验证溢出桶: bucket 9 应有新增计数, 验证重放值 2.0s 精准落入 +Inf 桶
-    let buckets =
-        testutil::histogram_bucket_counts(&exporter, "aidb_operation_duration_seconds").unwrap();
-    assert!(buckets[9] >= 1);
 }
 
 #[test]

@@ -147,6 +147,21 @@ impl DB {
             .statistics
             .clone()
             .unwrap_or_else(|| Arc::new(Statistics::new(options.max_levels)));
+        stats.l0_compaction_trigger.store(
+            options.level0_compaction_trigger as u64,
+            AtomicOrdering::Relaxed,
+        );
+        stats.l0_slowdown_writes_trigger.store(
+            options.level0_slowdown_writes_trigger as u64,
+            AtomicOrdering::Relaxed,
+        );
+        stats.l0_stop_writes_trigger.store(
+            options.level0_stop_writes_trigger as u64,
+            AtomicOrdering::Relaxed,
+        );
+        stats
+            .memtable_limit_bytes
+            .store(options.memtable_size as u64, AtomicOrdering::Relaxed);
 
         let mut options = options;
         if options.statistics.is_none() {

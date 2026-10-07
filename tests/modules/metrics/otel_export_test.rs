@@ -24,12 +24,9 @@ fn test_otel_export_new_counters_gauges_and_stall() {
     // 注入 Write Stall
     let stall_kind = WriteStallKind::L0FilesSlowdown;
     stats.write_stall_requests[stall_kind as usize].store(5, Ordering::Relaxed);
-    for _ in 0..5 {
-        stats.write_stall_durations[stall_kind as usize].record(2500); // 2.5ms = 0.0025s
-    }
     stats
-        .write_stall_max_duration_us
-        .store(50_000, Ordering::Relaxed); // 50ms = 0.05s
+        .write_stall_window_max_us
+        .store(50_000, Ordering::Relaxed);
 
     // 注入 Pending Compaction Bytes
     stats
@@ -73,27 +70,22 @@ fn test_otel_export_new_counters_gauges_and_stall() {
         80
     );
 
-    // 验证 write_stall_requests_total
     assert_eq!(
-        testutil::counter_sum(&exporter, "aidb_write_stall_requests_total"),
+        testutil::counter_sum(&exporter, "aidb_write_stall_total"),
         5
     );
-
-    // 验证 write_stall_duration_seconds 直方图
     assert_eq!(
         testutil::histogram_count(&exporter, "aidb_write_stall_duration_seconds"),
-        5
+        0
     );
 
-    // 验证 Gauges
     assert_eq!(
         testutil::gauge_value(&exporter, "aidb_compaction_pending_bytes"),
         123_456.0
     );
-    let max_dur_sec = testutil::gauge_value(&exporter, "aidb_write_stall_max_duration_seconds");
-    assert!(
-        (max_dur_sec - 0.05).abs() < 1e-6,
-        "Expected ~0.05s, got {max_dur_sec}"
+    assert_eq!(
+        testutil::gauge_value(&exporter, "aidb_write_stall_window_max_us"),
+        50_000.0
     );
 
     // 第二次同步 (无新增增量), 验证差分推进不重复累计
@@ -103,19 +95,17 @@ fn test_otel_export_new_counters_gauges_and_stall() {
         1000
     );
     assert_eq!(
-        testutil::counter_sum(&exporter, "aidb_write_stall_requests_total"),
+        testutil::counter_sum(&exporter, "aidb_write_stall_total"),
         5
     );
     assert_eq!(
         testutil::histogram_count(&exporter, "aidb_write_stall_duration_seconds"),
-        5
+        0
     );
 
     // 增加增量
     stats.wal_written_bytes.fetch_add(500, Ordering::Relaxed);
     stats.write_stall_requests[stall_kind as usize].fetch_add(2, Ordering::Relaxed);
-    stats.write_stall_durations[stall_kind as usize].record(10_000);
-    stats.write_stall_durations[stall_kind as usize].record(10_000);
 
     sync_to_otel(&stats);
     assert_eq!(
@@ -123,11 +113,11 @@ fn test_otel_export_new_counters_gauges_and_stall() {
         1500
     );
     assert_eq!(
-        testutil::counter_sum(&exporter, "aidb_write_stall_requests_total"),
+        testutil::counter_sum(&exporter, "aidb_write_stall_total"),
         7
     );
     assert_eq!(
         testutil::histogram_count(&exporter, "aidb_write_stall_duration_seconds"),
-        7
+        0
     );
 }

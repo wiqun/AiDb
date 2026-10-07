@@ -130,9 +130,11 @@ impl DB {
             .chain(task.expanded_inputs.iter())
             .map(|f| f.file_size())
             .sum();
-        self.stats
-            .compaction_read_bytes
-            .fetch_add(read_bytes, AtomicOrdering::Relaxed);
+        self.stats.note_compaction_read(read_bytes);
+        self.stats.compaction_last_duration_us.store(
+            run_start.elapsed().as_micros() as u64,
+            AtomicOrdering::Relaxed,
+        );
 
         self.stats.compaction_phases[CompactionPhase::Run as usize]
             .fetch_add(1, AtomicOrdering::Relaxed);

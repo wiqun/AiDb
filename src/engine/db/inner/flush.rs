@@ -104,6 +104,10 @@ impl DB {
             self.stats
                 .flush_duration
                 .record(flush_start.elapsed().as_micros() as u64);
+            self.stats.flush_last_duration_us.store(
+                flush_start.elapsed().as_micros() as u64,
+                AtomicOrdering::Relaxed,
+            );
             return Ok(());
         }
         let file_size = builder.finish()?;
@@ -134,6 +138,10 @@ impl DB {
         self.stats
             .flush_duration
             .record(flush_start.elapsed().as_micros() as u64);
+        self.stats.flush_last_duration_us.store(
+            flush_start.elapsed().as_micros() as u64,
+            AtomicOrdering::Relaxed,
+        );
         Ok(())
     }
 
