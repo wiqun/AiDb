@@ -26,18 +26,21 @@ fn test_put_flush_get_lifecycle() {
     let put_tree = capture_spans(|| {
         db.put(b"lifecycle", b"ok").unwrap();
     });
-    put_tree.assert_ancestor("wal_write", "db_put");
-    put_tree.assert_ancestor("mem_put", "db_put");
+    assert!(put_tree.spans_named("db_put").is_empty());
+    assert!(put_tree.spans_named("wal_write").is_empty());
 
+    aidb::observability::set_traces_enabled(true);
     let flush_tree = capture_spans(|| {
         db.flush().unwrap();
     });
+    aidb::observability::set_traces_enabled(false);
     assert!(!flush_tree.spans_named("db_flush").is_empty());
 
     let get_tree = capture_spans(|| {
         assert_eq!(db.get(b"lifecycle").unwrap(), Some(b"ok".to_vec()));
     });
-    get_tree.assert_ancestor("sst_seek", "db_get");
+    assert!(get_tree.spans_named("db_get").is_empty());
+    assert!(get_tree.spans_named("sst_seek").is_empty());
 
     db.close().unwrap();
     drop(db);

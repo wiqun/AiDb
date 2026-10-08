@@ -23,7 +23,8 @@ fn test_user_read_and_logical_bytes() {
 
     let target_key = b"k_10";
     let expected_val = vec![b'v'; 128];
-    let kv_len = (target_key.len() + expected_val.len()) as u64;
+    // 点查只计返回的 value 长度. miss 不加 key 长度.
+    let kv_len = expected_val.len() as u64;
 
     let block_read_0 = stats.block_read_bytes.load(Ordering::Relaxed);
     let logical_read_0 = stats.logical_read_bytes.load(Ordering::Relaxed);
@@ -42,7 +43,7 @@ fn test_user_read_and_logical_bytes() {
     assert_eq!(
         logical_read_1,
         logical_read_0 + kv_len,
-        "Cold read must increment logical_read_bytes by key.len() + val.len()"
+        "Cold read must increment logical_read_bytes by value length"
     );
 
     // 2. 热读: 命中 BlockCache, block_read_bytes 不变, logical_read_bytes 继续增加

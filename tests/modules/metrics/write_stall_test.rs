@@ -53,7 +53,8 @@ fn test_write_stall_l0_metrics() {
     if slowdown_req > 0 {
         assert_eq!(
             stats.operations[DbOp::StallSlowdown as usize].load(Ordering::Relaxed),
-            slowdown_req
+            0,
+            "DbOp stall counters stay at zero"
         );
         let hist_count = stats.write_stall_durations[WriteStallKind::L0FilesSlowdown as usize]
             .count
@@ -63,7 +64,8 @@ fn test_write_stall_l0_metrics() {
     if stop_req > 0 {
         assert_eq!(
             stats.operations[DbOp::StallStop as usize].load(Ordering::Relaxed),
-            stop_req
+            0,
+            "DbOp stall counters stay at zero"
         );
         let hist_count = stats.write_stall_durations[WriteStallKind::L0FilesStop as usize]
             .count

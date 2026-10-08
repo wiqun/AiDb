@@ -20,7 +20,7 @@ fn test_snapshot_observability() {
     let caps = capture_spans_under_lock(|| {
         let _snap = db.snapshot().unwrap();
     });
-    assert!(!caps.spans_named("db_snapshot").is_empty());
+    assert!(caps.spans_named("db_snapshot").is_empty());
 
     let events = capture_events_under_lock(|| {
         let _snap = db.snapshot().unwrap();

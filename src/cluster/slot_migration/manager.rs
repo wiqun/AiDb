@@ -424,7 +424,8 @@ impl SlotMigrationManager {
             return Err(ClusterError::InvalidState("migration already in progress".into()).into());
         }
 
-        // Begin via MetaRaft
+        // Begin via MetaRaft. propose 在 follower 上转发到 leader 后就会返回,
+        // 本机状态机要等复制才看得到. migration_id 取的是 apply 后的 version.
         self.meta_raft
             .propose(MetaRequest::BeginSlotMigration {
                 source_group,
@@ -432,6 +433,19 @@ impl SlotMigrationManager {
                 slots: slots.clone(),
             })
             .await?;
+        if let Err(e) = self.wait_until_local_migration(&slots).await {
+            if let Err(cancel_err) = self
+                .meta_raft
+                .propose(MetaRequest::CancelSlotMigration)
+                .await
+            {
+                tracing::warn!(
+                    error = %cancel_err,
+                    "local meta lagged after BeginSlotMigration and cancel also failed"
+                );
+            }
+            return Err(e);
+        }
 
         let migration_id = self.meta_raft.get_cluster_meta().version;
         let executor = SlotMigrationExecutor::new(
@@ -674,6 +688,32 @@ impl SlotMigrationManager {
     /// slots)`, 而不是从本地 `executor`/`last_run` 推断 —— 这两者在
     /// `run_pending_migration` 执行后会被清空/消费, 不能用来判断"当前是否有
     /// 迁移在进行".
+    /// Begin 已提交后, 等到本机 Meta 状态机出现同一批 slot.
+    /// follower 上 propose 返回时复制可能还没应用到本机, 多等几秒.
+    async fn wait_until_local_migration(&self, slots: &[u16]) -> Result<()> {
+        const ATTEMPTS: u32 = 150;
+        for _ in 0..ATTEMPTS {
+            if self.local_migration_slots_match(slots) {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(CANCEL_META_WAIT_MS)).await;
+        }
+        Err(ClusterError::InvalidState(
+            "BeginSlotMigration committed but local meta has not applied it".into(),
+        )
+        .into())
+    }
+
+    fn local_migration_slots_match(&self, slots: &[u16]) -> bool {
+        match self.meta_raft.get_migration_state() {
+            Some(SlotMigrationState::Prepare { slots: got, .. })
+            | Some(SlotMigrationState::Migrating { slots: got, .. })
+            | Some(SlotMigrationState::Frozen { slots: got, .. })
+            | Some(SlotMigrationState::ReadyToCommit { slots: got, .. }) => got.as_slice() == slots,
+            None => false,
+        }
+    }
+
     fn current_migration_signature(&self) -> Result<(u64, u64, Vec<u16>)> {
         match self.meta_raft.get_migration_state() {
             None => Err(ClusterError::InvalidState("no active migration".into()).into()),
