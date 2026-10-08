@@ -54,7 +54,7 @@ fn bench_write_sequential(c: &mut Criterion) {
                     black_box(vec![0u8; 1024]),
                 );
             }
-            let _ = db.write(black_box(&batch)).unwrap();
+            db.write(black_box(&batch)).unwrap();
             db.flush().unwrap();
         });
     });

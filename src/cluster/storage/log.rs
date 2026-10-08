@@ -40,7 +40,7 @@ impl OpenRaftStorage {
     pub(crate) fn save_vote_internal(&self, vote: &VOf) -> Result<()> {
         let data =
             rmp_serde::to_vec(vote).map_err(|e| ClusterError::Serialization(e.to_string()))?;
-        let _ = self.db.put(&vote_key(self.group_id), &data)?;
+        self.db.put(&vote_key(self.group_id), &data)?;
         self.state.write().vote = Some(*vote);
         Ok(())
     }
@@ -115,7 +115,7 @@ impl OpenRaftStorage {
                 .map_err(|e| ClusterError::Serialization(e.to_string()))?;
             batch.put(last_log_id_key(self.group_id), data);
         }
-        let _ = self.db.write(&batch)?;
+        self.db.write(&batch)?;
         let mut state = self.state.write();
         if let Some(last) = entries.last() {
             state.last_log_id = Some(last.log_id);
@@ -158,7 +158,7 @@ impl OpenRaftStorage {
             if let Some(ref lid) = state.last_log_id {
                 let data = rmp_serde::to_vec(lid)
                     .map_err(|e| ClusterError::Serialization(e.to_string()))?;
-                let _ = self.db.put(&last_log_id_key(self.group_id), &data)?;
+                self.db.put(&last_log_id_key(self.group_id), &data)?;
             }
         }
         Ok(())
@@ -189,7 +189,7 @@ impl OpenRaftStorage {
         self.state.write().last_purged_log_id = Some(log_id);
         let data =
             rmp_serde::to_vec(&log_id).map_err(|e| ClusterError::Serialization(e.to_string()))?;
-        let _ = self.db.put(&last_purged_log_id_key(self.group_id), &data)?;
+        self.db.put(&last_purged_log_id_key(self.group_id), &data)?;
         Ok(())
     }
 
@@ -315,7 +315,7 @@ impl OpenRaftStorage {
                                     openraft::StoredMembership::new(Some(entry.log_id), m.clone());
                                 let mem_data = postcard::to_allocvec(&stored)
                                     .map_err(|e| ClusterError::Serialization(e.to_string()))?;
-                                let _ = self.db.put(&membership_key(gid), &mem_data)?;
+                                self.db.put(&membership_key(gid), &mem_data)?;
                                 break;
                             }
                         }

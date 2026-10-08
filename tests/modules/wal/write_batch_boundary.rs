@@ -35,7 +35,7 @@ fn write_test_batch(db: &DB, batch_size: usize, value: &[u8]) {
     for i in 0..batch_size {
         batch.put(format!("k{i}").as_bytes(), value);
     }
-    let _ = db.write(&batch).unwrap();
+    db.write(&batch).unwrap();
 }
 
 fn count_recovered_puts(result: &aidb::engine::wal::manager::RecoveryResult) -> usize {

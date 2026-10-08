@@ -44,7 +44,7 @@ fn test_wa_wal_and_logical_bytes() {
     batch.delete(b"bk2");
     let batch_bytes = (b"bk1".len() + b"bv1".len() + b"bk2".len()) as u64;
 
-    let _ = db.write(&batch).unwrap();
+    db.write(&batch).unwrap();
     let logical_after_batch = stats.logical_write_bytes.load(Ordering::Relaxed);
     assert_eq!(
         logical_after_batch,

@@ -89,7 +89,7 @@ fn test_write_batch_empty() {
     let dir = tempdir().unwrap();
     let db = DB::open(dir.path(), small_opts()).unwrap();
     let batch = WriteBatch::new();
-    let _ = db.write(&batch).unwrap();
+    db.write(&batch).unwrap();
     db.close().unwrap();
 }
 
@@ -101,7 +101,7 @@ fn test_write_batch_mixed() {
     batch.put(b"a", b"1");
     batch.put(b"b", b"2");
     batch.delete(b"a");
-    let _ = db.write(&batch).unwrap();
+    db.write(&batch).unwrap();
     assert_eq!(db.get(b"a").unwrap(), None);
     assert_eq!(db.get(b"b").unwrap(), Some(b"2".to_vec()));
     db.close().unwrap();

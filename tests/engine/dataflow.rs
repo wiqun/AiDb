@@ -55,13 +55,13 @@ fn test_write_batch_keyspace_net_add() {
     let mut batch = WriteBatch::new();
     batch.put(b"wb:k1", b"v1");
     batch.put(b"wb:k2", b"v2");
-    let _ = db.write(&batch).unwrap();
+    db.write(&batch).unwrap();
     assert_eq!(scan_key_count(&db), 2);
 
     let mut overwrite = WriteBatch::new();
     overwrite.put(b"wb:k1", b"v1-new");
     overwrite.delete(b"wb:k2");
-    let _ = db.write(&overwrite).unwrap();
+    db.write(&overwrite).unwrap();
     assert_eq!(scan_key_count(&db), 1);
     assert_eq!(db.get(b"wb:k1").unwrap(), Some(b"v1-new".to_vec()));
 

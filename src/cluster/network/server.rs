@@ -143,6 +143,7 @@ impl RaftService for RaftServiceImpl {
         request: TonicRequest<raft_rpc::AppendEntriesRequest>,
     ) -> std::result::Result<tonic::Response<raft_rpc::AppendEntriesResponse>, tonic::Status> {
         let req = request.into_inner();
+        crate::cluster::contact::note_leader_append(req.group_id);
         if let Some(stats) = &self.dispatcher.stats {
             stats.raft_rpc[RaftRpcType::AppendEntries as usize]
                 [RaftRpcDirection::Incoming as usize]

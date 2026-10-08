@@ -1,5 +1,6 @@
 //! AiDb 分布式集群 (Phase 12: 单 Raft Group; Phase 13: MetaRaft).
 
+pub mod contact;
 #[cfg(feature = "cluster-test-util")]
 pub mod failpoint;
 pub mod leader_watcher;

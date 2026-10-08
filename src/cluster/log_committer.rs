@@ -611,7 +611,7 @@ fn sync_flush(
             }
         }
 
-        let _ = db.write(&batch)?;
+        db.write(&batch)?;
     }
 
     // 2. Truncate — 使用 DB 级别的 delete_range
@@ -630,7 +630,7 @@ fn sync_flush(
                             .map_err(|e| ClusterError::Serialization(e.to_string()))?;
                         let mut b = WriteBatch::new();
                         b.put(keys::last_log_id_key(group_id), lid_data);
-                        let _ = db.write(&b)?;
+                        db.write(&b)?;
                     }
                 }
             }

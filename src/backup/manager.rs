@@ -155,9 +155,8 @@ impl BackupManager {
     ) -> Result<BackupId> {
         let backup_id = timestamp_nanos();
         self.create_backup_inner(db, backup_id, description)
-            .map_err(|e| {
+            .inspect_err(|e| {
                 note_backup_failed(backup_id, &e.to_string());
-                e
             })
     }
 

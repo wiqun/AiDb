@@ -55,12 +55,11 @@ impl OpenRaftStorage {
     pub(crate) fn apply_batch_to_sm(&self, batch: &ThinWriteBatch) -> Result<()> {
         let mut db_batch = WriteBatch::new();
         let mut overlay = HashMap::new();
-        let _ = self.append_thin_batch_to_db_batch(&mut db_batch, batch, &mut overlay)?;
+        self.append_thin_batch_to_db_batch(&mut db_batch, batch, &mut overlay)?;
         if db_batch.is_empty() {
             return Ok(());
         }
-        let _ = self
-            .db
+        self.db
             .write(&db_batch)
             .map_err(|e| Error::Cluster(map_db_err(e)))?;
         Ok(())
@@ -74,12 +73,11 @@ impl OpenRaftStorage {
     ) -> Result<()> {
         let mut db_batch = WriteBatch::new();
         let mut overlay = HashMap::new();
-        let _ = self.append_migration_write_to_batch(&mut db_batch, epoch, ops, &mut overlay)?;
+        self.append_migration_write_to_batch(&mut db_batch, epoch, ops, &mut overlay)?;
         if db_batch.is_empty() {
             return Ok(());
         }
-        let _ = self
-            .db
+        self.db
             .write(&db_batch)
             .map_err(|e| Error::Cluster(map_db_err(e)))?;
         Ok(())
@@ -104,8 +102,7 @@ impl OpenRaftStorage {
         if batch.is_empty() {
             return Ok(());
         }
-        let _ = self
-            .db
+        self.db
             .write(&batch)
             .map_err(|e| Error::Cluster(map_db_err(e)))?;
         Ok(())
@@ -206,8 +203,7 @@ impl OpenRaftStorage {
                         crate::cluster::failpoint::fire(
                             crate::cluster::FailPoint::ApplyBeforePersist,
                         );
-                        let _ = self
-                            .db
+                        self.db
                             .write_without_wal(&batch)
                             .map_err(|e| Error::Cluster(map_db_err(e)))?;
                         #[cfg(feature = "cluster-test-util")]
@@ -430,8 +426,7 @@ impl OpenRaftStorage {
             last_applied_key(self.group_id),
             Self::serialize_last_applied(log_id)?,
         );
-        let _ = self
-            .db
+        self.db
             .write(&batch)
             .map_err(|e| Error::Cluster(map_db_err(e)))?;
         self.state.write().last_applied = Some(*log_id);
@@ -452,8 +447,7 @@ impl OpenRaftStorage {
             last_applied_key(self.group_id),
             Self::serialize_last_applied(log_id)?,
         );
-        let _ = self
-            .db
+        self.db
             .write(&batch)
             .map_err(|e| Error::Cluster(map_db_err(e)))?;
         self.state.write().last_applied = Some(*log_id);
@@ -476,8 +470,7 @@ impl OpenRaftStorage {
             last_applied_key(self.group_id),
             Self::serialize_last_applied(log_id)?,
         );
-        let _ = self
-            .db
+        self.db
             .write(&batch)
             .map_err(|e| Error::Cluster(map_db_err(e)))?;
         self.state.write().last_applied = Some(*log_id);
