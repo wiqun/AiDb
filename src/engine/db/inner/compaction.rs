@@ -138,10 +138,6 @@ impl DB {
             .map(|f| f.file_size())
             .sum();
         self.stats.note_compaction_read(read_bytes);
-        self.stats.compaction_last_duration_us.store(
-            run_start.elapsed().as_micros() as u64,
-            AtomicOrdering::Relaxed,
-        );
 
         self.stats.compaction_phases[CompactionPhase::Run as usize]
             .fetch_add(1, AtomicOrdering::Relaxed);
@@ -210,6 +206,10 @@ impl DB {
                 .fetch_add(1, AtomicOrdering::Relaxed);
             self.stats.compaction_durations[CompactionPhase::Apply as usize]
                 .record(apply_start.elapsed().as_micros() as u64);
+            self.stats.compaction_last_duration_us.store(
+                run_start.elapsed().as_micros() as u64,
+                AtomicOrdering::Relaxed,
+            );
         }
 
         let pending = self.pending_compaction_bytes();
