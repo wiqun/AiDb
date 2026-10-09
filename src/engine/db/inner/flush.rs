@@ -61,7 +61,7 @@ impl DB {
             }
             let removed = self.immutable_memtables.write().remove(0);
             let removed_size = removed.approximate_size() as u64;
-            let _ = self.stats.memtable_size_bytes[1].fetch_update(
+            let _ = self.stats.memtable_size_bytes[1].try_update(
                 AtomicOrdering::Relaxed,
                 AtomicOrdering::Relaxed,
                 |cur| Some(cur.saturating_sub(removed_size)),
