@@ -3,7 +3,7 @@
 //! 随机 put/delete/flush/compact 操作序列 + 对照模型, 验证 filter 语义.
 
 use aidb::config::Options;
-use aidb::engine::compaction::{CompactionFilter, FilterDecision};
+use aidb::engine::compaction::{CompactionFilter, CompactionPointReader, FilterDecision};
 use aidb::DB;
 use proptest::prelude::*;
 use std::collections::BTreeMap;
@@ -152,4 +152,66 @@ fn prop_no_filter_keeps_all(
     db.close().unwrap();
 }
 
+}
+
+/// key 形如 `s{n}/{i}` 的是子项, 父 header 为 `h{n}`; 父不存在则子项是孤儿.
+/// 只有带点查句柄时才能判断父是否存在, 因此 `filter` 保守保留.
+struct OrphanFilter;
+
+impl CompactionFilter for OrphanFilter {
+    fn filter(&self, _level: usize, _key: &[u8], _value: &[u8]) -> FilterDecision {
+        FilterDecision::Keep
+    }
+
+    fn filter_with_reader(
+        &self,
+        _level: usize,
+        key: &[u8],
+        _value: &[u8],
+        reader: &dyn CompactionPointReader,
+    ) -> FilterDecision {
+        let user_key = aidb::engine::memtable::extract_user_key(key);
+        let Some(rest) = user_key.strip_prefix(b"s") else {
+            return FilterDecision::Keep;
+        };
+        let n = rest.split(|b| *b == b'/').next().unwrap_or_default();
+        let header = [b"h".as_slice(), n].concat();
+        match reader.get(&header) {
+            Ok(None) => FilterDecision::Remove,
+            _ => FilterDecision::Keep,
+        }
+    }
+}
+
+/// 期望: compaction 时 filter 能经 reader 点查父 header, 删除父已不存在的子项, 保留有父的子项.
+/// 这是 aikv 版本化 subkey GC 的依赖点, 必须在真实 DB compaction 路径上生效.
+#[test]
+fn filter_with_reader_drops_orphans_during_db_compaction() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(DB::open(dir.path(), test_opts()).unwrap());
+    db.set_compaction_filter(Some(Arc::new(OrphanFilter)));
+
+    db.put(b"h1", b"x").unwrap();
+    for i in 0..20u8 {
+        db.put(&[b"s1/".as_slice(), &[i]].concat(), b"v").unwrap();
+        db.put(&[b"s2/".as_slice(), &[i]].concat(), b"v").unwrap();
+    }
+    db.flush().unwrap();
+    for i in 0..5u8 {
+        db.put(&[b'p', i], &[i]).unwrap();
+        db.flush().unwrap();
+    }
+    db.drain_compactions().unwrap();
+
+    for i in 0..20u8 {
+        assert!(db
+            .get(&[b"s1/".as_slice(), &[i]].concat())
+            .unwrap()
+            .is_some());
+        assert!(db
+            .get(&[b"s2/".as_slice(), &[i]].concat())
+            .unwrap()
+            .is_none());
+    }
+    db.close().unwrap();
 }

@@ -6,9 +6,22 @@ use super::{
     sstable_path, update_sstable_metrics, AtomicBool, AtomicOrdering, CompactionJob,
     CompactionTask, Duration, Error, Receiver, Result, SSTableReader, VersionEdit, Weak, DB,
 };
-use crate::engine::compaction::{user_key_from_internal, UserKeyRange};
+use crate::engine::compaction::{user_key_from_internal, CompactionPointReader, UserKeyRange};
 use crate::statistics::CompactionPhase;
 use std::sync::Arc;
+
+/// 借用 `&DB` 的点查句柄, 只在 `run_compaction_once` 栈上存活.
+/// 读取最新可见版本, 不计入 Get 操作统计.
+struct DbPointReader<'a> {
+    db: &'a DB,
+}
+
+impl CompactionPointReader for DbPointReader<'_> {
+    fn get(&self, user_key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let max_seq = self.db.sequence.load(AtomicOrdering::SeqCst);
+        self.db.get_at_sequence_uncounted(user_key, max_seq)
+    }
+}
 
 impl DB {
     pub(super) fn maybe_trigger_compaction(&self) {
@@ -111,6 +124,7 @@ impl DB {
             .collect();
         let start = surviving_start_level(task.level, task.output_level);
         let surviving = deeper_and_sibling_user_ranges(&levels, start, &consumed);
+        let reader = DbPointReader { db: self };
         let results = CompactionJob::new(
             task.inputs.clone(),
             task.expanded_inputs.clone(),
@@ -124,7 +138,7 @@ impl DB {
         .with_snapshot_threshold(min_snap_seq)
         .with_surviving_user_ranges(surviving)
         .with_filter(self.compaction_filter.read().clone())
-        .run(&file_numbers)?;
+        .run_with_reader(&file_numbers, Some(&reader))?;
 
         let written_bytes: u64 = results.iter().map(|r| r.file_size).sum();
         self.stats

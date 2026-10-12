@@ -34,7 +34,7 @@ description: AiDb 持久化层 — SSTable 布局、层级 compaction、布隆�
 | `engine/compaction/job.rs` | 归并 dedup; subcompaction 多线程分裂 | `CompactionJob::run` |
 | `engine/compaction/merge.rs` | 多 SST 堆归并 (compaction 专用) | `MergeIterator` |
 | `engine/compaction/helpers.rs` | key range 重叠判定; user_key 提取 | `key_ranges_overlap_by_meta_raw`, `user_key_from_internal` |
-| `engine/compaction/filter.rs` | `CompactionFilter` (纯决策) + `CompactionRemovalListener` (最新 Put 被 Remove 时回调) | `FilterDecision`, `CompactionFilter`, `CompactionRemovalListener` |
+| `engine/compaction/filter.rs` | `CompactionFilter` (无写副作用, 可经 `CompactionPointReader` 点查) + `CompactionRemovalListener` (最新 Put 被 Remove 时回调) | `FilterDecision`, `CompactionFilter`, `CompactionPointReader`, `CompactionRemovalListener` |
 | `engine/filter/mod.rs` | Filter 模块根; re-export | — |
 | `engine/filter/bloom.rs` | SST 级 Bloom Filter (user_key 散列) | `BloomFilter`, `Filter` |
 | `engine/cache/mod.rs` | Cache 模块根; re-export | — |
@@ -58,6 +58,8 @@ description: AiDb 持久化层 — SSTable 布局、层级 compaction、布隆�
 - **Bloom Filter**: 仅索引 user_key; block 内仍按 `seq <= max_seq` 过滤. miss → 免 I/O; decode 失败 → open **降级**为无 filter (记录 warn 日志, 不崩溃).
 - **Block CRC 与 Handle 长度**: 校验 **解压后** payload; trailer = `[compressed_data][type:1][crc:4]`. `BlockHandle.size` 必须记录压缩后 payload 的实际长度 (不含 5B trailer). MANIFEST CRC 失败 → `Error::Corruption`.
 - **Compaction dedup 与删除标记**: `TypePut` 按 `SnapshotDedupTracker` 保留最新版本和 `seq <= min_snapshot_sequence` 的边界穿越版本, 更老版本丢弃. 点删除和范围删除在没有快照, 且没有幸存文件与标记范围重叠时不写入输出. 只要还有快照, 标记先留下. 幸存文件从源层里这次没重写的文件算起. 点删除的范围是那一个 user key. 范围删除的范围是 `[start, end)`.
+- **filter 删除最新 Put 的标记**: 最新 `TypePut` 被 filter `Remove` 时, 若存在快照 (`min_snapshot_sequence != u64::MAX`) 或幸存文件区间覆盖该 user key, 则以同 sequence 写出 `TypeDelete` 标记, 否则直接丢弃. 不写标记会让同 key 的更老版本重新可见. 标记之后仍按删除标记规则在后续 compaction 中回收.
+- **CompactionFilter 点查**: `run_compaction_once` 以 `DbPointReader` 调用 `CompactionJob::run_with_reader`. `filter_with_reader` 收到的 `CompactionPointReader` 读取最新可见版本, 不计入 Get 操作统计, 也不计入逻辑读字节. 无 reader 的 `run` 只调用 `filter`, 因此 `filter` 只能在确定可删时返回 `Remove`. Filter 不得写入引擎.
 - **CompactionRemovalListener**: 仅在 Version 安装成功后回调 `filter_removed_user_keys`; 调用方须持 `Weak<DB>` (禁止 `Arc<DB>` 回指造成泄漏). `DB::close` 在 join compaction 后将 filter/listener 置 `None`.
 - **Trivial move**: rename 后若 reader open 失败, 文件自动 rename 回原位置.
 - **Checkpoint 互斥**: `checkpoint_in_progress` 阻止 `run_compaction_once`; `pin_sstables` 防止 unlink.

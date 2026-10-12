@@ -36,6 +36,13 @@ pub fn should_drop_delete_marker(
     !overlaps
 }
 
+/// 点 key 是否落在任一幸存文件的 user key 区间内 (即该 key 的旧版本可能仍在幸存文件里).
+pub fn overlaps_surviving(user_key: &[u8], surviving: &[UserKeyRange]) -> bool {
+    surviving
+        .iter()
+        .any(|file| marker_overlaps(user_key, None, file))
+}
+
 fn marker_overlaps(marker_start: &[u8], marker_end: Option<&[u8]>, file: &UserKeyRange) -> bool {
     match marker_end {
         None => file.start.as_slice() <= marker_start && marker_start <= file.end.as_slice(),

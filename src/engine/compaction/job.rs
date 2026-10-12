@@ -20,13 +20,15 @@
 //!   快照还能看见的版本即使在最底层也留下.
 //! - 0 entry 的子任务输出空 `CompactionResult` (file_number = 0), 上层跳过 AddFile.
 
-use super::drop::{should_drop_delete_marker, UserKeyRange};
+use super::drop::{overlaps_surviving, should_drop_delete_marker, UserKeyRange};
 use super::helpers::user_key_from_internal;
 use super::merge::MergeIterator;
 use super::trackers::{RangeTombstoneTracker, SnapshotDedupTracker};
 use crate::config::CompressionType;
-use crate::engine::compaction::filter::{CompactionFilter, FilterDecision};
-use crate::engine::memtable::{extract_sequence, extract_value_type, ValueType};
+use crate::engine::compaction::filter::{CompactionFilter, CompactionPointReader, FilterDecision};
+use crate::engine::memtable::{
+    encode_internal_key, extract_sequence, extract_value_type, ValueType,
+};
 use crate::engine::sstable::{sstable_path, SSTableBuilder, SSTableReader};
 use crate::error::Result;
 use std::path::{Path, PathBuf};
@@ -111,9 +113,12 @@ impl CompactionJob {
         all
     }
 
-    /// 检查 entry 是否应被 filter 丢弃.
-    fn should_filter(&self, key: &[u8], value: &[u8]) -> bool {
-        should_filter_impl(&self.compaction_filter, self.output_level, key, value)
+    /// 写入路径用的 filter + 点查句柄. reader 为 `None` 时等价于旧的纯 `filter`.
+    fn filter_ctx<'a>(&'a self, reader: Option<&'a dyn CompactionPointReader>) -> FilterCtx<'a> {
+        FilterCtx {
+            filter: self.compaction_filter.as_deref(),
+            reader,
+        }
     }
 
     fn count_dedup_entries(&self) -> Result<usize> {
@@ -222,15 +227,30 @@ impl CompactionJob {
     /// 每个子任务使用 `file_numbers[i]` 作为输出文件编号.
     /// 调用方需预先分配所有文件编号, 避免并发分配冲突.
     pub fn run(&self, file_numbers: &[u64]) -> Result<Vec<CompactionResult>> {
+        self.run_with_reader(file_numbers, None)
+    }
+
+    /// 同 [`CompactionJob::run`], 但 filter 可经 `reader` 点查其它 key
+    /// (见 [`CompactionFilter::filter_with_reader`]). `reader` 为 `None` 时与 `run` 等价.
+    pub fn run_with_reader(
+        &self,
+        file_numbers: &[u64],
+        reader: Option<&dyn CompactionPointReader>,
+    ) -> Result<Vec<CompactionResult>> {
         if file_numbers.len() <= 1 {
             let fnum = file_numbers.first().copied().unwrap_or(0);
-            return Ok(vec![self.run_single(fnum)?]);
+            return Ok(vec![self.run_single(fnum, reader)?]);
         }
-        self.run_split(file_numbers)
+        self.run_split(file_numbers, reader)
     }
 
     /// 单线程完整 compaction. 合并 count_dedup_entries 的计数遍历和写入遍历, 减少一次完整 I/O.
-    fn run_single(&self, file_number: u64) -> Result<CompactionResult> {
+    fn run_single(
+        &self,
+        file_number: u64,
+        reader: Option<&dyn CompactionPointReader>,
+    ) -> Result<CompactionResult> {
+        let ctx = self.filter_ctx(reader);
         let output_path = sstable_path(&self.db_path, file_number, self.output_level);
 
         // 粗估条目数以设置 Bloom filter (不做精确计数, 避免双遍历)
@@ -272,7 +292,7 @@ impl CompactionJob {
 
             if last_user_key.as_deref() == Some(user_key) {
                 if !tracker.already_crossed() {
-                    if !self.should_filter(&key, &value) {
+                    if !should_filter_impl(ctx, self.output_level, &key, &value) {
                         builder.add(&key, &value)?;
                         entry_count += 1;
                     }
@@ -305,12 +325,28 @@ impl CompactionJob {
                 continue;
             }
 
-            if !self.should_filter(&key, &value) {
+            if !should_filter_impl(ctx, self.output_level, &key, &value) {
                 builder.add(&key, &value)?;
                 entry_count += 1;
             } else if value_type == ValueType::TypePut {
                 // 记录; Version 安装后再通知 listener (见 DB::run_compaction_once).
                 filter_removed.push(user_key.to_vec());
+                if let Some(marker) = removal_marker(
+                    user_key,
+                    seq,
+                    self.min_snapshot_sequence,
+                    &self.surviving_user_ranges,
+                ) {
+                    builder.add(&marker, &[])?;
+                    entry_count += 1;
+                    last_user_key = Some(user_key.to_vec());
+                    tracker.observe(seq, self.min_snapshot_sequence);
+                    if smallest_key.is_none() {
+                        smallest_key = Some(marker.clone());
+                    }
+                    largest_key = Some(marker);
+                    continue;
+                }
             }
             last_user_key = Some(user_key.to_vec());
             tracker.observe(seq, self.min_snapshot_sequence);
@@ -346,7 +382,11 @@ impl CompactionJob {
     }
 
     /// 分裂 compaction: 将输入按 key 范围分成多个子任务并行执行.
-    fn run_split(&self, file_numbers: &[u64]) -> Result<Vec<CompactionResult>> {
+    fn run_split(
+        &self,
+        file_numbers: &[u64],
+        reader: Option<&dyn CompactionPointReader>,
+    ) -> Result<Vec<CompactionResult>> {
         let num_splits = file_numbers.len();
         let (total_count, split_keys) = self.count_dedup_with_splits(num_splits)?;
 
@@ -371,7 +411,7 @@ impl CompactionJob {
         let compression = self.compression;
         let bloom_fpr = self.bloom_false_positive_rate;
         let min_snap_seq = self.min_snapshot_sequence;
-        let compaction_filter = self.compaction_filter.clone();
+        let ctx = self.filter_ctx(reader);
         let results: Vec<Result<CompactionResult>> = std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(split_keys.len() + 1);
 
@@ -388,7 +428,6 @@ impl CompactionJob {
                 };
                 let readers = Arc::clone(&all_readers);
                 let path = db_path.clone();
-                let filter = compaction_filter.clone();
                 // 最后一段取剩余估算
                 let expected = if i < split_keys.len() {
                     est_per_range
@@ -411,7 +450,7 @@ impl CompactionJob {
                         bloom_fpr,
                         min_snap_seq,
                         expected,
-                        filter,
+                        ctx,
                         surviving,
                     )
                 }));
@@ -427,8 +466,24 @@ impl CompactionJob {
 /// 单个子 compaction 任务: 以 `range_end` 为界的 `MergeIterator` 遍历输入,
 /// 仅输出在 `[range_start, range_end)` 范围内的条目.
 #[allow(clippy::too_many_arguments)]
-/// 检查 entry 是否应被 compaction filter 丢弃.
-/// 与 `CompactionJob::should_filter` 语义相同, 但以函数形式供 `write_sub_compaction` 使用.
+/// 最新 `TypePut` 被 filter 删除后, 是否需要写出同 sequence 的删除标记.
+///
+/// 更老版本仍可能在快照 (`min_snap_seq != u64::MAX`) 或幸存文件里; 没有标记它们就会重新可见.
+/// 返回 `Some(标记的内部键)` 表示需要写出.
+fn removal_marker(
+    user_key: &[u8],
+    seq: u64,
+    min_snap_seq: u64,
+    surviving: &[UserKeyRange],
+) -> Option<Vec<u8>> {
+    if min_snap_seq != u64::MAX || overlaps_surviving(user_key, surviving) {
+        Some(encode_internal_key(user_key, seq, ValueType::TypeDelete))
+    } else {
+        None
+    }
+}
+
+/// 判断删除标记是否可以不写入输出 (见 `should_drop_delete_marker`).
 fn drop_delete_marker(
     value_type: ValueType,
     sequence: u64,
@@ -452,16 +507,24 @@ fn drop_delete_marker(
     )
 }
 
-fn should_filter_impl(
-    filter: &Option<Arc<dyn CompactionFilter>>,
-    level: usize,
-    key: &[u8],
-    value: &[u8],
-) -> bool {
-    match filter {
-        Some(f) => f.filter(level, key, value) == FilterDecision::Remove,
-        None => false,
-    }
+/// filter 与可选点查句柄, 随写入路径下发. 两者都是借用, 因此整体 `Copy`, 可直接 move 进子任务线程.
+#[derive(Clone, Copy)]
+struct FilterCtx<'a> {
+    filter: Option<&'a dyn CompactionFilter>,
+    reader: Option<&'a dyn CompactionPointReader>,
+}
+
+/// 检查 entry 是否应被 compaction filter 丢弃.
+/// 有 reader 时走 `filter_with_reader`, 否则走 `filter`.
+fn should_filter_impl(ctx: FilterCtx<'_>, level: usize, key: &[u8], value: &[u8]) -> bool {
+    let Some(filter) = ctx.filter else {
+        return false;
+    };
+    let decision = match ctx.reader {
+        Some(reader) => filter.filter_with_reader(level, key, value, reader),
+        None => filter.filter(level, key, value),
+    };
+    decision == FilterDecision::Remove
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -478,7 +541,7 @@ fn write_sub_compaction(
     bloom_fpr: f64,
     min_snap_seq: u64,
     expected_keys: usize,
-    compaction_filter: Option<Arc<dyn CompactionFilter>>,
+    ctx: FilterCtx<'_>,
     surviving: Vec<UserKeyRange>,
 ) -> Result<CompactionResult> {
     let output_path = sstable_path(db_path, file_number, output_level);
@@ -544,7 +607,7 @@ fn write_sub_compaction(
 
         if last_user_key.as_deref() == Some(user_key) {
             if !tracker.already_crossed() {
-                if !should_filter_impl(&compaction_filter, output_level, &key, &value) {
+                if !should_filter_impl(ctx, output_level, &key, &value) {
                     builder.add(&key, &value)?;
                     entry_count += 1;
                 }
@@ -570,18 +633,31 @@ fn write_sub_compaction(
             continue;
         }
 
-        if !should_filter_impl(&compaction_filter, output_level, &key, &value) {
+        // 最新版本被 filter 删除时, 同 key 的更老版本若仍在快照或幸存文件里, 直接丢弃会让它们重新可见.
+        // 这种情况下以同 sequence 写出删除标记, 语义等同于 filter 把该 key 删除.
+        let tombstone: Option<Vec<u8>> = if !should_filter_impl(ctx, output_level, &key, &value) {
             builder.add(&key, &value)?;
             entry_count += 1;
+            None
         } else if value_type == ValueType::TypePut {
             filter_removed.push(user_key.to_vec());
-        }
+            match removal_marker(user_key, seq, min_snap_seq, &surviving) {
+                Some(marker) => {
+                    builder.add(&marker, &[])?;
+                    entry_count += 1;
+                    Some(marker)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         last_user_key = Some(user_key.to_vec());
         tracker.observe(seq, min_snap_seq);
         if smallest_key.is_none() {
-            smallest_key = Some(key.clone());
+            smallest_key = Some(tombstone.clone().unwrap_or_else(|| key.clone()));
         }
-        largest_key = Some(key);
+        largest_key = Some(tombstone.unwrap_or(key));
     }
 
     if entry_count == 0 {
@@ -825,5 +901,166 @@ mod tests {
         let results = job.run(&[200, 201]).unwrap();
         let total: usize = results.iter().map(|r| r.entry_count).sum();
         assert_eq!(total, 2, "a and b should each appear once after dedup");
+    }
+
+    /// 父 key 不存在时删除子 key: filter 经 reader 点查父 key.
+    /// 期望: 带 reader 的 `run_with_reader` 删除孤儿, 单子任务与多子任务 (线程路径) 都一致.
+    #[test]
+    fn test_filter_with_reader_sees_reader_in_single_and_split_paths() {
+        use crate::engine::compaction::{CompactionFilter, CompactionPointReader, FilterDecision};
+
+        struct ParentReader;
+        impl CompactionPointReader for ParentReader {
+            fn get(&self, user_key: &[u8]) -> crate::Result<Option<Vec<u8>>> {
+                Ok((user_key == b"live").then(|| b"1".to_vec()))
+            }
+        }
+
+        /// key 形如 "{parent}/x": 父 key 不存在就删除; 无 reader 时保守保留.
+        struct DropOrphans;
+        impl CompactionFilter for DropOrphans {
+            fn filter(&self, _: usize, _: &[u8], _: &[u8]) -> FilterDecision {
+                FilterDecision::Keep
+            }
+            fn filter_with_reader(
+                &self,
+                _: usize,
+                key: &[u8],
+                _: &[u8],
+                reader: &dyn CompactionPointReader,
+            ) -> FilterDecision {
+                let user_key = crate::engine::memtable::extract_user_key(key);
+                let parent = user_key.split(|b| *b == b'/').next().unwrap_or_default();
+                match reader.get(parent) {
+                    Ok(None) => FilterDecision::Remove,
+                    _ => FilterDecision::Keep,
+                }
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let make = |num: u64| {
+            sst(
+                dir.path(),
+                num,
+                0,
+                &[
+                    (b"dead/x", 2, ValueType::TypePut, b"v"),
+                    (b"live/x", 1, ValueType::TypePut, b"v"),
+                ],
+            )
+        };
+        let job = CompactionJob::new(
+            vec![make(1)],
+            vec![],
+            1,
+            dir.path().to_path_buf(),
+            512,
+            16,
+            CompressionType::None,
+            0.0,
+        )
+        .with_filter(Some(Arc::new(DropOrphans)));
+
+        let without_reader = job.run(&[30]).unwrap();
+        assert_eq!(without_reader[0].entry_count, 2);
+
+        let single = job.run_with_reader(&[31], Some(&ParentReader)).unwrap();
+        assert_eq!(single[0].entry_count, 1);
+        let reader = SSTableReader::open(&single[0].output_path, None).unwrap();
+        let seek = encode_internal_key(b"live/x", u64::MAX, ValueType::TypePut);
+        assert!(reader.get(&seek).unwrap().is_some());
+
+        let split = job.run_with_reader(&[32, 33], Some(&ParentReader)).unwrap();
+        let total: usize = split.iter().map(|r| r.entry_count).sum();
+        assert_eq!(total, 1, "线程路径也应删除孤儿 key");
+    }
+
+    /// filter 删除 key `k` 的最新版本, 而更深层幸存文件里仍有 `k` 的旧版本.
+    /// 现象: 旧实现直接丢弃最新版本, compaction 后旧值重新可见.
+    /// 期望: 输出以同 sequence 写出删除标记, 读取得到 None. 单文件与分裂两条路径都要满足.
+    #[test]
+    fn test_filter_remove_over_surviving_writes_tombstone() {
+        use crate::engine::compaction::{CompactionFilter, FilterDecision};
+
+        struct DropAll;
+        impl CompactionFilter for DropAll {
+            fn filter(&self, _: usize, _: &[u8], _: &[u8]) -> FilterDecision {
+                FilterDecision::Remove
+            }
+        }
+
+        let surviving = vec![UserKeyRange {
+            start: b"a".to_vec(),
+            end: b"z".to_vec(),
+        }];
+        let dir = tempdir().unwrap();
+        let make_job = |num: u64| {
+            let a = sst(dir.path(), num, 0, &[(b"k", 5, ValueType::TypePut, b"new")]);
+            CompactionJob::new(
+                vec![a],
+                vec![],
+                1,
+                dir.path().to_path_buf(),
+                512,
+                16,
+                CompressionType::None,
+                0.0,
+            )
+            .with_filter(Some(Arc::new(DropAll)))
+            .with_surviving_user_ranges(surviving.clone())
+        };
+
+        for file_numbers in [vec![40u64], vec![41, 42]] {
+            let job = make_job(file_numbers[0] + 100);
+            let out = job.run(&file_numbers).unwrap();
+            let total: usize = out.iter().map(|r| r.entry_count).sum();
+            assert_eq!(total, 1, "{file_numbers:?}: 应只写出一条删除标记");
+            let removed: Vec<Vec<u8>> = out
+                .iter()
+                .flat_map(|r| r.filter_removed_user_keys.clone())
+                .collect();
+            assert_eq!(removed, vec![b"k".to_vec()], "{file_numbers:?}");
+            let written = out.iter().find(|r| r.entry_count == 1).unwrap();
+            let reader = SSTableReader::open(&written.output_path, None).unwrap();
+            let seek = encode_internal_key(b"k", u64::MAX, ValueType::TypePut);
+            let (_, ty) = reader.get(&seek).unwrap().expect("tombstone");
+            assert_eq!(ty, ValueType::TypeDelete, "{file_numbers:?}");
+        }
+    }
+
+    /// 有活跃快照时, 即使没有幸存文件重叠, 最新版本被 filter 删除也要留下删除标记.
+    /// 期望: 快照之前的版本仍可读, 快照之后看到删除. 无快照且无幸存重叠时不写标记 (见上一测试的对照).
+    #[test]
+    fn test_filter_remove_with_snapshot_writes_tombstone() {
+        use crate::engine::compaction::{CompactionFilter, FilterDecision};
+
+        struct DropAll;
+        impl CompactionFilter for DropAll {
+            fn filter(&self, _: usize, _: &[u8], _: &[u8]) -> FilterDecision {
+                FilterDecision::Remove
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let a = sst(dir.path(), 1, 0, &[(b"k", 5, ValueType::TypePut, b"new")]);
+        let job = CompactionJob::new(
+            vec![a],
+            vec![],
+            1,
+            dir.path().to_path_buf(),
+            512,
+            16,
+            CompressionType::None,
+            0.0,
+        )
+        .with_filter(Some(Arc::new(DropAll)))
+        .with_snapshot_threshold(3);
+        let out = job.run(&[50]).unwrap();
+        assert_eq!(out[0].entry_count, 1);
+        let reader = SSTableReader::open(&out[0].output_path, None).unwrap();
+        let seek = encode_internal_key(b"k", u64::MAX, ValueType::TypePut);
+        let (_, ty) = reader.get(&seek).unwrap().expect("tombstone");
+        assert_eq!(ty, ValueType::TypeDelete);
     }
 }

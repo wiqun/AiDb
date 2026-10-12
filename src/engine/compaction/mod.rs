@@ -10,7 +10,9 @@ mod trackers;
 mod version;
 
 pub use drop::UserKeyRange;
-pub use filter::{CompactionFilter, CompactionRemovalListener, FilterDecision};
+pub use filter::{
+    CompactionFilter, CompactionPointReader, CompactionRemovalListener, FilterDecision,
+};
 pub use helpers::{key_ranges_overlap_by_meta_raw, user_key_from_internal};
 pub use job::{CompactionJob, CompactionResult};
 pub use merge::MergeIterator;

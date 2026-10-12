@@ -26,14 +26,23 @@ impl DB {
     }
 
     pub(crate) fn get_at_sequence(&self, key: &[u8], max_seq: u64) -> Result<Option<Vec<u8>>> {
-        let r = if self.has_active_range_tombstones() {
-            self.get_at_sequence_with_range_tombstones(key, max_seq)?
-        } else {
-            self.get_at_sequence_fast(key, max_seq)?
-        };
+        let r = self.get_at_sequence_uncounted(key, max_seq)?;
         let bytes = r.as_ref().map(|v| v.len()).unwrap_or(0);
         self.stats.note_logical_read(bytes);
         Ok(r)
+    }
+
+    /// 与 `get_at_sequence` 结果相同, 但不计入逻辑读统计 (compaction 点查使用).
+    pub(crate) fn get_at_sequence_uncounted(
+        &self,
+        key: &[u8],
+        max_seq: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        if self.has_active_range_tombstones() {
+            self.get_at_sequence_with_range_tombstones(key, max_seq)
+        } else {
+            self.get_at_sequence_fast(key, max_seq)
+        }
     }
 
     pub(super) fn has_active_range_tombstones(&self) -> bool {
