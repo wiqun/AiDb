@@ -200,23 +200,21 @@ impl DB {
             .logical_write_bytes
             .fetch_add((key.len() + value.len()) as u64, AtomicOrdering::Relaxed);
 
-        // Phase 1: WAL append (in write_lock, no sync)
+        // 序号分配, WAL 追加, MemTable 插入与 committed 推进处于同一临界区 (与 write() 一致);
+        // fsync 等待在锁外, 写入插入即可见.
         let seq;
         {
             let _guard = self.write_lock.lock();
             seq = self.alloc_sequence(1)?;
             self.write_put_to_wal(seq, key, value, false)?;
+            self.memtable.read().put(key, value, seq)?;
+            self.committed_sequence
+                .fetch_max(seq, AtomicOrdering::SeqCst);
         }
 
-        // Phase 2: wait for WAL persistence (if sync_wal)
         if self.options.sync_wal {
             self.wait_group_commit_sync(seq)?;
         }
-
-        // Phase 3: MemTable (after WAL is durable)
-        self.memtable.read().put(key, value, seq)?;
-        self.committed_sequence
-            .fetch_max(seq, AtomicOrdering::SeqCst);
 
         self.maybe_freeze()?;
         tracing::debug!(target: "db", "db.put");
@@ -237,23 +235,20 @@ impl DB {
             .logical_write_bytes
             .fetch_add(key.len() as u64, AtomicOrdering::Relaxed);
 
-        // Phase 1: WAL append (in write_lock, no sync)
+        // 与 put() 相同: 插入与 committed 推进在写锁内完成, fsync 等待在锁外.
         let seq;
         {
             let _guard = self.write_lock.lock();
             seq = self.alloc_sequence(1)?;
             self.write_delete_to_wal(seq, key, false)?;
+            self.memtable.read().delete(key, seq)?;
+            self.committed_sequence
+                .fetch_max(seq, AtomicOrdering::SeqCst);
         }
 
-        // Phase 2: wait for WAL persistence (if sync_wal)
         if self.options.sync_wal {
             self.wait_group_commit_sync(seq)?;
         }
-
-        // Phase 3: MemTable (after WAL is durable)
-        self.memtable.read().delete(key, seq)?;
-        self.committed_sequence
-            .fetch_max(seq, AtomicOrdering::SeqCst);
 
         self.maybe_freeze()?;
         tracing::debug!(target: "db", "db.delete");
@@ -273,11 +268,18 @@ impl DB {
         self.check_not_closed()?;
         self.check_write_stall();
         self.stats.operations[DbOp::WriteBatch as usize].fetch_add(1, AtomicOrdering::Relaxed);
+        // 整批先校验再分配序号与写 WAL, 避免非法 key 留下前缀写入.
         let mut batch_bytes = 0u64;
         for op in &batch.operations {
             match op {
-                WriteOp::Put { key, value } => batch_bytes += (key.len() + value.len()) as u64,
-                WriteOp::Delete { key } => batch_bytes += key.len() as u64,
+                WriteOp::Put { key, value } => {
+                    Self::validate_user_key(key)?;
+                    batch_bytes += (key.len() + value.len()) as u64;
+                }
+                WriteOp::Delete { key } => {
+                    Self::validate_user_key(key)?;
+                    batch_bytes += key.len() as u64;
+                }
             }
         }
         self.stats
@@ -311,14 +313,8 @@ impl DB {
             for (i, op) in batch.operations.iter().enumerate() {
                 let seq = base + i as u64;
                 match op {
-                    WriteOp::Put { key, value } => {
-                        Self::validate_user_key(key)?;
-                        mt.put(key, value, seq)?;
-                    }
-                    WriteOp::Delete { key } => {
-                        Self::validate_user_key(key)?;
-                        mt.delete(key, seq)?;
-                    }
+                    WriteOp::Put { key, value } => mt.put(key, value, seq)?,
+                    WriteOp::Delete { key } => mt.delete(key, seq)?,
                 }
             }
         }
@@ -425,20 +421,21 @@ impl DB {
         }
         self.check_write_stall();
 
+        // 与 put() 相同: RangeTombstone 插入与 committed 推进在写锁内完成, fsync 等待在锁外.
         let seq;
         {
             let _guard = self.write_lock.lock();
             seq = self.alloc_sequence(1)?;
             self.write_delete_range_to_wal(seq, start, end, false)?;
+            self.memtable.read().put_range_delete(start, end, seq)?;
+            self.committed_sequence
+                .fetch_max(seq, AtomicOrdering::SeqCst);
         }
 
         if self.options.sync_wal {
             self.wait_group_commit_sync(seq)?;
         }
 
-        self.memtable.read().put_range_delete(start, end, seq)?;
-        self.committed_sequence
-            .fetch_max(seq, AtomicOrdering::SeqCst);
         self.maybe_freeze()?;
         Ok(())
     }

@@ -243,10 +243,9 @@ impl DB {
     pub fn snapshot(self: &Arc<Self>) -> Result<Snapshot> {
         self.check_not_closed()?;
         let _guard = self.write_lock.lock();
-        // 边界取"已提交"sequence 而非已分配的 `sequence`: `put`/`delete`/
-        // `delete_range` 在锁外写 memtable (等 WAL durable), 若用已分配值,
-        // 快照会看到创建时刻尚未提交的写入 (A-005 竞态). committed_sequence
-        // 仅在 memtable 写入完成后推进, 锁内读取时所有 <= 该值的写入必已可见.
+        // 边界取"已提交"sequence 而非已分配的 `sequence`: 若用已分配值, 快照可能
+        // 看到创建时刻尚未插入 MemTable 的写入 (A-005 竞态). committed_sequence
+        // 仅在 memtable 插入完成后推进, 锁内读取时所有 <= 该值的写入必已可见.
         let seq = self.committed_sequence.load(AtomicOrdering::SeqCst);
         // register 必须在 write_lock 释放前完成: 否则在"读到 seq"和"注册
         // 保护"之间存在窗口, 一次新写入 (及其可能触发的 compaction) 可以
@@ -265,8 +264,10 @@ impl DB {
 
     pub fn iter(&self) -> Result<DbIterGuard> {
         self.check_not_closed()?;
-        // Phase5: 全表扫描使用 K_MAX_SEQUENCE, 与 get_at_sequence 的 MVCC 边界区分.
-        let seq = crate::engine::memtable::K_MAX_SEQUENCE;
+        // 可见边界取已提交 sequence (与 Snapshot 一致): 写入在写锁内完成 MemTable 插入后才推进
+        // committed, 边界内的写入必已可见, 已分配但未插入的写入不会被部分暴露.
+        // 惰性迭代器不复制 MemTable, 迭代期间的新写入 (seq 大于边界) 对本迭代器不可见.
+        let seq = self.committed_sequence.load(AtomicOrdering::SeqCst);
         let mem = self.memtable.read();
         let imm = self.immutable_memtables.read();
         let sst = self.sstables.read();
@@ -283,7 +284,8 @@ impl DB {
 
     pub fn scan(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<DbIterGuard> {
         self.check_not_closed()?;
-        let seq = crate::engine::memtable::K_MAX_SEQUENCE;
+        // 与 iter() 相同, 使用已提交边界.
+        let seq = self.committed_sequence.load(AtomicOrdering::SeqCst);
         let mem = self.memtable.read();
         let imm = self.immutable_memtables.read();
         let sst = self.sstables.read();
@@ -370,6 +372,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = DB::open(dir.path(), Options::for_testing()).unwrap();
         db.sequence.store(3, Ordering::SeqCst);
+        db.committed_sequence.store(3, Ordering::SeqCst);
         let file_a = one_entry(dir.path(), 1, b"a", 2, ValueType::TypeRangeDelete, b"z");
         let file_b = one_entry(dir.path(), 2, b"m", 1, ValueType::TypePut, b"v");
         let mut levels = vec![Vec::new(); db.options.max_levels];

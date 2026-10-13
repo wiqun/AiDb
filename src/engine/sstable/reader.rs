@@ -28,7 +28,7 @@ use crate::engine::cache::BlockCache;
 use crate::engine::filter::{bloom::record_bloom_false_positive, BloomFilter, Filter};
 use crate::engine::memtable::{
     encode_internal_key, extract_sequence, extract_user_key, extract_value_type, range_covers,
-    PointState, ValueType,
+    range_overlaps, PointState, ValueType,
 };
 use crate::error::{Error, Result};
 use crate::statistics::Statistics;
@@ -361,8 +361,32 @@ impl SSTableReader {
             .collect()
     }
 
+    /// 只克隆与 `[start, end)` 相交的 range tombstone (`None` 表示无界).
+    pub(crate) fn collect_range_tombstones_overlapping(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Vec<(Vec<u8>, Vec<u8>, u64)> {
+        self.range_tombstones
+            .iter()
+            .filter(|r| range_overlaps(&r.start, &r.end, start, end))
+            .map(|r| (r.start.clone(), r.end.clone(), r.sequence))
+            .collect()
+    }
+
     pub fn iter(&self) -> SSTableIterator {
         SSTableIterator::new(
+            Arc::clone(&self.file),
+            self.file_number,
+            Arc::clone(&self.index_entries),
+            self.block_cache.clone(),
+            self.stats.clone(),
+        )
+    }
+
+    /// 未定位的迭代器, 调用方必须先 seek (见 `SSTableIterator::new_unpositioned`).
+    pub(crate) fn iter_unpositioned(&self) -> SSTableIterator {
+        SSTableIterator::new_unpositioned(
             Arc::clone(&self.file),
             self.file_number,
             Arc::clone(&self.index_entries),

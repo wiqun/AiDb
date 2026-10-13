@@ -5,6 +5,11 @@ pub fn range_covers(start: &[u8], end: &[u8], user_key: &[u8]) -> bool {
     start <= user_key && user_key < end
 }
 
+/// 半开区间 `[start, end)` 是否与查询区间 `[lo, hi)` 相交 (`None` 表示无界).
+pub fn range_overlaps(start: &[u8], end: &[u8], lo: Option<&[u8]>, hi: Option<&[u8]>) -> bool {
+    hi.is_none_or(|hi| start < hi) && lo.is_none_or(|lo| end > lo)
+}
+
 /// Range tombstone 索引条目 (与 MemTable SkipMap 内联 entry 对应).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RangeTombstoneRecord {

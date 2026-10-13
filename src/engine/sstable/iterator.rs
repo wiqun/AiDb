@@ -39,7 +39,21 @@ impl SSTableIterator {
         block_cache: Option<Arc<BlockCache>>,
         stats: Option<Arc<Statistics>>,
     ) -> Self {
-        let mut it = Self {
+        let mut it = Self::new_unpositioned(file, file_number, index_entries, block_cache, stats);
+        it.seek_to_first();
+        it
+    }
+
+    /// 不加载任何 block 的迭代器 (`valid() == false`), 调用方需先 seek 再使用.
+    /// 用于读路径惰性构造: 避免为随后会被 seek 掉的位置读取首块.
+    pub(crate) fn new_unpositioned(
+        file: Arc<File>,
+        file_number: u64,
+        index_entries: Arc<Vec<(Vec<u8>, BlockHandle)>>,
+        block_cache: Option<Arc<BlockCache>>,
+        stats: Option<Arc<Statistics>>,
+    ) -> Self {
+        Self {
             file,
             file_number,
             index_entries,
@@ -48,9 +62,7 @@ impl SSTableIterator {
             block_index: 0,
             block_iter: None,
             valid: false,
-        };
-        it.seek_to_first();
-        it
+        }
     }
 
     pub fn seek_to_first(&mut self) {

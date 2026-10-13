@@ -92,9 +92,9 @@ pub struct DB {
     compaction_picker: Arc<CompactionPicker>,
     sequence: AtomicU64,
     /// 已提交到 memtable 的最大 sequence (区别于 `sequence`: 后者是已分配的
-    /// 最大 sequence, `put`/`delete`/`delete_range` 在锁外写 memtable, 会存在
-    /// "已分配但未落 memtable" 的窗口). snapshot 边界必须取此值, 否则快照
-    /// 可能看到创建时刻尚未提交的写入 (见 A-005 竞态).
+    /// 最大 sequence, 分配与插入之间存在"已分配但未插入"的窗口). 所有写路径
+    /// 在写锁内完成插入后才推进此值; snapshot / iter / scan 边界必须取此值
+    /// (见 A-005 竞态).
     committed_sequence: AtomicU64,
     write_lock: Mutex<()>,
     flush_lock: Mutex<()>,
