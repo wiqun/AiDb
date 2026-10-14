@@ -222,11 +222,8 @@ impl MultiRaftNode {
         let node = self.groups.read().get(&group_id).cloned();
         match node {
             Some(node) => {
-                let storage = node.storage().clone();
-                let key = key.to_vec();
-                tokio::task::spawn_blocking(move || storage.get_state_machine_value(&key))
-                    .await
-                    .map_err(|e| ClusterError::Internal(e.to_string()))?
+                let storage = node.storage();
+                storage.get_state_machine_value(key).map_err(Into::into)
             }
             None => Err(ClusterError::Raft(format!("group {group_id} not found locally")).into()),
         }
