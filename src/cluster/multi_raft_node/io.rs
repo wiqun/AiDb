@@ -9,8 +9,30 @@ use crate::error::Result;
 
 use super::MultiRaftNode;
 
-/// 按用户 key 的半开区间读取 group 状态机。`end_user == None` 扫到该 group 末尾。
-/// `visit` 返回 false 时停止，不再读后面的 key。
+/// 半开用户 key 区间内字典序最大的一条. 空区间返回 `None`.
+fn last_sm_user_pair(
+    db: &crate::DB,
+    group_id: u64,
+    start_user: &[u8],
+    end_user: &[u8],
+) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    use crate::cluster::storage::keys::{sm_key, user_key_from_sm_key};
+
+    let start = sm_key(group_id, start_user);
+    let end = sm_key(group_id, end_user);
+    let mut iter = db.scan(Some(start.as_slice()), Some(end.as_slice()))?;
+    iter.seek_to_last();
+    let (Some(key), Some(value)) = (iter.key(), iter.value()) else {
+        return Ok(None);
+    };
+    let Some(user_key) = user_key_from_sm_key(group_id, key) else {
+        return Ok(None);
+    };
+    Ok(Some((user_key, value.to_vec())))
+}
+
+/// 按用户 key 的半开区间读取 group 状态机. `end_user == None` 扫到该 group 末尾.
+/// `visit` 返回 false 时停止, 不再读后面的 key.
 pub fn visit_sm_user_pairs(
     db: &crate::DB,
     group_id: u64,
@@ -242,6 +264,27 @@ impl MultiRaftNode {
     pub async fn scan_local_pairs(&self, group_id: u64) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.scan_local_pairs_in_range(group_id, Vec::new(), None)
             .await
+    }
+
+    /// 半开区间内字典序最大的一条. 空区间返回 None.
+    pub async fn last_local_user_pair(
+        &self,
+        group_id: u64,
+        start_user: Vec<u8>,
+        end_user: Vec<u8>,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let db = {
+            let storages = self.storages.read();
+            storages.get(&group_id).map(|storage| storage.db().clone())
+        };
+        match db {
+            Some(db) => tokio::task::spawn_blocking(move || {
+                last_sm_user_pair(&db, group_id, &start_user, &end_user)
+            })
+            .await
+            .map_err(|e| ClusterError::Internal(e.to_string()))?,
+            None => Err(ClusterError::Raft(format!("group {group_id} not found locally")).into()),
+        }
     }
 
     /// 只读用户 key 半开区间 `[start_user, end_user)` 里的状态机记录。
