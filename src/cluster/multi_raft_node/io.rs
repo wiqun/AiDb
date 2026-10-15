@@ -267,22 +267,61 @@ impl MultiRaftNode {
     }
 
     /// 半开区间内字典序最大的一条. 空区间返回 None.
-    pub async fn last_local_user_pair(
+    /// 直接读本地状态机, 不进入 `spawn_blocking`.
+    pub fn last_local_user_pair_sync(
         &self,
         group_id: u64,
-        start_user: Vec<u8>,
-        end_user: Vec<u8>,
+        start_user: &[u8],
+        end_user: &[u8],
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         let db = {
             let storages = self.storages.read();
             storages.get(&group_id).map(|storage| storage.db().clone())
         };
         match db {
-            Some(db) => tokio::task::spawn_blocking(move || {
-                last_sm_user_pair(&db, group_id, &start_user, &end_user)
-            })
-            .await
-            .map_err(|e| ClusterError::Internal(e.to_string()))?,
+            Some(db) => last_sm_user_pair(&db, group_id, start_user, end_user),
+            None => Err(ClusterError::Raft(format!("group {group_id} not found locally")).into()),
+        }
+    }
+
+    /// 半开区间内字典序最大的一条. 空区间返回 None.
+    pub async fn last_local_user_pair(
+        &self,
+        group_id: u64,
+        start_user: Vec<u8>,
+        end_user: Vec<u8>,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let storages = Arc::clone(&self.storages);
+        tokio::task::spawn_blocking(move || {
+            let db = {
+                let guard = storages.read();
+                guard.get(&group_id).map(|storage| storage.db().clone())
+            };
+            match db {
+                Some(db) => last_sm_user_pair(&db, group_id, &start_user, &end_user),
+                None => {
+                    Err(ClusterError::Raft(format!("group {group_id} not found locally")).into())
+                }
+            }
+        })
+        .await
+        .map_err(|e| ClusterError::Internal(e.to_string()))?
+    }
+
+    /// 只读用户 key 半开区间 `[start_user, end_user)` 里的状态机记录.
+    /// 直接读本地状态机, 不进入 `spawn_blocking`.
+    pub fn scan_local_pairs_in_range_sync(
+        &self,
+        group_id: u64,
+        start_user: &[u8],
+        end_user: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let db = {
+            let storages = self.storages.read();
+            storages.get(&group_id).map(|storage| storage.db().clone())
+        };
+        match db {
+            Some(db) => collect_sm_user_pairs(&db, group_id, start_user, end_user),
             None => Err(ClusterError::Raft(format!("group {group_id} not found locally")).into()),
         }
     }
@@ -295,18 +334,21 @@ impl MultiRaftNode {
         start_user: Vec<u8>,
         end_user: Option<Vec<u8>>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let db = {
-            let storages = self.storages.read();
-            storages.get(&group_id).map(|s| s.db().clone())
-        };
-        match db {
-            Some(db) => tokio::task::spawn_blocking(move || {
-                collect_sm_user_pairs(&db, group_id, &start_user, end_user.as_deref())
-            })
-            .await
-            .map_err(|e| ClusterError::Internal(e.to_string()))?,
-            None => Err(ClusterError::Raft(format!("group {group_id} not found locally")).into()),
-        }
+        let storages = Arc::clone(&self.storages);
+        tokio::task::spawn_blocking(move || {
+            let db = {
+                let guard = storages.read();
+                guard.get(&group_id).map(|storage| storage.db().clone())
+            };
+            match db {
+                Some(db) => collect_sm_user_pairs(&db, group_id, &start_user, end_user.as_deref()),
+                None => {
+                    Err(ClusterError::Raft(format!("group {group_id} not found locally")).into())
+                }
+            }
+        })
+        .await
+        .map_err(|e| ClusterError::Internal(e.to_string()))?
     }
 
     /// 按用户 key 区间遍历。`visit` 返回 false 时停止读取。
