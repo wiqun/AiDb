@@ -236,11 +236,7 @@ impl MultiRaftNode {
         Ok(factory.new_client(leader, &basic_node).await)
     }
 
-    /// 直接读取本地 group 状态机 (不要求 leader).
-    ///
-    /// 与 `get_key_from_group` 不同, 本方法不检查 leader 身份, 直接读本地
-    /// 状态机, 供数据面读路径 (leader 直读 / 只读副本) 使用.
-    pub async fn get_local(&self, group_id: u64, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    pub fn get_local_sync(&self, group_id: u64, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let node = self.groups.read().get(&group_id).cloned();
         match node {
             Some(node) => {
@@ -249,6 +245,14 @@ impl MultiRaftNode {
             }
             None => Err(ClusterError::Raft(format!("group {group_id} not found locally")).into()),
         }
+    }
+
+    /// 直接读取本地 group 状态机 (不要求 leader).
+    ///
+    /// 与 `get_key_from_group` 不同, 本方法不检查 leader 身份, 直接读本地
+    /// 状态机, 供数据面读路径 (leader 直读 / 只读副本) 使用.
+    pub async fn get_local(&self, group_id: u64, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.get_local_sync(group_id, key)
     }
 
     /// 本地各 group 引擎条目估值之和. 每个 group 有独立 DB, 直接读 SST 与 MemTable 计数, 不扫描.
