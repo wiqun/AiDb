@@ -103,6 +103,7 @@ flowchart TB
 - **地址规范**: MOVED 重定向优先使用 `NodeInfo.client_addr`, 缺省时 fallback `rpc_addr`; 节点间 Raft RPC 始终使用 `rpc_addr`.
 - **Meta 版本单调递增**: 每次成功 `apply_meta_request` 后 `ClusterMeta.version += 1`.
 - **Apply Fail-Fast 机制**: `apply_entries_internal` 遇到真实底级存储错误时必须直接 `?` 向上抛, 交给 openraft 判定该实例 `Fatal` 并停机; 绝不能当作业务错误吞掉, 否则会导致 `last_applied` 越过失败 entry, 造成数据丢失或副本分叉.
+- **本地同步读**: 本机 group 的点查和按 user key 区间取最后一条提供同步入口, 供脚本线程直接调用. 异步包装仍走 `spawn_blocking`. 不在本地的 group 不能用这两条同步入口.
 
 ## 数据流
 
