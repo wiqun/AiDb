@@ -26,7 +26,7 @@ fn test_cache_observability() {
             })
             .is_none());
     });
-    assert!(!miss_caps.spans_named("cache_get").is_empty());
+    assert!(miss_caps.spans_named("cache_get").is_empty());
 
     let hit_caps = capture_spans_under_lock(|| {
         assert_eq!(
@@ -34,7 +34,7 @@ fn test_cache_observability() {
             Bytes::from_static(b"block-data")
         );
     });
-    assert!(!hit_caps.spans_named("cache_get").is_empty());
+    assert!(hit_caps.spans_named("cache_get").is_empty());
 
     let events = capture_events_under_lock(|| {
         cache.reset_stats();

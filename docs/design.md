@@ -151,7 +151,7 @@ SSTable 一经生成即为只读不可变文件. `Checkpoint` 在强制 Flush �
 
 ### 为什么使用 tracing 而非 log crate?
 
-`tracing` 提供结构化 Span 上下文, 支持零成本静态过滤. 热路径埋点设为 `level = "debug"`, 在生产 `RUST_LOG=info` 下零性能开销; 同时支持跨线程与跨异步上下文追踪.
+`tracing` 提供结构化 Span 上下文. 只允许 `db_flush`, `cmp_run`, `raft_propose`, 且采样关闭时不创建.
 
 ### 库内指标注册而非自建 HTTP Exporter
 
@@ -176,4 +176,4 @@ AiDb 内部仅通过 OpenTelemetry 注册标准 `aidb_*` 指标, 不自建 HTTP 
 | **节点间通信** | gRPC (tonic + prost) | HTTP/2 多路复用, 类型安全 | 自定义私有二进制协议 |
 | **分片拓扑** | 16384 固定槽位 (CRC16) | 兼容 Redis 槽模型与 Hash Tag | 动态分片分裂合并 |
 | **全量备份** | Checkpoint 硬链接 + SHA256 | 零拷贝秒级快照, 一致性自检 | 在线物理热拷贝无锁 |
-| **可观测性** | tracing debug span + OTel 指标 | 零性能损耗, 宿主统一 OTLP 导出 | 库内自建 HTTP scrape 端口 |
+| **可观测性** | `db_flush`, `cmp_run`, `raft_propose` 与宿主 OTel 指标 | 采样关闭时不创建 span, 宿主统一 OTLP 导出 | 热路径 debug span, 库内自建 HTTP scrape 端口 |

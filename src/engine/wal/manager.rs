@@ -25,8 +25,10 @@ use super::record::{OpType, RecordType, WalEntry};
 use super::writer::Writer;
 use crate::config::Options;
 use crate::error::{Error, Result};
+use crate::statistics::Statistics;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -79,11 +81,11 @@ pub struct WALManager {
     #[expect(dead_code)]
     lock_file: std::fs::File,
     options: Arc<Options>,
+    stats: Option<Arc<Statistics>>,
 }
 
 impl WALManager {
     /// 打开或创建 WAL 目录
-    #[tracing::instrument(name = "wal_open", skip(path, options))]
     pub fn open(
         path: &Path,
         next_file_number: u64,
@@ -122,8 +124,11 @@ impl WALManager {
         writer.write_record(RecordType::Full, &file_header)?;
         writer.sync_data()?;
 
-        #[cfg(feature = "monitoring")]
-        crate::metrics::set_wal_size(writer.file_size().unwrap_or(0));
+        let stats = options.statistics.clone();
+        if let Some(ref s) = stats {
+            s.wal_size_bytes
+                .store(writer.file_size().unwrap_or(0), Ordering::Relaxed);
+        }
 
         Ok(WALManager {
             writer,
@@ -134,6 +139,7 @@ impl WALManager {
             wals: existing,
             lock_file,
             options,
+            stats,
         })
     }
 
@@ -185,7 +191,6 @@ impl WALManager {
     }
 
     /// 追加一条编码后的 WalEntry 到当前活跃 WAL
-    #[tracing::instrument(level = "debug", name = "wal_write", skip(self, data))]
     pub fn append(&mut self, data: &[u8]) -> Result<()> {
         self.append_record(data)?;
         self.maybe_auto_rotate()?;
@@ -198,10 +203,15 @@ impl WALManager {
     }
 
     fn append_record(&mut self, data: &[u8]) -> Result<()> {
+        let start_offset = self.writer.block_offset();
         self.writer.write_record(RecordType::Full, data)?;
+        let (disk_bytes, _) = Writer::estimated_record_disk_bytes(data, start_offset);
 
-        #[cfg(feature = "monitoring")]
-        crate::metrics::set_wal_size(self.writer.file_size().unwrap_or(0));
+        if let Some(ref s) = self.stats {
+            s.wal_written_bytes.fetch_add(disk_bytes, Ordering::Relaxed);
+            s.wal_size_bytes
+                .store(self.writer.file_size().unwrap_or(0), Ordering::Relaxed);
+        }
 
         Ok(())
     }
@@ -238,21 +248,18 @@ impl WALManager {
     }
 
     /// 刷新当前 WAL 缓冲区
-    #[tracing::instrument(level = "debug", name = "wal_flush", skip(self))]
     pub fn flush(&mut self) -> Result<()> {
         self.writer.flush()?;
         Ok(())
     }
 
     /// fsync 当前 WAL
-    #[tracing::instrument(level = "debug", name = "wal_sync", skip(self))]
     pub fn sync(&mut self) -> Result<()> {
         self.writer.sync_data()?;
         Ok(())
     }
 
     /// 轮转到新 WAL 文件: 关闭旧文件, 创建新文件, 写入 FileHeader
-    #[tracing::instrument(name = "wal_rotate", skip(self))]
     pub fn rotate(&mut self, next_sequence: u64) -> Result<()> {
         tracing::debug!(target: "wal", "wal.rotate: old={} new={}", self.file_number, self.file_number + 1);
         // 关闭当前 WAL (sync + 记录元数据)
@@ -281,8 +288,10 @@ impl WALManager {
         self.writer.write_record(RecordType::Full, &file_header)?;
         self.writer.sync_data()?;
 
-        #[cfg(feature = "monitoring")]
-        crate::metrics::set_wal_size(self.writer.file_size().unwrap_or(0));
+        if let Some(ref s) = self.stats {
+            s.wal_size_bytes
+                .store(self.writer.file_size().unwrap_or(0), Ordering::Relaxed);
+        }
 
         self.file_number = new_file_number;
         self.min_seq = next_sequence;
@@ -292,7 +301,6 @@ impl WALManager {
     }
 
     /// 关闭当前 WAL
-    #[tracing::instrument(name = "wal_close", skip(self))]
     pub fn close(&mut self) -> Result<()> {
         // 在文件末尾写入自校验 trailer: max_seq (8B) || !max_seq (8B)
         // 替代原有的 CRC 回填两步操作, 消除 CRC 重算的崩溃窗口.
@@ -314,7 +322,6 @@ impl WALManager {
     }
 
     /// 计算可清理的 WAL 文件 (max_seq < watermark), 删除并返回删除列表
-    #[tracing::instrument(name = "wal_cleanup", skip(self))]
     pub fn cleanup(&mut self, watermark: u64) -> Result<Vec<u64>> {
         let mut removed = Vec::new();
         let mut remaining = Vec::new();
@@ -390,7 +397,6 @@ impl WALManager {
     }
 
     /// 从所有 WAL 文件恢复 WalEntry
-    #[tracing::instrument(name = "wal_replay", skip(path, options))]
     pub fn recover(path: &Path, options: Arc<Options>) -> Result<RecoveryResult> {
         let mut all_entries = Vec::new();
         let mut max_sequence: u64 = 0;
@@ -488,8 +494,9 @@ impl WALManager {
                                         &mut batch_needed,
                                         &mut batch_count,
                                     );
+                                } else {
+                                    note_wal_fragment_discarded();
                                 }
-                                // 若 pending_fragments 为 None, 孤立 Last — 丢弃
                             }
                             RecordType::Full => {
                                 pending_fragments = None;
@@ -505,6 +512,9 @@ impl WALManager {
                         }
                     }
                     ReadStatus::Eof => {
+                        if pending_fragments.is_some() {
+                            note_wal_fragment_discarded();
+                        }
                         // 若 batch 未完成, 回滚
                         if let Some(batch_pos) = batch_start {
                             all_entries.truncate(batch_pos);
@@ -612,11 +622,16 @@ fn current_timestamp() -> u64 {
         .as_secs()
 }
 
+fn note_wal_fragment_discarded() {
+    tracing::warn!(target: "wal", "wal fragment discarded");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Options;
     use tempfile::tempdir;
+    use tracing::Subscriber;
 
     fn test_options() -> Arc<Options> {
         Arc::new(Options::for_testing())
@@ -748,5 +763,109 @@ mod tests {
         assert_eq!(parse_wal_filename("other.log"), None);
         assert_eq!(parse_wal_filename("wal_abc.log"), None);
         assert_eq!(parse_wal_filename("wal_1.txt"), None);
+    }
+
+    #[test]
+    fn reassembled_wal_fragment_does_not_warn() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::prelude::*;
+        use tracing_subscriber::Registry;
+
+        let dir = tempdir().unwrap();
+        let mut mgr = WALManager::open(dir.path(), 1, 100, test_options()).unwrap();
+        let entry = WalEntry {
+            sequence: 100,
+            op_type: OpType::TypePut,
+            has_value: true,
+            key: b"k".to_vec(),
+            value: Some(vec![1u8; crate::engine::wal::writer::BLOCK_SIZE]),
+        };
+        mgr.append(&entry.encode()).unwrap();
+        mgr.sync().unwrap();
+        mgr.close().unwrap();
+        drop(mgr);
+
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let layer = DiscardLayer {
+            hits: Arc::clone(&hits),
+        };
+        let result = tracing::subscriber::with_default(Registry::default().with(layer), || {
+            WALManager::recover(dir.path(), test_options()).unwrap()
+        });
+        assert_eq!(result.entries.len(), 1);
+        let discards = hits
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|hit| hit.1 == "wal fragment discarded")
+            .count();
+        assert_eq!(discards, 0);
+    }
+
+    #[test]
+    fn wal_fragment_discard_warns_without_bytes() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::prelude::*;
+        use tracing_subscriber::Registry;
+
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let layer = DiscardLayer {
+            hits: Arc::clone(&hits),
+        };
+        tracing::subscriber::with_default(Registry::default().with(layer), || {
+            super::note_wal_fragment_discarded();
+        });
+        let hits = hits.lock().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, tracing::Level::WARN);
+        assert_eq!(hits[0].1, "wal fragment discarded");
+        assert!(!hits[0].2.contains("data"));
+    }
+
+    struct DiscardLayer {
+        hits: std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String, String)>>>,
+    }
+
+    impl<S: Subscriber> tracing_subscriber::Layer<S> for DiscardLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut message = String::new();
+            let mut fields = String::new();
+            event.record(&mut Grab {
+                message: &mut message,
+                fields: &mut fields,
+            });
+            self.hits
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), message, fields));
+        }
+    }
+
+    struct Grab<'a> {
+        message: &'a mut String,
+        fields: &'a mut String,
+    }
+
+    impl tracing::field::Visit for Grab<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                *self.message = format!("{value:?}").trim_matches('"').to_string();
+            } else {
+                self.fields
+                    .push_str(&format!("{}={value:?} ", field.name()));
+            }
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                *self.message = value.to_string();
+            } else {
+                self.fields.push_str(&format!("{}={value} ", field.name()));
+            }
+        }
     }
 }

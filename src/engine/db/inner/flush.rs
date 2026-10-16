@@ -15,8 +15,9 @@ impl DB {
         self.do_flush_with_span()
     }
 
-    #[tracing::instrument(name = "db_flush", skip(self))]
     fn do_flush_with_span(&self) -> Result<()> {
+        let span = crate::observability::optional_span("db_flush");
+        let _enter = span.enter();
         self.do_flush()
     }
 
@@ -58,19 +59,27 @@ impl DB {
                 let imm = self.immutable_memtables.read();
                 self.flush_memtable_to_sstable(imm[0].inner())?;
             }
-            self.immutable_memtables.write().remove(0);
+            let removed = self.immutable_memtables.write().remove(0);
+            let removed_size = removed.approximate_size() as u64;
+            let _ = self.stats.memtable_size_bytes[1].try_update(
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+                |cur| Some(cur.saturating_sub(removed_size)),
+            );
             flushed += 1;
         }
+        if self.immutable_memtables.read().is_empty() {
+            self.stats.memtable_size_bytes[1].store(0, AtomicOrdering::Relaxed);
+        }
         if flushed > 0 {
-            #[cfg(feature = "monitoring")]
-            crate::metrics::record_flush();
+            self.stats
+                .flush_total
+                .fetch_add(flushed as u64, AtomicOrdering::Relaxed);
         }
         Ok(flushed)
     }
 
-    #[tracing::instrument(name = "db_flush_sst", skip(self, table))]
     fn flush_memtable_to_sstable(&self, table: &MemTable) -> Result<()> {
-        #[cfg(feature = "monitoring")]
         let flush_start = std::time::Instant::now();
         let mut count = 0u64;
         let file_number = self.version_set.read().allocate_file_number();
@@ -92,14 +101,23 @@ impl DB {
         }
         if count == 0 {
             builder.abandon()?;
-            #[cfg(feature = "monitoring")]
-            crate::metrics::record_flush_duration(flush_start.elapsed().as_secs_f64());
+            self.stats
+                .flush_duration
+                .record(flush_start.elapsed().as_micros() as u64);
+            self.stats.flush_last_duration_us.store(
+                flush_start.elapsed().as_micros() as u64,
+                AtomicOrdering::Relaxed,
+            );
             return Ok(());
         }
         let file_size = builder.finish()?;
-        let reader = Arc::new(SSTableReader::open(
+        self.stats
+            .flush_written_bytes
+            .fetch_add(file_size, AtomicOrdering::Relaxed);
+        let reader = Arc::new(SSTableReader::open_with_stats(
             &path,
             Some(Arc::clone(&self.block_cache)),
+            Some(Arc::clone(&self.stats)),
         )?);
         {
             let mut tables = self.sstables.write();
@@ -114,10 +132,16 @@ impl DB {
                 largest_key: reader.largest_key().to_vec(),
             })?;
         }
-        update_sstable_metrics(&self.sstables.read());
+        let pending = self.pending_compaction_bytes();
+        update_sstable_metrics(&self.sstables.read(), &self.stats, pending);
         tracing::info!(target: "db", file_number, file_size, "db.flush.complete");
-        #[cfg(feature = "monitoring")]
-        crate::metrics::record_flush_duration(flush_start.elapsed().as_secs_f64());
+        self.stats
+            .flush_duration
+            .record(flush_start.elapsed().as_micros() as u64);
+        self.stats.flush_last_duration_us.store(
+            flush_start.elapsed().as_micros() as u64,
+            AtomicOrdering::Relaxed,
+        );
         Ok(())
     }
 

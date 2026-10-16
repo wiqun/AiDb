@@ -4,6 +4,7 @@ use super::{
     Error, HashMap, NodeId, OpenRaftNode, OpenRaftStorage, Request, RwLock, TonicRequest,
     TypeConfig, VoteRequest,
 };
+use crate::statistics::{RaftRpcDirection, RaftRpcType, Statistics};
 
 /// 多 Group Raft gRPC 服务调度器
 /// 所有数据 Group 共享此实例, 通过 group_id 分发 RPC
@@ -16,14 +17,29 @@ pub struct RaftServiceDispatcher {
     /// Vote/AppendEntries/InstallSnapshot 调用点 (`register_group` 签名不变);
     /// 仅 `MultiRaftNode` 组装 group 时额外调用 `register_node`.
     nodes: Arc<RwLock<HashMap<u64, Arc<OpenRaftNode>>>>,
+    stats: Option<Arc<Statistics>>,
 }
 
 impl RaftServiceDispatcher {
     pub fn new() -> Self {
+        Self::new_with_stats(None)
+    }
+
+    pub fn new_with_stats(stats: Option<Arc<Statistics>>) -> Self {
         Self {
             groups: Arc::new(RwLock::new(HashMap::new())),
             nodes: Arc::new(RwLock::new(HashMap::new())),
+            stats,
         }
+    }
+
+    pub fn with_stats(mut self, stats: Arc<Statistics>) -> Self {
+        self.stats = Some(stats);
+        self
+    }
+
+    pub fn statistics(&self) -> Option<Arc<Statistics>> {
+        self.stats.clone()
     }
 
     pub fn register_group(
@@ -84,8 +100,10 @@ impl RaftService for RaftServiceImpl {
         &self,
         request: TonicRequest<raft_rpc::VoteRequest>,
     ) -> std::result::Result<tonic::Response<raft_rpc::VoteResponse>, tonic::Status> {
-        #[cfg(feature = "monitoring")]
-        crate::cluster::metrics::record_raft_rpc("vote", "incoming");
+        if let Some(stats) = &self.dispatcher.stats {
+            stats.raft_rpc[RaftRpcType::Vote as usize][RaftRpcDirection::Incoming as usize]
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let req = request.into_inner();
         let last_log_id = if req.last_log_index > 0 {
             Some(openraft::LogId::new(
@@ -124,11 +142,17 @@ impl RaftService for RaftServiceImpl {
         &self,
         request: TonicRequest<raft_rpc::AppendEntriesRequest>,
     ) -> std::result::Result<tonic::Response<raft_rpc::AppendEntriesResponse>, tonic::Status> {
-        #[cfg(feature = "monitoring")]
-        crate::cluster::metrics::record_raft_rpc("append_entries", "incoming");
         let req = request.into_inner();
-        #[cfg(feature = "monitoring")]
-        crate::cluster::metrics::record_raft_log_entries(req.entries.len() as u64);
+        crate::cluster::contact::note_leader_append(req.group_id);
+        if let Some(stats) = &self.dispatcher.stats {
+            stats.raft_rpc[RaftRpcType::AppendEntries as usize]
+                [RaftRpcDirection::Incoming as usize]
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            stats.raft_log_entries.fetch_add(
+                req.entries.len() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
 
         tracing::debug!(
             group_id = req.group_id,
@@ -229,8 +253,11 @@ impl RaftService for RaftServiceImpl {
         request: TonicRequest<raft_rpc::InstallSnapshotRequest>,
     ) -> std::result::Result<tonic::Response<raft_rpc::InstallSnapshotResponse>, tonic::Status>
     {
-        #[cfg(feature = "monitoring")]
-        crate::cluster::metrics::record_raft_rpc("install_snapshot", "incoming");
+        if let Some(stats) = &self.dispatcher.stats {
+            stats.raft_rpc[RaftRpcType::InstallSnapshot as usize]
+                [RaftRpcDirection::Incoming as usize]
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let req = request.into_inner();
         let meta = req
             .meta

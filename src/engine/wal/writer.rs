@@ -60,14 +60,12 @@ pub struct Writer {
 }
 
 impl Writer {
-    #[tracing::instrument(name = "wal_writer_open", skip(path))]
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_inner(path, None)
     }
 
     /// 打开 WAL 文件并预分配 `preallocate_bytes` 字节磁盘空间.
     /// `preallocate_bytes` 为 0 或 None 时跳过预分配.
-    #[tracing::instrument(name = "wal_writer_open", skip(path))]
     pub fn open_with_preallocate(path: &Path, preallocate_bytes: u64) -> Result<Self> {
         let pre = if preallocate_bytes > 0 {
             Some(preallocate_bytes)
@@ -78,13 +76,11 @@ impl Writer {
     }
 
     /// 兼容旧接口: sync_wal 由上层 WALManager 管理, Writer 不再负责 syncing.
-    #[tracing::instrument(name = "wal_writer_open_with_sync", skip(path))]
     pub fn open_with_sync(path: &Path, _sync_wal: bool) -> Result<Self> {
         Self::open(path)
     }
 
     /// 兼容旧接口: sync_wal 由上层管理, 同时支持预分配.
-    #[tracing::instrument(name = "wal_writer_open_with_sync_pre", skip(path))]
     pub fn open_with_sync_preallocate(
         path: &Path,
         _sync_wal: bool,
@@ -116,7 +112,6 @@ impl Writer {
     /// `data` 是已编码的 WalEntry 字节.
     /// 如果 data 长度超过 block 容量或 65535, 自动分片为 First/Middle/Last.
     /// 每片写入前检查 block 剩余空间, 不足时填充 0x00 padding 后切到新 block.
-    #[tracing::instrument(level = "debug", skip(self, data))]
     pub fn write_record(&mut self, record_type: RecordType, data: &[u8]) -> Result<()> {
         let max_payload = BLOCK_SIZE - HEADER_SIZE;
         let total = data.len();
@@ -216,7 +211,6 @@ impl Writer {
     }
 
     /// Flush 文件缓冲区
-    #[tracing::instrument(level = "debug", skip(self))]
     pub fn flush(&mut self) -> Result<()> {
         tracing::debug!(target: "wal", "wal.flush.start");
         self.file.flush()?;
@@ -225,7 +219,6 @@ impl Writer {
     }
 
     /// fdatasync — 仅 data+size, 跳过 mtime 元数据同步 (F-013)
-    #[tracing::instrument(level = "debug", skip(self))]
     pub fn sync_data(&mut self) -> Result<()> {
         tracing::debug!(target: "wal", "wal.sync.start");
         self.file.sync_data()?;

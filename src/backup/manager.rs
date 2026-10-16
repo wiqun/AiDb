@@ -1,18 +1,18 @@
 //! BackupManager: 备份创建、列举、删除、保留策略.
 
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
-#[cfg(feature = "monitoring")]
 use std::time::Instant;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use tracing::instrument;
 
 use crate::backup::storage::BackupStorage;
 use crate::backup::util;
 use crate::engine::checkpoint::Checkpoint;
 use crate::error::{Error, Result};
+use crate::statistics::{BackupOp, Statistics};
 use crate::DB;
 
 /// 备份 ID, 基于时间戳生成.
@@ -124,27 +124,50 @@ impl RetentionPolicy {
 pub struct BackupManager {
     storage: Arc<dyn BackupStorage>,
     policy: RetentionPolicy,
+    stats: Option<Arc<Statistics>>,
 }
 
 impl BackupManager {
     pub fn new(storage: Arc<dyn BackupStorage>, policy: RetentionPolicy) -> Self {
-        Self { storage, policy }
+        Self::new_with_stats(storage, policy, None)
+    }
+
+    pub fn new_with_stats(
+        storage: Arc<dyn BackupStorage>,
+        policy: RetentionPolicy,
+        stats: Option<Arc<Statistics>>,
+    ) -> Self {
+        Self {
+            storage,
+            policy,
+            stats,
+        }
     }
 
     pub fn create_backup(&self, db: &DB) -> Result<BackupId> {
         self.create_backup_with_description(db, None)
     }
 
-    #[instrument(name = "backup_create", skip(self, db), fields(backup_id))]
     pub fn create_backup_with_description(
         &self,
         db: &DB,
         description: Option<&str>,
     ) -> Result<BackupId> {
+        let backup_id = timestamp_nanos();
+        self.create_backup_inner(db, backup_id, description)
+            .inspect_err(|e| {
+                note_backup_failed(backup_id, &e.to_string());
+            })
+    }
+
+    fn create_backup_inner(
+        &self,
+        db: &DB,
+        backup_id: BackupId,
+        description: Option<&str>,
+    ) -> Result<BackupId> {
         use std::fs;
 
-        let backup_id = timestamp_nanos();
-        #[cfg(feature = "monitoring")]
         let start = Instant::now();
 
         // 在临时位置创建 checkpoint
@@ -231,10 +254,14 @@ impl BackupManager {
         // 应用保留策略
         self.apply_retention_policy()?;
 
-        tracing::Span::current().record("backup_id", backup_id);
-
-        #[cfg(feature = "monitoring")]
-        crate::metrics::record_backup_create(total_data_size, start.elapsed().as_secs_f64());
+        let stats = self.stats.clone().unwrap_or_else(|| db.statistics());
+        stats.backup_total[BackupOp::Create as usize].fetch_add(1, Ordering::Relaxed);
+        stats
+            .backup_size_bytes
+            .store(total_data_size, Ordering::Relaxed);
+        stats
+            .backup_duration
+            .record(start.elapsed().as_micros() as u64);
 
         tracing::event!(
             tracing::Level::INFO,
@@ -247,7 +274,6 @@ impl BackupManager {
         Ok(backup_id)
     }
 
-    #[instrument(name = "backup_list", skip(self))]
     pub fn list_backups(&self) -> Result<Vec<BackupMetadata>> {
         let entries = self.storage.list("backup_")?;
         let mut backups = Vec::new();
@@ -280,17 +306,16 @@ impl BackupManager {
         Ok(manifest.metadata)
     }
 
-    #[instrument(name = "backup_delete", skip(self), fields(backup_id = id))]
     pub fn delete_backup(&self, id: BackupId) -> Result<()> {
         let path = self.storage.backup_path(id);
         let result = self.storage.delete(&path);
-        #[cfg(feature = "monitoring")]
-        crate::metrics::record_backup_delete();
+        if let Some(ref s) = self.stats {
+            s.backup_total[BackupOp::Delete as usize].fetch_add(1, Ordering::Relaxed);
+        }
         tracing::info!(backup_id = id, "backup.delete");
         result
     }
 
-    #[instrument(name = "backup_retention", skip(self))]
     pub fn apply_retention_policy(&self) -> Result<Vec<BackupId>> {
         let backups = self.list_backups()?;
         let to_delete = self.policy.select_for_deletion(&backups);
@@ -308,9 +333,14 @@ fn timestamp_nanos() -> u64 {
         .as_nanos() as u64
 }
 
+fn note_backup_failed(backup_id: u64, error: &str) {
+    tracing::error!(backup_id, error, "backup failed");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing::Subscriber;
 
     fn make_backup(id: u64, age_secs: u64) -> BackupMetadata {
         let now = SystemTime::now()
@@ -423,5 +453,82 @@ mod tests {
         assert_eq!(to_delete.len(), 2);
         assert_eq!(to_delete[0], 0);
         assert_eq!(to_delete[1], 1);
+    }
+
+    #[test]
+    fn backup_failure_logs_error() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::prelude::*;
+        use tracing_subscriber::Registry;
+
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let stored = Arc::clone(&hits);
+        tracing::subscriber::with_default(
+            Registry::default().with(ErrLayer { hits: stored }),
+            || {
+                super::note_backup_failed(7, "disk full");
+            },
+        );
+        let hits = hits.lock().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, tracing::Level::ERROR);
+        assert_eq!(hits[0].1, "backup failed");
+        assert!(hits[0].2.contains("backup_id=7"));
+        assert!(!hits[0].2.contains("user-key"));
+    }
+
+    struct ErrLayer {
+        hits: std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String, String)>>>,
+    }
+
+    impl<S: Subscriber> tracing_subscriber::Layer<S> for ErrLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut message = String::new();
+            let mut fields = String::new();
+            event.record(&mut Grab {
+                message: &mut message,
+                fields: &mut fields,
+            });
+            self.hits
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), message, fields));
+        }
+    }
+
+    struct Grab<'a> {
+        message: &'a mut String,
+        fields: &'a mut String,
+    }
+
+    impl tracing::field::Visit for Grab<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                *self.message = format!("{value:?}").trim_matches('"').to_string();
+            } else {
+                self.fields
+                    .push_str(&format!("{}={value:?} ", field.name()));
+            }
+        }
+
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            self.fields.push_str(&format!("{}={value} ", field.name()));
+        }
+
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.fields.push_str(&format!("{}={value} ", field.name()));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                *self.message = value.to_string();
+            } else {
+                self.fields.push_str(&format!("{}={value} ", field.name()));
+            }
+        }
     }
 }

@@ -10,16 +10,19 @@ use crossbeam_skiplist::SkipMap;
 use super::key_bytes::InternalKeyBytes;
 use super::rep::MemTableRep;
 
+/// 可跨迭代器共享的 SkipMap 句柄: 迭代器持有它即可在不持有 MemTable 锁的情况下惰性定位.
+pub(crate) type SharedSkipMap = Arc<SkipMap<InternalKeyBytes, Arc<[u8]>>>;
+
 /// 基于 crossbeam SkipMap 的 MemTableRep 实现.
 pub(crate) struct SkipMapRep {
-    map: SkipMap<InternalKeyBytes, Arc<[u8]>>,
+    map: SharedSkipMap,
     size: AtomicUsize,
 }
 
 impl SkipMapRep {
     pub fn new() -> Self {
         Self {
-            map: SkipMap::new(),
+            map: Arc::new(SkipMap::new()),
             size: AtomicUsize::new(0),
         }
     }
@@ -28,6 +31,11 @@ impl SkipMapRep {
     /// FIXME: 泛型化 MemTable 时移除此方法, 改用 trait 原语遍历.
     pub(crate) fn inner_map(&self) -> &SkipMap<InternalKeyBytes, Arc<[u8]>> {
         &self.map
+    }
+
+    /// 克隆共享句柄 (O(1)), 供读路径迭代器惰性定位使用.
+    pub(crate) fn shared_map(&self) -> SharedSkipMap {
+        Arc::clone(&self.map)
     }
 }
 

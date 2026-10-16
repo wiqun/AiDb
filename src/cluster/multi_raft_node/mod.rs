@@ -46,6 +46,7 @@ use crate::cluster::sharded_storage::ShardedStorage;
 use crate::cluster::types::{NodeId, RaftNodeConfig};
 use crate::config::Options;
 use crate::engine::compaction::{CompactionFilter, CompactionRemovalListener};
+use crate::statistics::Statistics;
 
 mod io;
 mod lifecycle;
@@ -77,6 +78,7 @@ pub struct MultiRaftNode {
     /// 启动时会用真实 `rpc_timeout_ms`/`grpc_max_message_size` 替换其内容;
     /// 在此之前保持 `RaftNodeConfig::default()` (此时也不会有本地 group, 无需远程读).
     network_factory: Arc<RwLock<RaftNetworkClientFactory>>,
+    stats: Arc<Statistics>,
 }
 
 /// 按 group `DB` 构造 `CompactionRemovalListener` (每 group 独立实例).
@@ -122,6 +124,9 @@ impl MultiRaftNode {
         grpc_dispatcher: Arc<RaftServiceDispatcher>,
     ) -> Self {
         let router_for_lm = Arc::clone(&router);
+        let stats = grpc_dispatcher
+            .statistics()
+            .unwrap_or_else(|| Arc::new(Statistics::default()));
         Self {
             node_id,
             groups: Arc::new(RwLock::new(HashMap::new())),
@@ -137,12 +142,14 @@ impl MultiRaftNode {
             server_handle: parking_lot::Mutex::new(None),
             local_group_overrides: Arc::new(RwLock::new(HashSet::new())),
             elected_leader_overrides: Arc::new(RwLock::new(HashSet::new())),
-            network_factory: Arc::new(RwLock::new(RaftNetworkClientFactory::new(
+            network_factory: Arc::new(RwLock::new(RaftNetworkClientFactory::new_with_stats(
                 node_id,
                 0,
                 RaftNodeConfig::default().rpc_timeout_ms,
                 RaftNodeConfig::default().grpc_max_message_size,
+                Some(Arc::clone(&stats)),
             ))),
+            stats,
         }
     }
 
@@ -153,6 +160,9 @@ impl MultiRaftNode {
         grpc_dispatcher: Arc<RaftServiceDispatcher>,
         lifecycle: LifecycleManager,
     ) -> Self {
+        let stats = grpc_dispatcher
+            .statistics()
+            .unwrap_or_else(|| Arc::new(Statistics::default()));
         Self {
             node_id,
             groups: Arc::new(RwLock::new(HashMap::new())),
@@ -164,12 +174,26 @@ impl MultiRaftNode {
             server_handle: parking_lot::Mutex::new(None),
             local_group_overrides: Arc::new(RwLock::new(HashSet::new())),
             elected_leader_overrides: Arc::new(RwLock::new(HashSet::new())),
-            network_factory: Arc::new(RwLock::new(RaftNetworkClientFactory::new(
+            network_factory: Arc::new(RwLock::new(RaftNetworkClientFactory::new_with_stats(
                 node_id,
                 0,
                 RaftNodeConfig::default().rpc_timeout_ms,
                 RaftNodeConfig::default().grpc_max_message_size,
+                Some(Arc::clone(&stats)),
             ))),
+            stats,
+        }
+    }
+
+    /// 获取共享 Statistics 实例
+    pub fn statistics(&self) -> Arc<Statistics> {
+        Arc::clone(&self.stats)
+    }
+
+    /// 将共享 Statistics 实例注入到 LifecycleConfig 中 (若未显式指定)
+    pub fn inject_shared_statistics(&self, cfg: &mut LifecycleConfig) {
+        if cfg.options.statistics.is_none() {
+            cfg.options.statistics = Some(Arc::clone(&self.stats));
         }
     }
 

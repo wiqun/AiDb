@@ -11,18 +11,18 @@ fn test_mem_observability() {
     let _lock = tracing_test_lock();
     let mt = MemTable::new();
 
-    assert!(!capture_spans_under_lock(|| mt.put(b"k", b"v", 1).unwrap())
+    assert!(capture_spans_under_lock(|| mt.put(b"k", b"v", 1).unwrap())
         .spans_named("mem_put")
         .is_empty());
-    assert!(!capture_spans_under_lock(|| {
+    assert!(capture_spans_under_lock(|| {
         assert!(mt.get_latest(b"k").unwrap().is_some());
     })
     .spans_named("mem_get")
     .is_empty());
-    assert!(!capture_spans_under_lock(|| mt.delete(b"k", 2).unwrap())
+    assert!(capture_spans_under_lock(|| mt.delete(b"k", 2).unwrap())
         .spans_named("mem_delete")
         .is_empty());
-    assert!(!capture_spans_under_lock(|| {
+    assert!(capture_spans_under_lock(|| {
         let _ = mt.freeze(1);
     })
     .spans_named("mem_freeze")

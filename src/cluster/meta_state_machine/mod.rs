@@ -36,7 +36,6 @@
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use tracing::instrument;
 
 use crate::cluster::meta_types::{
     default_slot_table, ClusterMeta, MetaRequest, SlotMigrationState, SlotTable, SLOT_COUNT,
@@ -189,7 +188,6 @@ impl MetaStateMachine {
         validate::validate_with_state(request, &cluster_meta, &slot_table, &migration_state)
     }
 
-    #[instrument(name = "meta_apply", skip(self))]
     pub fn apply_meta_request(&self, request: MetaRequest) -> MetaSmResult<ApplyOutput> {
         self.validate_meta_request(&request)?;
 

@@ -91,7 +91,7 @@ fn test_write_batch_single_put() {
     let db = DB::open(dir.path(), tiny_opts()).unwrap();
     let mut batch = WriteBatch::new();
     batch.put(b"one", b"1");
-    let _ = db.write(&batch).unwrap();
+    db.write(&batch).unwrap();
     assert_eq!(db.get(b"one").unwrap(), Some(b"1".to_vec()));
     db.close().unwrap();
 }
@@ -104,7 +104,7 @@ fn test_write_batch_multiple_puts() {
     for i in 0..5u8 {
         batch.put([b'k', i], [i]);
     }
-    let _ = db.write(&batch).unwrap();
+    db.write(&batch).unwrap();
     for i in 0..5u8 {
         assert_eq!(db.get(&[b'k', i]).unwrap(), Some(vec![i]));
     }
@@ -118,7 +118,7 @@ fn test_write_batch_delete_only() {
     db.put(b"x", b"1").unwrap();
     let mut batch = WriteBatch::new();
     batch.delete(b"x");
-    let _ = db.write(&batch).unwrap();
+    db.write(&batch).unwrap();
     assert_eq!(db.get(b"x").unwrap(), None);
     db.close().unwrap();
 }

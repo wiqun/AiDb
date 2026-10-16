@@ -2,8 +2,6 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use tracing::instrument;
-
 use crate::cluster::meta_raft_node::MetaRaftNode;
 use crate::cluster::meta_types::MetaRequest;
 use crate::cluster::multi_raft_node::MultiRaftNode;
@@ -50,7 +48,6 @@ impl SlotMigrationExecutor {
         self.cancellation.store(true, Ordering::Relaxed);
     }
 
-    #[instrument(skip(self))]
     pub async fn execute(&self, migration: ActiveMigration) -> Result<BatchMigrateResult> {
         let last_key = self.load_checkpoint(migration.migration_id);
 

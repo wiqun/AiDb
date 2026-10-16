@@ -32,8 +32,6 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::time::Duration;
 
-use tracing::instrument;
-
 use crate::cluster::meta_state_machine::MetaStateMachine;
 use crate::cluster::meta_types::{MetaRequest, METARAFT_GROUP_ID};
 use crate::cluster::network::RaftNetworkClientFactory;
@@ -60,6 +58,7 @@ const REPLICATION_HEARTBEAT_MULTIPLIER: u32 = 3;
 pub struct MetaRaftNode {
     inner: Arc<OpenRaftNode>,
     state_machine: Arc<MetaStateMachine>,
+    #[cfg_attr(not(test), allow(dead_code))]
     heartbeat_interval_ms: u64,
 }
 
@@ -177,7 +176,6 @@ impl MetaRaftNode {
         Ok(())
     }
 
-    #[instrument(name = "meta_propose", skip(self))]
     pub async fn propose(&self, request: MetaRequest) -> Result<Response> {
         // Validate locally as an early optimization (catches obvious errors
         // before Raft round-trip).  For non-leader nodes the local state may
@@ -189,12 +187,10 @@ impl MetaRaftNode {
         self.inner.propose(Request::Meta(request)).await
     }
 
-    #[instrument(name = "meta_query", skip(self))]
     pub fn get_cluster_meta(&self) -> crate::cluster::meta_types::ClusterMeta {
         self.state_machine.get_cluster_meta()
     }
 
-    #[instrument(name = "meta_slot_query", skip(self))]
     pub fn get_slot_table(&self) -> crate::cluster::meta_types::SlotTable {
         self.state_machine.get_slot_table()
     }
@@ -244,7 +240,6 @@ impl MetaRaftNode {
     /// 每 50ms 检查一次 replication metrics, 允许落后 5 条以内.
     /// 超过 30s 返回 `ClusterError::Timeout`.
     #[cfg(test)]
-    #[instrument(skip(self), fields(node_id))]
     async fn wait_learner_catch_up(&self, node_id: NodeId) -> Result<()> {
         let start = tokio::time::Instant::now();
         let deadline = start + CATCH_UP_TIMEOUT;
@@ -293,7 +288,6 @@ impl MetaRaftNode {
     /// Step 1: 等待至少一个其他 voter 的 `matched >= last_log_index`.
     /// Step 2: sleep `3 * heartbeat_interval` 让 commit_index 传播.
     #[cfg(test)]
-    #[instrument(skip(self), fields(voter_count = voter_ids.len()))]
     async fn confirm_replication(&self, voter_ids: &[NodeId]) -> Result<()> {
         // 快速路径: 只有本节点一个 voter, entry 已本地 committed
         if voter_ids.len() <= 1 {
@@ -350,7 +344,6 @@ impl MetaRaftNode {
     ///
     /// After the membership change commits, updates ClusterMeta so subsequent
     /// promotions see the correct voter set.
-    #[instrument(skip(self), fields(node_id, heartbeat_ms = self.heartbeat_interval_ms))]
     pub async fn promote_learner_to_voter(&self, node_id: NodeId) -> Result<()> {
         let meta = self.get_cluster_meta();
         let mut voter_ids: Vec<NodeId> = meta

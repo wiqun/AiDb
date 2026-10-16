@@ -1,5 +1,6 @@
 //! Compaction: Version 管理, 多路归并, 文件选择与后台整理.
 
+mod drop;
 pub mod filter;
 mod helpers;
 mod job;
@@ -8,7 +9,10 @@ mod picker;
 mod trackers;
 mod version;
 
-pub use filter::{CompactionFilter, CompactionRemovalListener, FilterDecision};
+pub use drop::UserKeyRange;
+pub use filter::{
+    CompactionFilter, CompactionPointReader, CompactionRemovalListener, FilterDecision,
+};
 pub use helpers::{key_ranges_overlap_by_meta_raw, user_key_from_internal};
 pub use job::{CompactionJob, CompactionResult};
 pub use merge::MergeIterator;

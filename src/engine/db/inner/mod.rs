@@ -50,7 +50,7 @@ pub(super) use super::iterator::DbIterGuard;
 pub(super) use super::numbers::scan_next_wal_file_number;
 pub(super) use super::replay::replay_entries;
 pub(super) use super::snapshot::{Snapshot, SnapshotList};
-pub(super) use super::write_batch::{EngineWriteStats, WriteBatch, WriteOp};
+pub(super) use super::write_batch::{WriteBatch, WriteOp};
 pub(super) use crate::config::Options;
 pub(super) use crate::engine::cache::{BlockCache, CacheStats};
 pub(super) use crate::engine::compaction::{
@@ -66,6 +66,7 @@ pub(super) use crate::engine::sstable::{sstable_path, SSTableBuilder, SSTableRea
 pub(super) use crate::engine::wal::manager::WALManager;
 pub(super) use crate::engine::wal::record::{OpType, WalEntry};
 pub(super) use crate::error::{Error, Result};
+pub(super) use crate::statistics::Statistics;
 pub(super) use crossbeam_channel::{Receiver, Sender};
 pub(super) use parking_lot::{Mutex, RwLock};
 pub(super) use std::collections::HashSet;
@@ -91,9 +92,9 @@ pub struct DB {
     compaction_picker: Arc<CompactionPicker>,
     sequence: AtomicU64,
     /// 已提交到 memtable 的最大 sequence (区别于 `sequence`: 后者是已分配的
-    /// 最大 sequence, `put`/`delete`/`delete_range` 在锁外写 memtable, 会存在
-    /// "已分配但未落 memtable" 的窗口). snapshot 边界必须取此值, 否则快照
-    /// 可能看到创建时刻尚未提交的写入 (见 A-005 竞态).
+    /// 最大 sequence, 分配与插入之间存在"已分配但未插入"的窗口). 所有写路径
+    /// 在写锁内完成插入后才推进此值; snapshot / iter / scan 边界必须取此值
+    /// (见 A-005 竞态).
     committed_sequence: AtomicU64,
     write_lock: Mutex<()>,
     flush_lock: Mutex<()>,
@@ -109,7 +110,6 @@ pub struct DB {
     /// 最新 Put 被 filter Remove 时的监听器 (filter 保持无副作用).
     compaction_removal_listener: RwLock<Option<Arc<dyn CompactionRemovalListener>>>,
     checkpoint_in_progress: AtomicBool,
-    total_key_count: AtomicUsize,
     block_cache: Arc<BlockCache>,
     pub(crate) snapshots: Arc<SnapshotList>,
     /// Group commit: leader election mutex
@@ -119,12 +119,54 @@ pub struct DB {
     /// L0 SSTable count for lock-free stall checks (F-050/051/054).
     /// Maintained atomically inside all `sstables.write()` critical sections.
     l0_sstable_count: AtomicUsize,
+    pub(crate) stats: Arc<Statistics>,
 }
 
 impl DB {
-    #[tracing::instrument(name = "db_open", skip(path, options), fields(path = %path.as_ref().display()))]
+    /// 访问当前 DB 实例绑定的无锁原子指标集合
+    pub fn statistics(&self) -> Arc<Statistics> {
+        Arc::clone(&self.stats)
+    }
+
     pub fn open(path: impl AsRef<Path>, options: Options) -> Result<Arc<Self>> {
         options.validate()?;
+
+        // 校验外部注入的 statistics 层数一致性契约, 避免后续越界访问
+        if let Some(ref stats) = options.statistics {
+            if stats.sstable_count.len() != options.max_levels {
+                return Err(Error::InvalidArgument(format!(
+                    "statistics.sstable_count.len() ({}) must equal options.max_levels ({})",
+                    stats.sstable_count.len(),
+                    options.max_levels
+                )));
+            }
+        }
+
+        let stats = options
+            .statistics
+            .clone()
+            .unwrap_or_else(|| Arc::new(Statistics::new(options.max_levels)));
+        stats.l0_compaction_trigger.store(
+            options.level0_compaction_trigger as u64,
+            AtomicOrdering::Relaxed,
+        );
+        stats.l0_slowdown_writes_trigger.store(
+            options.level0_slowdown_writes_trigger as u64,
+            AtomicOrdering::Relaxed,
+        );
+        stats.l0_stop_writes_trigger.store(
+            options.level0_stop_writes_trigger as u64,
+            AtomicOrdering::Relaxed,
+        );
+        stats
+            .memtable_limit_bytes
+            .store(options.memtable_size as u64, AtomicOrdering::Relaxed);
+
+        let mut options = options;
+        if options.statistics.is_none() {
+            options.statistics = Some(Arc::clone(&stats));
+        }
+
         let path = path.as_ref().to_path_buf();
         let options = Arc::new(options);
 
@@ -143,19 +185,40 @@ impl DB {
 
         let next_wal = scan_next_wal_file_number(&path);
         let max_levels = options.max_levels;
-        let block_cache = Arc::new(BlockCache::new(options.block_cache_size));
+        let block_cache = Arc::new(BlockCache::new_with_stats(
+            options.block_cache_size,
+            Some(Arc::clone(&stats)),
+        ));
         let cache_for_open = Some(Arc::clone(&block_cache));
 
+        // 阶段 1: WAL 回放计时与物理字节累加
+        let wal_replay_start = std::time::Instant::now();
         let recovery = WALManager::recover(&path, Arc::clone(&options))?;
-        let memtable = MemTable::new();
+        let memtable = MemTable::new_with_stats(Some(Arc::clone(&stats)));
         replay_entries(&memtable, &recovery.entries)?;
+        let wal_replay_duration = wal_replay_start.elapsed().as_micros() as u64;
+        let wal_replayed_bytes: u64 = recovery.recovered_files.iter().map(|f| f.file_size).sum();
+        stats
+            .recovery_wal_replay_duration_us
+            .store(wal_replay_duration, AtomicOrdering::Relaxed);
+        stats
+            .recovery_wal_replayed_bytes
+            .store(wal_replayed_bytes, AtomicOrdering::Relaxed);
+
         let mut last_sequence = recovery.max_sequence;
         last_sequence = last_sequence.max(max_sequence_in_memtable(&memtable));
 
+        // 阶段 2: Manifest 加载与版本树重建计时
+        let manifest_start = std::time::Instant::now();
         let version_set = if current_exists(&path) {
             VersionSet::recover(&path, max_levels, options.max_manifest_size)?
         } else {
-            let edits = scan_version_edits_from_dir(&path, max_levels, cache_for_open.clone())?;
+            let edits = scan_version_edits_from_dir(
+                &path,
+                max_levels,
+                cache_for_open.clone(),
+                Some(Arc::clone(&stats)),
+            )?;
             if edits.is_empty() {
                 VersionSet::open_new(&path, max_levels, options.max_manifest_size)?
             } else {
@@ -167,7 +230,24 @@ impl DB {
                 )?
             }
         };
-        let sstables = load_sstables_from_version(&path, version_set.current(), cache_for_open)?;
+        let manifest_duration = manifest_start.elapsed().as_micros() as u64;
+        stats
+            .recovery_manifest_duration_us
+            .store(manifest_duration, AtomicOrdering::Relaxed);
+
+        // 阶段 3: SSTable Reader 打开与元数据加载计时
+        let sstable_open_start = std::time::Instant::now();
+        let sstables = load_sstables_from_version(
+            &path,
+            version_set.current(),
+            cache_for_open,
+            Some(Arc::clone(&stats)),
+        )?;
+        let sstable_open_duration = sstable_open_start.elapsed().as_micros() as u64;
+        stats
+            .recovery_sstable_open_duration_us
+            .store(sstable_open_duration, AtomicOrdering::Relaxed);
+
         remove_orphan_sstables(&path, version_set.current())?;
         last_sequence = last_sequence.max(max_sequence_in_sstables(&sstables));
 
@@ -187,12 +267,13 @@ impl DB {
             .map(|_| crossbeam_channel::bounded(options.compaction_channel_size))
             .unzip();
 
+        stats.sequence.store(last_sequence, AtomicOrdering::Relaxed);
+        stats.block_cache_size.store(0, AtomicOrdering::Relaxed);
+        let pending = version_set.pending_compaction_bytes(&compaction_picker);
+        update_sstable_metrics(&sstables, &stats, pending);
         #[cfg(feature = "monitoring")]
         {
             crate::metrics::init();
-            crate::metrics::set_sequence(last_sequence);
-            crate::metrics::set_block_cache_size(0);
-            update_sstable_metrics(&sstables);
         }
 
         let l0_sstable_count_init = sstables[0].len();
@@ -220,12 +301,12 @@ impl DB {
             compaction_filter: RwLock::new(None),
             compaction_removal_listener: RwLock::new(None),
             checkpoint_in_progress: AtomicBool::new(false),
-            total_key_count: AtomicUsize::new(0),
             block_cache,
             snapshots: SnapshotList::new(),
             group_commit_lock: Mutex::new(()),
             group_commit_synced_seq: AtomicU64::new(0),
             l0_sstable_count: AtomicUsize::new(l0_sstable_count_init),
+            stats: Arc::clone(&stats),
         });
 
         db.start_flush_thread();
@@ -350,6 +431,35 @@ impl DB {
         self.sstables.read()[0].len()
     }
 
+    /// 引擎条目估值: 已打开 SSTable 的 `num_entries` 加上活跃和不可变 MemTable 的 `entry_count`.
+    /// 不扫描 key. `properties` 缺失的文件按 0.
+    pub fn estimate_entry_count(&self) -> u64 {
+        let sst_entries = {
+            let levels = self.sstables.read();
+            levels
+                .iter()
+                .flatten()
+                .map(|reader| reader.properties().map(|p| p.num_entries).unwrap_or(0))
+                .fold(0u64, u64::saturating_add)
+        };
+        let mem_entries = self.memtable.read().entry_count();
+        let imm_entries = self
+            .immutable_memtables
+            .read()
+            .iter()
+            .fold(0u64, |sum, imm| sum.saturating_add(imm.entry_count()));
+        sst_entries
+            .saturating_add(mem_entries)
+            .saturating_add(imm_entries)
+    }
+
+    /// 待 Compaction 积压量 (Pending Bytes) 纯内存现算.
+    pub fn pending_compaction_bytes(&self) -> u64 {
+        self.version_set
+            .read()
+            .pending_compaction_bytes(&self.compaction_picker)
+    }
+
     /// Block cache 统计快照.
     pub fn cache_stats(&self) -> CacheStats {
         self.block_cache.stats()
@@ -407,7 +517,13 @@ impl DB {
         let imm = self.immutable_memtables.read();
         let sst = self.sstables.read();
         Ok(super::iterator::DBIterator::new(
-            &mem, &imm, &sst, sequence, start, end,
+            &mem,
+            &imm,
+            &sst,
+            sequence,
+            start,
+            end,
+            Some(Arc::clone(&self.stats)),
         ))
     }
 
@@ -425,7 +541,6 @@ impl DB {
         Ok(())
     }
 
-    #[tracing::instrument(name = "db_close", skip(self))]
     pub fn close(&self) -> Result<()> {
         if self.closed.load(AtomicOrdering::Acquire) {
             return Ok(());
@@ -451,6 +566,11 @@ impl DB {
         let _ = self.wal.write().cleanup(u64::MAX);
         tracing::info!(target: "db", "db.close");
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn replace_sstables_for_test(&self, levels: Vec<Vec<Arc<SSTableReader>>>) {
+        *self.sstables.write() = levels;
     }
 }
 
@@ -484,13 +604,33 @@ fn max_sequence_in_sstables(sstables: &[Vec<Arc<SSTableReader>>]) -> u64 {
     max
 }
 
-fn update_sstable_metrics(_sstables: &[Vec<Arc<SSTableReader>>]) {
-    #[cfg(feature = "monitoring")]
-    for (level, readers) in _sstables.iter().enumerate() {
-        let label = level.to_string();
-        let total: u64 = readers.iter().map(|r| r.file_size()).sum();
-        crate::metrics::set_sstable_level(&label, readers.len() as i64, total as i64);
+pub(crate) fn update_sstable_metrics(
+    sstables: &[Vec<Arc<SSTableReader>>],
+    stats: &Statistics,
+    pending_bytes: u64,
+) {
+    // live_bytes: 全部 SST 的有效 entry 载荷 (raw_key_size + raw_value_size) 之和,
+    // 空间放大 SA 分母的 SST 侧; flush/compaction 改变 SST 集合后随本函数自然重算
+    let live_total: u64 = sstables
+        .iter()
+        .flatten()
+        .map(|r| {
+            r.properties()
+                .map(|p| p.raw_key_size + p.raw_value_size)
+                .unwrap_or(0)
+        })
+        .sum();
+    stats.live_bytes.store(live_total, AtomicOrdering::Relaxed);
+    for (level, readers) in sstables.iter().enumerate() {
+        if level < stats.sstable_count.len() {
+            let total: u64 = readers.iter().map(|r| r.file_size()).sum();
+            stats.sstable_count[level].store(readers.len() as u64, AtomicOrdering::Relaxed);
+            stats.sstable_size_bytes[level].store(total, AtomicOrdering::Relaxed);
+        }
     }
+    stats
+        .compaction_pending_bytes
+        .store(pending_bytes, AtomicOrdering::Relaxed);
 }
 
 impl Drop for DB {

@@ -10,7 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 创建数据库并写入数据
     let db = aidb::DB::open(dir, aidb::config::Options::default())?;
     for i in 0u32..100 {
-        let _ = db.put(format!("key_{i:04}").as_bytes(), b"value")?;
+        db.put(format!("key_{i:04}").as_bytes(), b"value")?;
     }
     db.flush()?;
     println!("✅ 写入 100 个 key 并 flush");

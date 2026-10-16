@@ -78,7 +78,7 @@ fn test_db_write_batch_crash_recovery_with_wal_rotate() {
         for key in &keys {
             batch.put(key.as_slice(), b"val");
         }
-        let _ = db.write(&batch).unwrap();
+        db.write(&batch).unwrap();
         // 故意不 close — 模拟崩溃; Drop 会 sync WAL.
     }
 

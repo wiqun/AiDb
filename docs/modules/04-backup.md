@@ -11,7 +11,7 @@ description: AiDb 全量备份与恢复 — BackupManager、RecoveryManager、Ba
 - 排查全量备份创建、manifest 校验和、保留策略清理、数据 restore 失败
 - **不覆盖**: `Checkpoint::create` 底层实现 (pin / hard_link / compaction 互斥) → [engine-storage.md](02-engine-storage.md)
 - **不覆盖**: AiKv `BGSAVE` 命令 (AiKv 直接调用 `Checkpoint::create`, 不经 `BackupManager`)
-- **不覆盖**: `aidb_backup_*` OTel 监控指标 → [observability.md](05-observability.md)
+- **不覆盖**: 备份不进入指标导出.
 - **构建**: 默认启用 `backup` feature; 禁用时整个 `backup` 模块不参与编译
 
 ## 代码地图
@@ -149,7 +149,7 @@ let manager = BackupManager::new(storage, policy);
 | 项 | 位置 | 说明 |
 | --- | --- | --- |
 | `backup` | `Cargo.toml` default | 启用 `src/backup/`; 引入 `ring`, `hex`, `serde_json` |
-| `monitoring` | `manager` / `recovery` | 记录 `aidb_backup_total`, `aidb_backup_size_bytes`, `aidb_backup_duration_seconds` |
+| `monitoring` | `manager` / `recovery` | 备份字节与耗时留在内部统计, 不导出 `aidb_backup_*` |
 | tracing spans | `#[instrument]` | `backup_create`, `backup_list`, `backup_delete`, `backup_retention`, `backup_restore`, `backup_verify` |
 
 ## 测试

@@ -455,6 +455,25 @@ fn test_multi_raft_node_init() {
 }
 
 #[test]
+fn last_local_user_pair_sync_missing_group() {
+    let router = Arc::new(Router::new(
+        default_slot_table(),
+        HashMap::new(),
+        HashMap::new(),
+    ));
+    let dispatcher = Arc::new(RaftServiceDispatcher::new());
+    let node = MultiRaftNode::new(1, router, dispatcher);
+    let err = node
+        .last_local_user_pair_sync(1, b"", b"")
+        .expect_err("missing group");
+    assert!(err.to_string().contains("not found locally"), "{err}");
+    let err = node
+        .scan_local_pairs_in_range_sync(1, b"", None)
+        .expect_err("missing group");
+    assert!(err.to_string().contains("not found locally"), "{err}");
+}
+
+#[test]
 fn test_multi_raft_node_new_with_lifecycle() {
     let router = Arc::new(Router::new(
         default_slot_table(),

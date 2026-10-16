@@ -648,3 +648,16 @@ fn test_sstable_iterator_seek_to_last_empty() {
     let err = b.finish().unwrap_err();
     assert!(matches!(err, Error::InvalidArgument(_)));
 }
+
+#[test]
+fn get_does_not_return_adjacent_user_key() {
+    let dir = tempdir().unwrap();
+    let path = sstable_path(dir.path(), 1, 0);
+    let mut b = SSTableBuilder::new(&path, 512, 16, CompressionType::None, 0.0).unwrap();
+    b.add(&ik(b"a", 1), b"va").unwrap();
+    b.add(&ik(b"c", 1), b"vc").unwrap();
+    b.finish().unwrap();
+    let reader = SSTableReader::open(&path, None).unwrap();
+    let seek = ik(b"b", 10);
+    assert_eq!(reader.get(&seek).unwrap(), None);
+}

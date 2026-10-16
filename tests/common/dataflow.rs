@@ -91,6 +91,17 @@ impl SpanCollector {
         let records = self.records.lock().unwrap().clone();
 
         // 找到根节点 (parent_id=None 的 span, 若无则取第一个)
+        if records.is_empty() {
+            return SpanTree {
+                root: SpanNode {
+                    name: String::new(),
+                    target: String::new(),
+                    children: Vec::new(),
+                },
+                span_count: 0,
+            };
+        }
+
         let root_idx = records
             .iter()
             .position(|r| r.parent_id.is_none())

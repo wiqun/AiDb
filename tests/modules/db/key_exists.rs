@@ -6,11 +6,25 @@ fn key_exists_sees_key_after_flush_to_sst() {
     let dir = tempfile::tempdir().unwrap();
     let db = aidb::DB::open(dir.path(), aidb::config::Options::for_testing()).unwrap();
     let big = vec![0u8; 256 * 1024];
-    db.put(b"big", &big).unwrap(); // Task 1 时 put 仍为 Result<()>; Task 2 起变为 Result<bool> 后忽略 bool 即可
+    db.put(b"big", &big).unwrap();
     db.flush().unwrap();
     assert!(db.key_exists(b"big").unwrap());
     assert!(!db.key_exists(b"missing").unwrap());
     assert_eq!(db.get(b"big").unwrap().as_deref(), Some(big.as_slice()));
+}
+
+#[test]
+fn key_exists_without_stats_does_not_bump_block_seek() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = aidb::DB::open(dir.path(), aidb::config::Options::for_testing()).unwrap();
+    let big = vec![0u8; 256 * 1024];
+    db.put(b"big", &big).unwrap();
+    db.flush().unwrap();
+    let before = db.statistics().snapshot().block_seek_count;
+    assert!(db.key_exists_without_stats(b"big").unwrap());
+    assert_eq!(db.statistics().snapshot().block_seek_count, before);
+    assert!(db.key_exists(b"big").unwrap());
+    assert!(db.statistics().snapshot().block_seek_count > before);
 }
 
 #[test]

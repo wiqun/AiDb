@@ -28,8 +28,6 @@ pub fn bloom_false_positive_count() -> u64 {
 
 pub(crate) fn record_bloom_false_positive() {
     BLOOM_FALSE_POSITIVES.fetch_add(1, Ordering::Relaxed);
-    #[cfg(feature = "monitoring")]
-    crate::metrics::record_bloom_false_positive();
 }
 
 /// Filter 抽象, 便于未来扩展 Ribbon 等.

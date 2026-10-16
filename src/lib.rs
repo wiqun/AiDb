@@ -9,14 +9,18 @@ pub mod backup;
 
 pub mod engine;
 pub mod error;
+pub mod observability;
 
 #[cfg(feature = "monitoring")]
 pub mod metrics;
 
 pub use engine::cache::{BlockCache, CacheStats};
 pub use engine::checkpoint::Checkpoint;
-pub use engine::db::{DbIterGuard, EngineWriteStats, Snapshot, WriteBatch, WriteOp, DB};
+pub use engine::db::{DbIterGuard, Snapshot, WriteBatch, WriteOp, DB};
 pub use error::{Error, Result};
+
+pub mod statistics;
+pub use statistics::Statistics;
 
 #[cfg(feature = "cluster")]
 pub mod cluster;

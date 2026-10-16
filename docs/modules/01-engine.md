@@ -32,26 +32,27 @@ description: AiDb 写路径 — WAL、MemTable、DB API、WriteBatch、MVCC 快�
 | `engine/memtable/range_tombstone.rs` | Range tombstone 辅助 (`[start,end)` 覆盖 / 最大 seq) | `max_covering_range_tombstone_seq` |
 | `engine/db/mod.rs` | DB 模块根; re-export | — |
 | `engine/db/inner/` | DB 总协调 (子目录): `mod.rs` 生命周期/状态 + `write.rs` 写路径 + `read.rs` 读路径 + `exists.rs` 存在性判定 + `flush.rs` Flush + `compaction.rs` Compaction | `DB::open`, `put`, `write`, `get`, `key_exists` |
-| `engine/db/write_batch.rs` | 批写容器与写摘要 | `WriteBatch`, `WriteOp`, `EngineWriteStats` |
+| `engine/db/write_batch.rs` | 批写容器 | `WriteBatch`, `WriteOp` |
 | `engine/db/replay.rs` | WAL entry → MemTable 回放 | `replay_entries` |
 | `engine/db/snapshot.rs` | MVCC 快照; `SnapshotList` | `Snapshot::get`, `SnapshotList` |
-| `engine/db/iterator.rs` | 跨 MemTable + SSTable 归并迭代 | `DBIterator` |
+| `engine/db/iterator.rs` | 跨 MemTable + SSTable 惰性归并迭代 (区间剪枝, 逆序按区间收敛) | `DBIterator` |
 | `engine/db/numbers.rs` | WAL 文件编号扫描 | `scan_next_wal_file_number` |
 | `src/config.rs` | 引擎配置: `Options` / `ClusterConfig` / `MigrationConfig` / `CompressionType` | `Options::for_testing`, `Options::validate` |
 | `src/error.rs` | 类型化错误 (`thiserror`); `Cluster` 变体需 feature `cluster` | `Error`, `Result` |
 
-公共 re-export (`src/lib.rs`): `DB`, `WriteBatch`, `WriteOp`, `EngineWriteStats`, `Snapshot`, `DbIterGuard`.
+公共 re-export (`src/lib.rs`): `DB`, `WriteBatch`, `WriteOp`, `Snapshot`, `DbIterGuard`.
 
 ## 关键 invariant (勿破坏)
 
-- **写顺序**: WAL append **先于** MemTable 写入 (`put`/`delete`/`write` 均如此).
+- **写顺序**: WAL append **先于** MemTable 写入 (`put`/`delete`/`delete_range`/`write` 均如此).
+- **写临界区**: `put`/`delete`/`delete_range`/`write` 在 `write_lock` 内完成序号分配, WAL 追加, MemTable 插入与 `committed_sequence` 推进; `sync_wal` 的 fsync 等待在锁外 (组提交). 因此写入在插入后即对 `iter`/`scan`/`snapshot` 可见; 若 fsync 失败, 调用方收到 `Err` 但写入已可见.
 - **Sequence**: 合法范围 `[1, 2^56)`; `alloc_sequence` 与 `check_sequence` 双重校验; overflow → `Error::InvalidState`.
-- **User key**: 非空; 空 key → `Error::InvalidArgument`.
+- **User key**: 非空; 空 key → `Error::InvalidArgument`. `write` 在分配序号与写 WAL 之前整批校验, 含非法 key 的批次整体失败且不留前缀.
 - **单进程**: 数据目录 `LOCK` 文件 + `fs2` 独占锁; 多进程打开 → `Error::Busy`.
 - **Batch 崩溃原子性**: recover 时 `BatchStart` 标记不完整 batch 整批丢弃; 单条 put/delete 无 BatchStart.
 - **MemTable freeze**: `freeze(self)` 消费可变表; `flush_seq` = 冻结时刻 sequence.
 - **Snapshot 创建**: 在 `write_lock` 下读 sequence 并注册 `SnapshotList` (register 必须发生在释放锁之前); Drop 时 unregister. Compaction 读取 `min_snapshot_sequence()` 时同样短暂持有 `write_lock`, 与 snapshot 创建之间形成 happens-before, 避免读到"seq 已确定但尚未 register"的中间态.
-- **iter/scan vs get**: `iter`/`scan` 使用 `K_MAX_SEQUENCE`; `get` 使用 `sequence.load()` — 行为 intentionally 不同.
+- **iter/scan 可见边界**: `iter`/`scan` 以创建时刻的 `committed_sequence` 为可见上界, 与 `Snapshot` 一致 (`get` 仍用 `sequence`, 见已知限制); 迭代器惰性持有 MemTable 的 SkipMap 句柄, 迭代期间的新写入 (seq 大于边界) 不可见. 逆序遍历 (`seek_to_last`/`prev`) 以 `end` 为上界、以 `start` 为下界, 且按 user key 取组内最新可见版本再判定删除与 range tombstone.
 - **delete_range**: O(1) 写入 MemTable RangeTombstone 与 WAL `TypeRangeDelete`, 非扫 key 逐条删除.
 
 ## 数据流
@@ -64,7 +65,10 @@ flowchart LR
     L --> S[alloc_sequence]
     S --> WAL[WAL append]
     WAL --> MT[MemTable put/delete]
-    MT --> F{memtable_size?}
+    MT --> CM[committed 推进]
+    CM --> UL[解锁]
+    UL --> SY[sync 等待 组提交]
+    SY --> F{memtable_size?}
     F -->|yes| FR[freeze → immutable]
     FR --> BG[后台 flush 线程]
 ```
@@ -115,9 +119,10 @@ SSTable / VersionSet 细节见 [engine-storage.md](02-engine-storage.md).
 | API | 说明 |
 | --- | --- |
 | `DB::open(path, Options)` | 恢复 + 启动后台 flush/compaction 线程 |
-| `put(key, value) -> Result<bool>` | 单条写; 返回是否 insert (新 key); 同源更新 `total_key_count` |
-| `write(&WriteBatch) -> Result<EngineWriteStats>` | 原子批量写; BatchStart + 连续 seq; 一次 `sync_wal`; 批内 overlay 累计 inserted/deleted |
-| `write_without_wal(&WriteBatch) -> Result<EngineWriteStats>` | 同上但不写引擎 WAL (Raft apply 等); 同样用 `key_exists` + overlay |
+| `put(key, value) -> Result<()>` | 单条写; 不为键计数做存在性判断 |
+| `write(&WriteBatch) -> Result<()>` | 原子批量写; BatchStart + 连续 seq; 一次 `sync_wal` |
+| `write_without_wal(&WriteBatch) -> Result<()>` | 同上但不写引擎 WAL (Raft apply 等) |
+| `estimate_entry_count() -> u64` | SST `num_entries` 与 MemTable `entry_count` 之和, 含旧版本和墓碑 |
 | `delete(key)` | 单条删; 分配连续 sequence |
 | `get(key)` | 读取最新可见版本 |
 | `key_exists(key)` | 完整存在性判定 (mem→imm→SST); 不物化 Value |
@@ -160,7 +165,7 @@ batch.delete(b"k2");
 let _ = db.write(&batch)?;
 ```
 
-空 batch 为 no-op (不写 WAL, 不分配 sequence; 返回零值 `EngineWriteStats`).
+空 batch 为 no-op (不写 WAL, 不分配 sequence; 返回 `Ok(())`).
 
 ### Snapshot 点读
 
@@ -213,6 +218,6 @@ cargo test --test engine --test snapshot -- --test-threads=1
 ## 已知限制
 
 - 并发 `get` 无锁读 MemTable: WriteBatch 逐条写入 MemTable 期间, 其他线程可能看到 batch **部分** 效果 (与 LevelDB 一致). Snapshot 创建持 `write_lock`, 无此问题.
-- `iter`/`scan` 不过滤到当前 sequence, 使用 `K_MAX_SEQUENCE` 见全部已写入版本.
-- `total_key_count` 与 `put`/`write`/`write_without_wal` 返回的 insert/delete 摘要同源: 经完整 `key_exists` (及批内 overlay) 判定后增减 (AtomicUsize Relaxed 序, 不持久化).
+- `iter`/`scan` 的可见上界为创建时刻的 `committed_sequence` (与 `Snapshot` 一致), 迭代器创建之后的写入不可见; 同一迭代器的正向与逆向 API 不应混用后依赖原方向位置.
+- `get`/`key_exists` 的可见上界仍为 `sequence.load()` (已分配序号), 与 `iter`/`scan` 边界不同: 并发写入在插入 MemTable 的中途可能被 `get` 看到部分效果.
 - 数据目录格式与旧版 `aidb-oldmain` **不兼容** (文本 WAL → 二进制 WalEntry).

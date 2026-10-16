@@ -55,12 +55,11 @@ impl OpenRaftStorage {
     pub(crate) fn apply_batch_to_sm(&self, batch: &ThinWriteBatch) -> Result<()> {
         let mut db_batch = WriteBatch::new();
         let mut overlay = HashMap::new();
-        let _ = self.append_thin_batch_to_db_batch(&mut db_batch, batch, &mut overlay)?;
+        self.append_thin_batch_to_db_batch(&mut db_batch, batch, &mut overlay)?;
         if db_batch.is_empty() {
             return Ok(());
         }
-        let _ = self
-            .db
+        self.db
             .write(&db_batch)
             .map_err(|e| Error::Cluster(map_db_err(e)))?;
         Ok(())
@@ -74,12 +73,11 @@ impl OpenRaftStorage {
     ) -> Result<()> {
         let mut db_batch = WriteBatch::new();
         let mut overlay = HashMap::new();
-        let _ = self.append_migration_write_to_batch(&mut db_batch, epoch, ops, &mut overlay)?;
+        self.append_migration_write_to_batch(&mut db_batch, epoch, ops, &mut overlay)?;
         if db_batch.is_empty() {
             return Ok(());
         }
-        let _ = self
-            .db
+        self.db
             .write(&db_batch)
             .map_err(|e| Error::Cluster(map_db_err(e)))?;
         Ok(())
@@ -104,8 +102,7 @@ impl OpenRaftStorage {
         if batch.is_empty() {
             return Ok(());
         }
-        let _ = self
-            .db
+        self.db
             .write(&batch)
             .map_err(|e| Error::Cluster(map_db_err(e)))?;
         Ok(())
@@ -206,8 +203,7 @@ impl OpenRaftStorage {
                         crate::cluster::failpoint::fire(
                             crate::cluster::FailPoint::ApplyBeforePersist,
                         );
-                        let _ = self
-                            .db
+                        self.db
                             .write_without_wal(&batch)
                             .map_err(|e| Error::Cluster(map_db_err(e)))?;
                         #[cfg(feature = "cluster-test-util")]
@@ -254,7 +250,7 @@ impl OpenRaftStorage {
         Ok(responses)
     }
 
-    /// 批内 overlay: key 为 `sm_key`, value 为当前批内可见的存在性.
+    /// 批内 overlay, 只给 `PutConditional` 用. Put / Delete 会更新它, 但不再为 effects 读盘.
     fn overlay_key_exists(
         overlay: &HashMap<Vec<u8>, bool>,
         db: &crate::DB,
@@ -262,7 +258,7 @@ impl OpenRaftStorage {
     ) -> Result<bool> {
         match overlay.get(sk) {
             Some(present) => Ok(*present),
-            None => db.key_exists(sk),
+            None => db.key_exists_without_stats(sk),
         }
     }
 
@@ -271,27 +267,22 @@ impl OpenRaftStorage {
         batch: &mut WriteBatch,
         thin: &ThinWriteBatch,
         overlay: &mut HashMap<Vec<u8>, bool>,
-    ) -> Result<Vec<bool>> {
-        let mut effects = Vec::with_capacity(thin.ops.len());
+    ) -> Result<()> {
         for op in &thin.ops {
             match op {
                 ThinWriteOp::Put { key, value } => {
                     let sk = sm_key(self.group_id, key);
-                    let existed = Self::overlay_key_exists(overlay, &self.db, &sk)?;
-                    effects.push(!existed);
                     overlay.insert(sk.clone(), true);
                     batch.put(sk, value.clone());
                 }
                 ThinWriteOp::Delete { key } => {
                     let sk = sm_key(self.group_id, key);
-                    let existed = Self::overlay_key_exists(overlay, &self.db, &sk)?;
-                    effects.push(existed);
                     overlay.insert(sk.clone(), false);
                     batch.delete(sk);
                 }
             }
         }
-        Ok(effects)
+        Ok(())
     }
 
     fn append_put_conditional_to_batch(
@@ -330,9 +321,9 @@ impl OpenRaftStorage {
         epoch: u64,
         ops: &ThinWriteBatch,
         overlay: &mut HashMap<Vec<u8>, bool>,
-    ) -> Result<Vec<bool>> {
+    ) -> Result<()> {
         if ops.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let tip_key = mig_tip_key(self.group_id, epoch);
         let tip_before = self
@@ -340,14 +331,11 @@ impl OpenRaftStorage {
             .get(&tip_key)?
             .and_then(|v| decode_tip(&v))
             .unwrap_or(0);
-        let mut effects = Vec::with_capacity(ops.ops.len());
         for (i, op) in ops.ops.iter().enumerate() {
             let seq = tip_before + i as u64 + 1;
             match op {
                 ThinWriteOp::Put { key, value } => {
                     let sk = sm_key(self.group_id, key);
-                    let existed = Self::overlay_key_exists(overlay, &self.db, &sk)?;
-                    effects.push(!existed);
                     overlay.insert(sk.clone(), true);
                     batch.put(sk, value.clone());
                     batch.put(
@@ -357,8 +345,6 @@ impl OpenRaftStorage {
                 }
                 ThinWriteOp::Delete { key } => {
                     let sk = sm_key(self.group_id, key);
-                    let existed = Self::overlay_key_exists(overlay, &self.db, &sk)?;
-                    effects.push(existed);
                     overlay.insert(sk.clone(), false);
                     batch.delete(sk);
                     batch.put(
@@ -369,7 +355,7 @@ impl OpenRaftStorage {
             }
         }
         batch.put(tip_key, encode_tip(tip_before + ops.len() as u64));
-        Ok(effects)
+        Ok(())
     }
 
     /// FIX-0056-A1: Commit/Cancel 后 GC 该 epoch 的全部 `mig/{gid}/{epoch}/*`
@@ -402,31 +388,25 @@ impl OpenRaftStorage {
             }
             Request::Put { key, value } => {
                 let sk = sm_key(self.group_id, key);
-                let existed = Self::overlay_key_exists(overlay, &self.db, &sk)?;
                 overlay.insert(sk.clone(), true);
                 batch.put(sk, value.clone());
-                Ok(Response::WriteStats {
-                    effects: vec![!existed],
-                })
+                Ok(Response::Ok)
             }
             Request::Delete { key } => {
                 let sk = sm_key(self.group_id, key);
-                let existed = Self::overlay_key_exists(overlay, &self.db, &sk)?;
                 overlay.insert(sk.clone(), false);
                 batch.delete(sk);
-                Ok(Response::WriteStats {
-                    effects: vec![existed],
-                })
+                Ok(Response::Ok)
             }
             Request::WriteBatch(wb) => {
-                let effects = self.append_thin_batch_to_db_batch(batch, wb, overlay)?;
-                Ok(Response::WriteStats { effects })
+                self.append_thin_batch_to_db_batch(batch, wb, overlay)?;
+                Ok(Response::Ok)
             }
             // 迁移写屏障: 不改用户数据, 仅随 entry 推进 last_applied.
             Request::MigrationBarrier { .. } => Ok(Response::Ok),
             Request::MigrationWrite { epoch, ops } => {
-                let effects = self.append_migration_write_to_batch(batch, *epoch, ops, overlay)?;
-                Ok(Response::WriteStats { effects })
+                self.append_migration_write_to_batch(batch, *epoch, ops, overlay)?;
+                Ok(Response::Ok)
             }
             Request::MigrationGc { epoch } => {
                 self.append_migration_gc_to_batch(batch, *epoch)?;
@@ -446,8 +426,7 @@ impl OpenRaftStorage {
             last_applied_key(self.group_id),
             Self::serialize_last_applied(log_id)?,
         );
-        let _ = self
-            .db
+        self.db
             .write(&batch)
             .map_err(|e| Error::Cluster(map_db_err(e)))?;
         self.state.write().last_applied = Some(*log_id);
@@ -468,8 +447,7 @@ impl OpenRaftStorage {
             last_applied_key(self.group_id),
             Self::serialize_last_applied(log_id)?,
         );
-        let _ = self
-            .db
+        self.db
             .write(&batch)
             .map_err(|e| Error::Cluster(map_db_err(e)))?;
         self.state.write().last_applied = Some(*log_id);
@@ -492,8 +470,7 @@ impl OpenRaftStorage {
             last_applied_key(self.group_id),
             Self::serialize_last_applied(log_id)?,
         );
-        let _ = self
-            .db
+        self.db
             .write(&batch)
             .map_err(|e| Error::Cluster(map_db_err(e)))?;
         self.state.write().last_applied = Some(*log_id);
@@ -578,10 +555,9 @@ mod tests {
         assert!(storage.get_state_machine_value(b"k1").unwrap().is_none());
     }
 
-    /// 空库上 Put→Del→Put: effects 为 [inserted, deleted, inserted],
-    /// 且依赖批内 overlay (中间 Del 必须可见, 否则第二次 Put 会误报非 insert).
+    /// 空库上 Put→Del→Put 只返回 Ok, 最终值是最后一次 Put.
     #[test]
-    fn apply_write_batch_put_del_put_effects_no_double_insert() {
+    fn apply_write_batch_put_del_put_returns_ok() {
         use openraft::{EntryPayload, LogId};
 
         let (storage, _dir) = test_storage();
@@ -597,18 +573,10 @@ mod tests {
             .apply_entries_internal(std::slice::from_ref(&entry))
             .unwrap();
         assert_eq!(responses.len(), 1);
-        match &responses[0] {
-            Response::WriteStats { effects } => {
-                assert_eq!(effects.as_slice(), &[true, true, true]);
-            }
-            other => panic!("expected WriteStats, got {other:?}"),
-        }
-        assert!(
-            storage
-                .db
-                .key_exists(&sm_key(DEFAULT_GROUP_ID, b"k"))
-                .unwrap(),
-            "最终 key 应存在"
+        assert!(matches!(responses[0], Response::Ok));
+        assert_eq!(
+            storage.get_state_machine_value(b"k").unwrap(),
+            Some(b"b".to_vec())
         );
     }
 

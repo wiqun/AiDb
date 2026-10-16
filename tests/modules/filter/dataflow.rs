@@ -32,7 +32,7 @@ fn test_filter_bloom_observability() {
     let caps = capture_spans_under_lock(|| {
         assert!(reader.get(&present).unwrap().is_some());
     });
-    assert!(!caps.spans_named("sst_seek").is_empty());
+    assert!(caps.spans_named("sst_seek").is_empty());
 
     let missing = encode_internal_key(b"absent", u64::MAX, ValueType::TypePut);
     let events = capture_events_under_lock(|| {

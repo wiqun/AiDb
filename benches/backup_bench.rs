@@ -24,7 +24,7 @@ fn preload_db(db: &DB, count: u64) {
         for i in written..batch_end {
             batch.put(format!("key_{:05}", i).as_bytes(), &VALUE_1KB[..]);
         }
-        let _ = db.write(&batch).unwrap();
+        db.write(&batch).unwrap();
         written = batch_end;
         if written.is_multiple_of(1000) || written == count {
             db.flush().unwrap();

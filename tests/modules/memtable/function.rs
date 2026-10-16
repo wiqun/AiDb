@@ -32,6 +32,20 @@ fn test_compare_internal_key() {
     assert_eq!(compare_internal_key(&a, &b), std::cmp::Ordering::Less);
 }
 
+/// 每条成功写入的内部记录都计入 entry_count, 包括覆盖, 点删除和范围删除.
+#[test]
+fn entry_count_counts_each_inserted_record() {
+    let mt = MemTable::new();
+    assert_eq!(mt.entry_count(), 0);
+    mt.put(b"a", b"1", 1).unwrap();
+    mt.put(b"a", b"2", 2).unwrap();
+    mt.delete(b"a", 3).unwrap();
+    mt.put_range_delete(b"a", b"z", 4).unwrap();
+    assert_eq!(mt.entry_count(), 4);
+    let frozen = mt.freeze(4);
+    assert_eq!(frozen.entry_count(), 4);
+}
+
 /// 验证 MemTable 基本 Put 和 Get 操作
 #[test]
 fn test_memtable_put_get() {
