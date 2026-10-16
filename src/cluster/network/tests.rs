@@ -41,6 +41,7 @@ async fn invalidate_on_unavailable_only_for_connection_failures() {
         1024,
         None,
         Some(Arc::clone(&channels)),
+        None,
     );
 
     // 基线: 池与本地 client 状态

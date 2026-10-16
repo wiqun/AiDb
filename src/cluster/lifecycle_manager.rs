@@ -27,7 +27,6 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use tracing::instrument;
 
 use crate::cluster::meta_types::{ClusterMeta, SlotMigrationState, SlotTable};
 use crate::cluster::router::Router;
@@ -98,7 +97,6 @@ impl LifecycleManager {
     ///
     /// Returns a [`TickResult`] containing groups to create, groups to remove,
     /// and expected Raft memberships for local groups.
-    #[instrument(skip(self))]
     pub fn tick(&self) -> TickResult {
         let meta = self.meta_raft.get_cluster_meta();
         let new_table = self.meta_raft.get_slot_table();

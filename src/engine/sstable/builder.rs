@@ -101,12 +101,6 @@ impl SSTableBuilder {
         }
     }
 
-    #[tracing::instrument(
-        level = "debug",
-        name = "sst_build_add",
-        skip(self, key, value),
-        fields(key_len = key.len())
-    )]
     pub fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         if key.is_empty() {
             return Err(Error::InvalidArgument("empty SSTable key".into()));
@@ -176,11 +170,6 @@ impl SSTableBuilder {
     }
 
     pub fn finish(mut self) -> Result<u64> {
-        let _span = tracing::debug_span!(
-          "sst_build_finish",
-          file = %self.final_path.display()
-        )
-        .entered();
         if self.num_entries == 0 {
             return Err(Error::InvalidArgument("empty sstable".into()));
         }
@@ -200,8 +189,6 @@ impl SSTableBuilder {
             let key_count = self.num_entries;
             let num_bits = filter.num_bits();
             let num_hashes = filter.num_hashes();
-            let _bloom_span =
-                tracing::debug_span!("bloom_build", key_count, num_bits, num_hashes).entered();
             let encoded = filter.encode();
             tracing::debug!(
               target: "sst",

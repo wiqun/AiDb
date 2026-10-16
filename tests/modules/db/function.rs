@@ -89,7 +89,7 @@ fn test_write_batch_empty() {
     let dir = tempdir().unwrap();
     let db = DB::open(dir.path(), small_opts()).unwrap();
     let batch = WriteBatch::new();
-    let _ = db.write(&batch).unwrap();
+    db.write(&batch).unwrap();
     db.close().unwrap();
 }
 
@@ -101,7 +101,7 @@ fn test_write_batch_mixed() {
     batch.put(b"a", b"1");
     batch.put(b"b", b"2");
     batch.delete(b"a");
-    let _ = db.write(&batch).unwrap();
+    db.write(&batch).unwrap();
     assert_eq!(db.get(b"a").unwrap(), None);
     assert_eq!(db.get(b"b").unwrap(), Some(b"2".to_vec()));
     db.close().unwrap();
@@ -313,4 +313,30 @@ fn test_db_reverse_scan_with_range() {
     }
     assert_eq!(keys, vec![b"b".to_vec(), b"c".to_vec()]);
     db.close().unwrap();
+}
+
+/// flush 后重开, 估值来自 SST; 同一 key 再写入时, MemTable 里的新版本也计入.
+#[test]
+fn estimate_includes_sst_and_newer_memtable_version() {
+    let dir = tempdir().unwrap();
+    let db = DB::open(dir.path(), small_opts()).unwrap();
+    db.put(b"k", b"v1").unwrap();
+    db.flush().unwrap();
+    drop(db);
+    let db = DB::open(dir.path(), small_opts()).unwrap();
+    assert_eq!(db.estimate_entry_count(), 1);
+    db.put(b"k", b"v2").unwrap();
+    assert_eq!(db.estimate_entry_count(), 2);
+}
+
+/// 重开后, 在任何新写入之前估值已经来自已打开的 SST, 不是 0.
+#[test]
+fn estimate_reopen_is_not_zero_before_new_writes() {
+    let dir = tempdir().unwrap();
+    let db = DB::open(dir.path(), small_opts()).unwrap();
+    db.put(b"k", b"v1").unwrap();
+    db.flush().unwrap();
+    drop(db);
+    let db = DB::open(dir.path(), small_opts()).unwrap();
+    assert_eq!(db.estimate_entry_count(), 1);
 }

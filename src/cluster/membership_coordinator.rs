@@ -31,8 +31,6 @@
 
 use std::sync::Arc;
 
-use tracing::instrument;
-
 use crate::cluster::meta_raft_node::MetaRaftNode;
 use crate::cluster::meta_types::{MetaRequest, NodeStatus, SlotMigrationState};
 use crate::cluster::multi_raft_node::MultiRaftNode;
@@ -93,7 +91,6 @@ impl MembershipCoordinator {
     /// 幂等语义: 如果 RPC 地址已存在则视为更新 client_addr 而非新增.
     /// 这允许 --cluster-peers 启动的节点通过后续 CLUSTER MEET 补充
     /// client_addr, 确保 MOVED 重定向返回客户端端口而非 RPC 端口.
-    #[instrument(skip(self), fields(ctx.node_id, ctx.rpc_addr, ctx.join_method = ?ctx.join_method))]
     pub async fn add_node(&self, ctx: NodeJoinContext) -> Result<()> {
         let start = std::time::Instant::now();
         tracing::info!("add_node: starting");
@@ -193,14 +190,12 @@ impl MembershipCoordinator {
     ///
     /// Gathers all current voters plus the target node and calls
     /// `change_membership` on the MetaRaft consensus group.
-    #[instrument(skip(self))]
     pub async fn promote_learner_to_voter(&self, node_id: NodeId) -> Result<()> {
         // Delegate to MetaRaftNode which has the correct safety-net logic.
         self.meta_raft.promote_learner_to_voter(node_id).await
     }
 
     /// 从集群移除节点.
-    #[instrument(skip(self))]
     pub async fn remove_node(&self, ctx: NodeLeaveContext) -> Result<()> {
         let cluster_meta = self.meta_raft.get_cluster_meta();
         if !cluster_meta.nodes.contains_key(&ctx.node_id) {
@@ -285,7 +280,6 @@ impl MembershipCoordinator {
     /// 如果 group 不在本地 (is_group_local 返回 false), 则跳过 MultiRaft 操作,
     /// 仅更新 MetaRaft 元数据. 后续 LifecycleManager 会在 group 所在节点上检测到
     /// drift 并自动执行 Raft 成员变更.
-    #[instrument(skip(self))]
     pub async fn change_group_membership(
         &self,
         group_id: u64,
@@ -379,7 +373,6 @@ impl MembershipCoordinator {
     }
 
     /// 用新节点替换旧节点.
-    #[instrument(skip(self))]
     pub async fn replace_node(&self, old_node_id: NodeId, new_node_id: NodeId) -> Result<()> {
         let cluster_meta = self.meta_raft.get_cluster_meta();
         let groups: Vec<u64> = cluster_meta

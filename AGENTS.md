@@ -9,7 +9,7 @@
 ### 🔴 绝对禁止 (Never)
 - **禁止网络服务化**: AiDb 不自建 TCP/HTTP listener, 不实现 Redis RESP 协议, 不对外暴露网络端口 (除 Raft 内部 gRPC 节点间通信外).
 - **禁止破坏同步 API 契约**: 公共 API (`DB::put/get/scan` 等) 保持**纯同步**; 异步调用方通过 `spawn_blocking` 桥接.
-- **禁止热路径高等级 Span**: `put/get/write/WAL/MemTable/SSTable/block/Raft apply/propose` 等热路径的 `#[tracing::instrument]` 必须设为 `level = "debug"`, 确保在生产 `RUST_LOG=info` 下零性能开销.
+- **禁止允许名单以外的 Span**: 只允许 `db_flush`, `cmp_run`, `raft_propose`. 不得再加 `#[instrument]`. 采样关闭时不组装这些 span 的字段.
 - **禁止测试并发污染**: 集成测试与 Raft 测试**严禁多线程并发**, 必须带 `--test-threads=1`.
 - **禁止裸 `#[ignore]`**: 耗时或压力测试必须显式标注原因前缀 `#[ignore = "slow: ..."]` 或 `#[ignore = "stress: ..."]`.
 - **禁止随意修改底层持久化格式**: WAL Record 格式、SSTable Block 编码、Manifest 版本日志及 `proto/raft.proto` 变更属于高风险操作, 须提前评估兼容性与迁移方案.
@@ -77,4 +77,4 @@ cargo test -- --ignored --test-threads=1
 | **SSTable / Compaction / 缓存 / 过滤** | [docs/modules/02-engine-storage.md](docs/modules/02-engine-storage.md) | Leveled Compaction 评分与 Claim、Bloom 过滤、LRU BlockCache、硬链接快照 |
 | **Raft / MultiRaft / 槽位迁移** | [docs/modules/03-cluster.md](docs/modules/03-cluster.md) | MetaRaft 拓扑、MultiRaft Group 生命周期、SlotMigrationManager (F-056-A1 增量追平) |
 | **全量备份与恢复** | [docs/modules/04-backup.md](docs/modules/04-backup.md) | `BackupManager`、`RecoveryManager`、逐文件 SHA256 校验和与恢复 |
-| **指标注册与链路跟踪** | [docs/modules/05-observability.md](docs/modules/05-observability.md) | `aidb_*` OTel 埋点注册、热路径 `debug` span 约定 |
+| **指标注册与链路跟踪** | [docs/modules/05-observability.md](docs/modules/05-observability.md) | `aidb_*` OTel 埋点注册、`db_flush` / `cmp_run` / `raft_propose` span |

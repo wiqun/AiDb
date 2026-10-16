@@ -108,6 +108,7 @@ async fn network_blackhole_drops_rpc() {
         1024,
         None,
         None,
+        None,
     );
 
     let request = AppendEntriesRequest {

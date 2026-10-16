@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::RwLock;
-use tracing::instrument;
 
 use crate::cluster::meta_raft_node::MetaRaftNode;
 use crate::cluster::meta_types::{MetaRequest, SlotMigrationState, SLOT_COUNT};
@@ -194,7 +193,6 @@ impl SlotMigrationManager {
     }
 
     /// Migrating → Frozen. 要求本节点已完成匹配的 execute.
-    #[instrument(skip(self))]
     pub async fn freeze_for_commit(&self) -> Result<()> {
         let (source_group, target_group, slots) = self.current_migration_signature()?;
         self.require_completed_run_matching(source_group, target_group, &slots)?;
@@ -223,7 +221,6 @@ impl SlotMigrationManager {
     }
 
     /// Frozen 后向 target propose 写屏障并短暂稳定观察, 再落盘 quiesce_token.
-    #[instrument(skip(self))]
     pub async fn quiesce_writes(&self) -> Result<()> {
         match self.meta_raft.get_migration_state() {
             Some(SlotMigrationState::Frozen { target_group, .. }) => {
@@ -275,7 +272,6 @@ impl SlotMigrationManager {
     /// (`quiesce_writes` 之后, `final_verify` 之前的收尾前置) —— 两次相隔
     /// `QUIESCE_STABLE_MS` 读到的 tip 相等即认为 drain 完成. tip 在
     /// `MigrationWrite` apply 内单调递增, Frozen 下没有新客户端写会自然稳定.
-    #[instrument(skip(self))]
     pub async fn drain_oplog_tip_stable(&self) -> Result<()> {
         let (source_group, target_group, slots) = match self.meta_raft.get_migration_state() {
             Some(SlotMigrationState::Frozen {
@@ -323,7 +319,6 @@ impl SlotMigrationManager {
     /// 不做 source⊆target 存在性比对, 也不做 PutConditional 补拷.
     /// FIX-0056-A1: 调用顺序上位于 `drain_oplog_tip_stable` 之后 (见
     /// `finish_migration`) —— 本函数不重复校验 tip 是否稳定, 只信任链路顺序.
-    #[instrument(skip(self))]
     pub async fn final_verify(&self) -> Result<()> {
         let (source_group, target_group, slots) = match self.meta_raft.get_migration_state() {
             Some(SlotMigrationState::Frozen {
@@ -352,7 +347,6 @@ impl SlotMigrationManager {
     }
 
     /// Frozen → ReadyToCommit. 要求 quiesce_token 已落盘 (选择 A: Manager 内校验).
-    #[instrument(skip(self))]
     pub async fn mark_ready(&self) -> Result<()> {
         self.final_verify().await?;
         if self.read_quiesce_token().is_none() {
@@ -381,7 +375,6 @@ impl SlotMigrationManager {
 
     /// 完整收尾链: freeze → quiesce → drain_oplog_tip_stable → final_verify
     /// → mark_ready → commit.
-    #[instrument(skip(self))]
     pub async fn finish_migration(&self) -> Result<()> {
         self.freeze_for_commit().await?;
         self.quiesce_writes().await?;
@@ -391,7 +384,6 @@ impl SlotMigrationManager {
         self.commit_migration().await
     }
 
-    #[instrument(skip(self))]
     pub async fn start_migration(
         &self,
         source_group: u64,
@@ -432,7 +424,8 @@ impl SlotMigrationManager {
             return Err(ClusterError::InvalidState("migration already in progress".into()).into());
         }
 
-        // Begin via MetaRaft
+        // Begin via MetaRaft. propose 在 follower 上转发到 leader 后就会返回,
+        // 本机状态机要等复制才看得到. migration_id 取的是 apply 后的 version.
         self.meta_raft
             .propose(MetaRequest::BeginSlotMigration {
                 source_group,
@@ -440,6 +433,19 @@ impl SlotMigrationManager {
                 slots: slots.clone(),
             })
             .await?;
+        if let Err(e) = self.wait_until_local_migration(&slots).await {
+            if let Err(cancel_err) = self
+                .meta_raft
+                .propose(MetaRequest::CancelSlotMigration)
+                .await
+            {
+                tracing::warn!(
+                    error = %cancel_err,
+                    "local meta lagged after BeginSlotMigration and cancel also failed"
+                );
+            }
+            return Err(e);
+        }
 
         let migration_id = self.meta_raft.get_cluster_meta().version;
         let executor = SlotMigrationExecutor::new(
@@ -555,7 +561,6 @@ impl SlotMigrationManager {
     /// 1. Meta 相位必须为 `ReadyToCommit` (F-056; Meta validate 是权威, 此处双保险).
     /// 2. `executor` 仍然存在时拒绝 —— target 上必然没有完整拷贝.
     /// 3. 必须存在匹配 `(source, target, slots)` 且 `completed` 的 run record.
-    #[instrument(skip(self))]
     pub async fn commit_migration(&self) -> Result<()> {
         let (source_group, target_group, slots) = self.current_migration_signature()?;
 
@@ -597,7 +602,6 @@ impl SlotMigrationManager {
     ///
     /// F-056: Ready/Frozen 下读可能已指向 target; 必须先 Cancel 让读回 source,
     /// 再 `cleanup_target_residuals`, 避免读空洞.
-    #[instrument(skip(self))]
     pub async fn cancel_migration(&self) -> Result<()> {
         let (_source_group, target_group, slots) = self.current_migration_signature()?;
 
@@ -684,6 +688,32 @@ impl SlotMigrationManager {
     /// slots)`, 而不是从本地 `executor`/`last_run` 推断 —— 这两者在
     /// `run_pending_migration` 执行后会被清空/消费, 不能用来判断"当前是否有
     /// 迁移在进行".
+    /// Begin 已提交后, 等到本机 Meta 状态机出现同一批 slot.
+    /// follower 上 propose 返回时复制可能还没应用到本机, 多等几秒.
+    async fn wait_until_local_migration(&self, slots: &[u16]) -> Result<()> {
+        const ATTEMPTS: u32 = 150;
+        for _ in 0..ATTEMPTS {
+            if self.local_migration_slots_match(slots) {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(CANCEL_META_WAIT_MS)).await;
+        }
+        Err(ClusterError::InvalidState(
+            "BeginSlotMigration committed but local meta has not applied it".into(),
+        )
+        .into())
+    }
+
+    fn local_migration_slots_match(&self, slots: &[u16]) -> bool {
+        match self.meta_raft.get_migration_state() {
+            Some(SlotMigrationState::Prepare { slots: got, .. })
+            | Some(SlotMigrationState::Migrating { slots: got, .. })
+            | Some(SlotMigrationState::Frozen { slots: got, .. })
+            | Some(SlotMigrationState::ReadyToCommit { slots: got, .. }) => got.as_slice() == slots,
+            None => false,
+        }
+    }
+
     fn current_migration_signature(&self) -> Result<(u64, u64, Vec<u16>)> {
         match self.meta_raft.get_migration_state() {
             None => Err(ClusterError::InvalidState("no active migration".into()).into()),

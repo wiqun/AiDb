@@ -22,6 +22,10 @@
 //! - `snapshot_size_threshold: None` = 禁用 size-based snapshot, 仅依赖
 //!   `LogsSinceLast` 策略.
 
+use std::sync::Arc;
+
+use crate::statistics::Statistics;
+
 /// 压缩算法
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompressionType {
@@ -116,6 +120,8 @@ pub struct Options {
     pub min_sub_compactions: usize,
     /// Compaction 信号通道容量 (默认 64)
     pub compaction_channel_size: usize,
+    /// 引擎可观测性原子指标集合 (None 则在 open 时自动创建, 默认 None)
+    pub statistics: Option<Arc<Statistics>>,
 }
 
 impl Default for Options {
@@ -162,6 +168,7 @@ impl Default for Options {
             max_sub_compactions: 4,
             min_sub_compactions: 2,
             compaction_channel_size: 64,
+            statistics: None,
         }
     }
 }
@@ -210,6 +217,7 @@ impl Options {
             max_sub_compactions: 4,
             min_sub_compactions: 2,
             compaction_channel_size: 64,
+            statistics: None,
         }
     }
 

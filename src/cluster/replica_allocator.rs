@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 
-use tracing::{instrument, warn};
+use tracing::warn;
 
 use crate::cluster::meta_types::{ClusterMeta, SlotStatus, SLOT_COUNT};
 use crate::cluster::types::{ClusterError, NodeId};
@@ -74,7 +74,6 @@ impl ReplicaAllocator {
         self.weights.get(&node_id).copied().unwrap_or(1.0)
     }
 
-    #[instrument(skip(self, cluster_meta))]
     pub fn allocate_group(
         &self,
         group_id: u64,
@@ -169,7 +168,6 @@ impl ReplicaAllocator {
         })
     }
 
-    #[instrument(skip(self, cluster_meta))]
     pub fn rebalance_replicas(
         &self,
         cluster_meta: &ClusterMeta,

@@ -6,7 +6,22 @@ use super::{
     sstable_path, update_sstable_metrics, AtomicBool, AtomicOrdering, CompactionJob,
     CompactionTask, Duration, Error, Receiver, Result, SSTableReader, VersionEdit, Weak, DB,
 };
+use crate::engine::compaction::{user_key_from_internal, CompactionPointReader, UserKeyRange};
+use crate::statistics::CompactionPhase;
 use std::sync::Arc;
+
+/// 借用 `&DB` 的点查句柄, 只在 `run_compaction_once` 栈上存活.
+/// 读取最新可见版本, 不计入 Get 操作统计.
+struct DbPointReader<'a> {
+    db: &'a DB,
+}
+
+impl CompactionPointReader for DbPointReader<'_> {
+    fn get(&self, user_key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let max_seq = self.db.sequence.load(AtomicOrdering::SeqCst);
+        self.db.get_at_sequence_uncounted(user_key, max_seq)
+    }
+}
 
 impl DB {
     pub(super) fn maybe_trigger_compaction(&self) {
@@ -49,31 +64,35 @@ impl DB {
         if self.checkpoint_in_progress.load(AtomicOrdering::Acquire) {
             return Ok(false);
         }
-        #[cfg(feature = "monitoring")]
         let pick_start = std::time::Instant::now();
         let levels: Vec<Vec<Arc<SSTableReader>>> = self.sstables.read().iter().cloned().collect();
         let task = match self.compaction_picker.pick_compaction(&levels) {
             Some(t) => t,
             None => return Ok(false),
         };
-        #[cfg(feature = "monitoring")]
-        {
-            crate::metrics::record_compaction("pick");
-            crate::metrics::record_compaction_duration("pick", pick_start.elapsed().as_secs_f64());
-        }
+        let span = crate::observability::optional_span("cmp_run");
+        let _enter = span.enter();
+        self.stats.compaction_phases[CompactionPhase::Pick as usize]
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.stats.compaction_durations[CompactionPhase::Pick as usize]
+            .record(pick_start.elapsed().as_micros() as u64);
 
         // Claim files to prevent overlapping compactions from different threads
         if !self.try_claim_files(&task) {
             return Ok(true);
         }
 
+        let level = task.level;
+        tracing::info!(target: "cmp", level, "compaction start");
+
         // --- TRIVIAL MOVE FAST PATH ---
         if task.is_trivial_move {
-            return self.run_trivial_move(task);
+            let moved = self.run_trivial_move(task)?;
+            tracing::info!(target: "cmp", level, "compaction end");
+            return Ok(moved);
         }
         // --- END TRIVIAL MOVE ---
 
-        #[cfg(feature = "monitoring")]
         let run_start = std::time::Instant::now();
         // "Pin": 读取 min_snapshot_sequence() 时短暂持有 write_lock, 和
         // snapshot() 内"读 seq + register"共享同一把锁, 二者之间就有了严格
@@ -97,6 +116,15 @@ impl DB {
         let file_numbers: Vec<u64> = (0..num_splits)
             .map(|_| self.version_set.read().allocate_file_number())
             .collect();
+        let consumed: Vec<u64> = task
+            .inputs
+            .iter()
+            .chain(task.expanded_inputs.iter())
+            .map(|f| f.file_number())
+            .collect();
+        let start = surviving_start_level(task.level, task.output_level);
+        let surviving = deeper_and_sibling_user_ranges(&levels, start, &consumed);
+        let reader = DbPointReader { db: self };
         let results = CompactionJob::new(
             task.inputs.clone(),
             task.expanded_inputs.clone(),
@@ -108,16 +136,28 @@ impl DB {
             self.options.bloom_false_positive_rate,
         )
         .with_snapshot_threshold(min_snap_seq)
+        .with_surviving_user_ranges(surviving)
         .with_filter(self.compaction_filter.read().clone())
-        .run(&file_numbers)?;
+        .run_with_reader(&file_numbers, Some(&reader))?;
 
-        #[cfg(feature = "monitoring")]
-        {
-            crate::metrics::record_compaction("run");
-            crate::metrics::record_compaction_duration("run", run_start.elapsed().as_secs_f64());
-        }
+        let written_bytes: u64 = results.iter().map(|r| r.file_size).sum();
+        self.stats
+            .compaction_written_bytes
+            .fetch_add(written_bytes, AtomicOrdering::Relaxed);
 
-        #[cfg(feature = "monitoring")]
+        let read_bytes: u64 = task
+            .inputs
+            .iter()
+            .chain(task.expanded_inputs.iter())
+            .map(|f| f.file_size())
+            .sum();
+        self.stats.note_compaction_read(read_bytes);
+
+        self.stats.compaction_phases[CompactionPhase::Run as usize]
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.stats.compaction_durations[CompactionPhase::Run as usize]
+            .record(run_start.elapsed().as_micros() as u64);
+
         let apply_start = std::time::Instant::now();
 
         {
@@ -126,9 +166,10 @@ impl DB {
 
             for result in &results {
                 if result.entry_count > 0 {
-                    let reader = Arc::new(SSTableReader::open(
+                    let reader = Arc::new(SSTableReader::open_with_stats(
                         &result.output_path,
                         Some(Arc::clone(&self.block_cache)),
+                        Some(Arc::clone(&self.stats)),
                     )?);
                     if task.output_level == 0 {
                         sst_guard[task.output_level].insert(0, reader);
@@ -175,17 +216,18 @@ impl DB {
                 self.l0_sstable_count
                     .fetch_add(l0_output_count, AtomicOrdering::Relaxed);
             }
-            #[cfg(feature = "monitoring")]
-            {
-                crate::metrics::record_compaction("apply");
-                crate::metrics::record_compaction_duration(
-                    "apply",
-                    apply_start.elapsed().as_secs_f64(),
-                );
-            }
+            self.stats.compaction_phases[CompactionPhase::Apply as usize]
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            self.stats.compaction_durations[CompactionPhase::Apply as usize]
+                .record(apply_start.elapsed().as_micros() as u64);
+            self.stats.compaction_last_duration_us.store(
+                run_start.elapsed().as_micros() as u64,
+                AtomicOrdering::Relaxed,
+            );
         }
 
-        update_sstable_metrics(&self.sstables.read());
+        let pending = self.pending_compaction_bytes();
+        update_sstable_metrics(&self.sstables.read(), &self.stats, pending);
 
         // Version 已切换: 再通知 listener, 便于上层用 get==None 安全扣减.
         if let Some(listener) = self.compaction_removal_listener.read().clone() {
@@ -208,6 +250,7 @@ impl DB {
         }
 
         self.release_files(&task);
+        tracing::info!(target: "cmp", level = task.level, "compaction end");
         Ok(true)
     }
 
@@ -251,7 +294,11 @@ impl DB {
         })?;
 
         // Re-open at the new path (file content unchanged, just new level in name)
-        let reader = match SSTableReader::open(&new_path, Some(Arc::clone(&self.block_cache))) {
+        let reader = match SSTableReader::open_with_stats(
+            &new_path,
+            Some(Arc::clone(&self.block_cache)),
+            Some(Arc::clone(&self.stats)),
+        ) {
             Ok(r) => Arc::new(r),
             Err(e) => {
                 // Rollback: move the file back to its original location
@@ -294,7 +341,8 @@ impl DB {
             }
         }
 
-        update_sstable_metrics(&self.sstables.read());
+        let pending = self.pending_compaction_bytes();
+        update_sstable_metrics(&self.sstables.read(), &self.stats, pending);
 
         self.release_files(&task);
         Ok(true)
@@ -319,11 +367,6 @@ pub(super) fn compaction_background_loop(
         let Some(db) = weak.upgrade() else {
             break;
         };
-        let pending = db
-            .compaction_picker
-            .pick_compaction(&db.sstables.read().iter().cloned().collect::<Vec<_>>())
-            .is_some();
-        let _bg = tracing::debug_span!("cmp_background", pending).entered();
         match db.run_compaction_once() {
             Ok(true) => continue,
             Ok(false) => {
@@ -332,6 +375,210 @@ pub(super) fn compaction_background_loop(
             Err(e) => {
                 tracing::error!(target: "cmp", error = %e, "compaction round failed");
                 let _ = signal.recv_timeout(Duration::from_millis(db.options.compaction_poll_ms));
+            }
+        }
+    }
+}
+
+pub(crate) fn surviving_start_level(source_level: usize, _output_level: usize) -> usize {
+    source_level
+}
+
+pub(crate) fn deeper_and_sibling_user_ranges(
+    levels: &[Vec<Arc<SSTableReader>>],
+    output_level: usize,
+    consumed: &[u64],
+) -> Vec<UserKeyRange> {
+    let mut ranges = Vec::new();
+    for files in levels.iter().skip(output_level) {
+        for file in files {
+            if consumed.contains(&file.file_number()) {
+                continue;
+            }
+            let Ok(start) = user_key_from_internal(file.smallest_key()) else {
+                continue;
+            };
+            let Ok(end) = user_key_from_internal(file.largest_key()) else {
+                continue;
+            };
+            ranges.push(UserKeyRange {
+                start: start.to_vec(),
+                end: end.to_vec(),
+            });
+        }
+    }
+    ranges
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{deeper_and_sibling_user_ranges, surviving_start_level};
+    use crate::config::CompressionType;
+    use crate::engine::memtable::{encode_internal_key, ValueType};
+    use crate::engine::sstable::{sstable_path, SSTableBuilder, SSTableReader};
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use tempfile::tempdir;
+    use tracing::Subscriber;
+
+    fn one_key(
+        dir: &std::path::Path,
+        num: u64,
+        level: usize,
+        user_key: &[u8],
+    ) -> Arc<SSTableReader> {
+        let path = sstable_path(dir, num, level);
+        let mut b = SSTableBuilder::new(&path, 512, 16, CompressionType::None, 0.0).unwrap();
+        b.add(&encode_internal_key(user_key, 1, ValueType::TypePut), b"v")
+            .unwrap();
+        b.finish().unwrap();
+        Arc::new(SSTableReader::open(&path, None).unwrap())
+    }
+
+    #[test]
+    fn deeper_and_sibling_user_ranges_keeps_unconsumed_output_and_deeper() {
+        let dir = tempdir().unwrap();
+        let mut levels = vec![Vec::new(), Vec::new(), Vec::new()];
+        levels[1].push(one_key(dir.path(), 10, 1, b"a"));
+        levels[1].push(one_key(dir.path(), 11, 1, b"m"));
+        levels[2].push(one_key(dir.path(), 20, 2, b"z"));
+        let ranges = deeper_and_sibling_user_ranges(&levels, 1, &[10]);
+        let starts: Vec<Vec<u8>> = ranges.into_iter().map(|r| r.start).collect();
+        assert!(starts.contains(&b"m".to_vec()));
+        assert!(starts.contains(&b"z".to_vec()));
+        assert!(!starts.iter().any(|s| s == b"a"));
+    }
+
+    #[test]
+    fn source_level_sibling_survives_when_output_is_deeper() {
+        let dir = tempdir().unwrap();
+        let mut levels = vec![Vec::new(), Vec::new(), Vec::new()];
+        levels[1].push(one_key(dir.path(), 10, 1, b"a"));
+        levels[1].push(one_key(dir.path(), 11, 1, b"m"));
+        levels[2].push(one_key(dir.path(), 20, 2, b"z"));
+        let from_source = deeper_and_sibling_user_ranges(&levels, 1, &[10]);
+        let from_output = deeper_and_sibling_user_ranges(&levels, 2, &[10]);
+        assert!(from_source.iter().any(|r| r.start == b"m"));
+        assert!(!from_output.iter().any(|r| r.start == b"m"));
+        assert_eq!(surviving_start_level(1, 2), 1);
+    }
+
+    #[test]
+    fn flush_and_compaction_log_once_without_user_key() {
+        use std::sync::Arc;
+        use tracing_subscriber::prelude::*;
+        use tracing_subscriber::Registry;
+
+        use crate::config::Options;
+        use crate::DB;
+
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let layer = LogLayer {
+            messages: Arc::clone(&messages),
+        };
+        let subscriber = Registry::default()
+            .with(layer.with_filter(tracing_subscriber::filter::LevelFilter::INFO));
+        let dir = tempdir().unwrap();
+        let db = DB::open(dir.path(), Options::for_testing()).unwrap();
+        let key = b"user-key-should-stay-out";
+        let _guard = tracing::subscriber::set_default(subscriber);
+        db.put(key, b"v").unwrap();
+        db.flush().unwrap();
+        let flush_logs = messages
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, message, _)| message == "db.flush.complete")
+            .count();
+        assert_eq!(flush_logs, 1);
+        let dumped = messages
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, _, fields)| fields.clone())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(!dumped.contains("user-key-should-stay-out"));
+        db.put(key, b"v2").unwrap();
+        db.flush().unwrap();
+        db.run_compaction_once().unwrap();
+        let start = messages
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, message, _)| message == "compaction start")
+            .count();
+        let end = messages
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, message, _)| message == "compaction end")
+            .count();
+        assert_eq!(start, 1);
+        assert_eq!(end, 1);
+        let dumped = messages
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, _, fields)| fields.clone())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(!dumped.contains("user-key-should-stay-out"));
+        drop(_guard);
+        db.close().unwrap();
+    }
+
+    struct LogLayer {
+        messages: Arc<Mutex<Vec<(tracing::Level, String, String)>>>,
+    }
+
+    impl<S: Subscriber> tracing_subscriber::Layer<S> for LogLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut message = String::new();
+            let mut fields = String::new();
+            event.record(&mut Grab {
+                message: &mut message,
+                fields: &mut fields,
+            });
+            self.messages
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), message, fields));
+        }
+    }
+
+    struct Grab<'a> {
+        message: &'a mut String,
+        fields: &'a mut String,
+    }
+
+    impl tracing::field::Visit for Grab<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                *self.message = format!("{value:?}").trim_matches('"').to_string();
+            } else {
+                self.fields
+                    .push_str(&format!("{}={value:?} ", field.name()));
+            }
+        }
+
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.fields.push_str(&format!("{}={value} ", field.name()));
+        }
+
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            self.fields.push_str(&format!("{}={value} ", field.name()));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                *self.message = value.to_string();
+            } else {
+                self.fields.push_str(&format!("{}={value} ", field.name()));
             }
         }
     }

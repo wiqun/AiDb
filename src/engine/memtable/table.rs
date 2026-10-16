@@ -23,8 +23,10 @@ use super::range_tombstone::{max_covering_range_tombstone_seq, RangeTombstoneRec
 use super::rep::MemTableRep;
 use super::skiplist_rep::SkipMapRep;
 use crate::error::Result;
+use crate::statistics::Statistics;
 use parking_lot::RwLock;
 use std::ops::Bound;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// 同 user_key 的 point 状态 (不含 range tombstone).
@@ -92,6 +94,10 @@ impl ImmutableMemTable {
     pub(crate) fn inner(&self) -> &MemTable {
         &self.table
     }
+
+    pub fn entry_count(&self) -> u64 {
+        self.table.entry_count()
+    }
 }
 
 /// 可变 MemTable.
@@ -99,6 +105,9 @@ pub struct MemTable {
     rep: SkipMapRep,
     /// Range tombstone 索引 — 仅含 delete_range 写入, 避免 GET 扫描全表.
     range_index: RwLock<Vec<RangeTombstoneRecord>>,
+    stats: Option<Arc<Statistics>>,
+    /// 成功插入的内部记录数, 含覆盖写, 点删除和范围删除. flush 不减少.
+    entry_count: AtomicU64,
 }
 
 impl Default for MemTable {
@@ -109,10 +118,20 @@ impl Default for MemTable {
 
 impl MemTable {
     pub fn new() -> Self {
+        Self::new_with_stats(None)
+    }
+
+    pub fn new_with_stats(stats: Option<Arc<Statistics>>) -> Self {
         Self {
             rep: SkipMapRep::new(),
             range_index: RwLock::new(Vec::new()),
+            stats,
+            entry_count: AtomicU64::new(0),
         }
+    }
+
+    pub fn entry_count(&self) -> u64 {
+        self.entry_count.load(Ordering::Relaxed)
     }
 
     pub fn has_range_tombstones(&self) -> bool {
@@ -127,22 +146,17 @@ impl MemTable {
         self.rep.approximate_size()
     }
 
-    #[tracing::instrument(level = "debug",
-    name = "mem_put",
-    skip(self, key, value),
-    fields(key_size = key.len(), value_size = value.len())
-  )]
     pub fn put(&self, key: &[u8], value: &[u8], sequence: u64) -> Result<()> {
         check_sequence(sequence)?;
         let ik = InternalKeyBytes(encode_internal_key_arc(key, sequence, ValueType::TypePut));
         let val = Arc::from(value);
         self.rep.insert(ik, val);
+        self.entry_count.fetch_add(1, Ordering::Relaxed);
         tracing::debug!(target: "mem", "mem.put");
         self.sync_active_metric();
         Ok(())
     }
 
-    #[tracing::instrument(level = "debug", name = "mem_delete", skip(self, key))]
     pub fn delete(&self, key: &[u8], sequence: u64) -> Result<()> {
         check_sequence(sequence)?;
         let ik = InternalKeyBytes(encode_internal_key_arc(
@@ -151,13 +165,13 @@ impl MemTable {
             ValueType::TypeDelete,
         ));
         self.rep.insert(ik, Arc::from(&[] as &[u8]));
+        self.entry_count.fetch_add(1, Ordering::Relaxed);
         tracing::debug!(target: "mem", "mem.delete");
         self.sync_active_metric();
         Ok(())
     }
 
     /// 写入 range tombstone: InternalKey=start, value=end, 半开区间 `[start, end)`.
-    #[tracing::instrument(name = "mem_delete_range", skip(self, start, end))]
     pub fn put_range_delete(&self, start: &[u8], end: &[u8], sequence: u64) -> Result<()> {
         check_sequence(sequence)?;
         let ik = InternalKeyBytes(encode_internal_key_arc(
@@ -167,6 +181,7 @@ impl MemTable {
         ));
         let val = Arc::from(end);
         self.rep.insert(ik, val);
+        self.entry_count.fetch_add(1, Ordering::Relaxed);
         self.range_index.write().push(RangeTombstoneRecord {
             start: start.to_vec(),
             end: end.to_vec(),
@@ -216,7 +231,6 @@ impl MemTable {
             .collect())
     }
 
-    #[tracing::instrument(level = "debug", name = "mem_get", skip(self, key))]
     pub fn get(&self, key: &[u8], snapshot_seq: u64) -> Result<Option<Vec<u8>>> {
         let seek_key = encode_internal_key(key, snapshot_seq, ValueType::TypePut);
         match self.search(&seek_key)? {
@@ -235,7 +249,6 @@ impl MemTable {
         }
     }
 
-    #[tracing::instrument(level = "debug", name = "mem_search", skip(self, seek_key))]
     pub fn search(&self, seek_key: &[u8]) -> Result<Option<(Arc<[u8]>, ValueType)>> {
         let bound = InternalKeyBytes::from_slice(seek_key);
         let Some(entry) = self.rep.lower_bound(Bound::Included(&bound)) else {
@@ -264,15 +277,12 @@ impl MemTable {
         }
     }
 
-    #[tracing::instrument(
-    name = "mem_freeze",
-    skip(self),
-    fields(approximate_size = self.approximate_size())
-  )]
     pub fn freeze(self, flush_seq: u64) -> ImmutableMemTable {
         tracing::info!(target: "mem", "mem.freeze");
-        #[cfg(feature = "monitoring")]
-        crate::metrics::memtable_on_freeze(self.approximate_size());
+        if let Some(ref s) = self.stats {
+            s.memtable_size_bytes[0].store(0, Ordering::Relaxed);
+            s.memtable_size_bytes[1].fetch_add(self.approximate_size() as u64, Ordering::Relaxed);
+        }
         ImmutableMemTable {
             table: self,
             flush_seq,
@@ -280,8 +290,9 @@ impl MemTable {
     }
 
     fn sync_active_metric(&self) {
-        #[cfg(feature = "monitoring")]
-        crate::metrics::memtable_set_active(self.approximate_size());
+        if let Some(ref s) = self.stats {
+            s.memtable_size_bytes[0].store(self.approximate_size() as u64, Ordering::Relaxed);
+        }
     }
 
     pub fn iter(&self) -> MemTableIterator<'_> {

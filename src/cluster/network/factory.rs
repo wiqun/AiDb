@@ -2,6 +2,7 @@ use super::{
     Arc, DashMap, Duration, HashMap, NetworkError, NodeId, RaftNetworkClient, RaftNetworkFactory,
     RaftServiceClient, RwLock, TypeConfig, Unreachable,
 };
+use crate::statistics::Statistics;
 
 #[derive(Clone)]
 pub struct RaftNetworkClientFactory {
@@ -13,10 +14,21 @@ pub struct RaftNetworkClientFactory {
     /// gRPC channel 连接池 — 按 node_id 缓存, 避免每次 RPC 都重新 TCP + HTTP/2 握手.
     /// Docker 容器 DNS 解析 (aikv-N) 每次 50-100ms, 复用 channel 可消除此开销.
     channels: Arc<DashMap<NodeId, RaftServiceClient<tonic::transport::Channel>>>,
+    stats: Option<Arc<Statistics>>,
 }
 
 impl RaftNetworkClientFactory {
     pub fn new(node_id: NodeId, group_id: u64, rpc_timeout_ms: u64, max_message_size: u64) -> Self {
+        Self::new_with_stats(node_id, group_id, rpc_timeout_ms, max_message_size, None)
+    }
+
+    pub fn new_with_stats(
+        node_id: NodeId,
+        group_id: u64,
+        rpc_timeout_ms: u64,
+        max_message_size: u64,
+        stats: Option<Arc<Statistics>>,
+    ) -> Self {
         Self {
             node_id,
             group_id,
@@ -24,7 +36,17 @@ impl RaftNetworkClientFactory {
             max_message_size,
             nodes: Arc::new(RwLock::new(HashMap::new())),
             channels: Arc::new(DashMap::new()),
+            stats,
         }
+    }
+
+    pub fn with_stats(mut self, stats: Arc<Statistics>) -> Self {
+        self.stats = Some(stats);
+        self
+    }
+
+    pub fn statistics(&self) -> Option<Arc<Statistics>> {
+        self.stats.clone()
     }
 
     pub fn with_group_id(&self, group_id: u64) -> Self {
@@ -35,6 +57,7 @@ impl RaftNetworkClientFactory {
             max_message_size: self.max_message_size,
             nodes: Arc::clone(&self.nodes),
             channels: Arc::clone(&self.channels),
+            stats: self.stats.clone(),
         }
     }
 
@@ -156,6 +179,7 @@ impl RaftNetworkFactory<TypeConfig> for RaftNetworkClientFactory {
             self.max_message_size,
             channel,
             Some(self.channels.clone()),
+            self.stats.clone(),
         )
     }
 }

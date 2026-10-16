@@ -1,6 +1,7 @@
 //! Block 落盘: compression type + CRC32 trailer.
 
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -9,6 +10,7 @@ use crc32fast::Hasher as Crc32Hasher;
 use crate::config::CompressionType;
 use crate::engine::cache::{BlockCache, CacheKey};
 use crate::error::{Error, Result};
+use crate::statistics::Statistics;
 
 use super::handle::BlockHandle;
 use super::BLOCK_TRAILER_SIZE;
@@ -52,11 +54,17 @@ pub fn read_block_cached(
     file_number: u64,
     handle: &BlockHandle,
     block_cache: Option<&Arc<BlockCache>>,
+    stats: Option<&Arc<Statistics>>,
 ) -> Result<Bytes> {
     let key = CacheKey {
         file_number,
         offset: handle.offset,
     };
+    // 触碰计数: hit 与 miss 双路径均计 1, 与 block_read_bytes (仅 miss 落盘字节) 互补,
+    // 前者为经典读放大 RA 分子, 后者为读穿透字节比分子
+    if let Some(s) = stats {
+        s.block_seek_count.fetch_add(1, Ordering::Relaxed);
+    }
     if let Some(cache) = block_cache {
         if let Some(bytes) = cache.get(key.clone()) {
             return Ok(bytes);
@@ -64,6 +72,9 @@ pub fn read_block_cached(
     }
 
     let data = read_block_from_file_traced(file, handle)?;
+    if let Some(s) = stats {
+        s.block_read_bytes.fetch_add(handle.size, Ordering::Relaxed);
+    }
     let bytes = Bytes::from(data);
     if let Some(cache) = block_cache {
         cache.insert(key, bytes.clone());
@@ -79,7 +90,6 @@ pub fn read_block_from_file(file: &std::fs::File, handle: &BlockHandle) -> Resul
     parse_block_bytes(&raw, handle)
 }
 
-#[tracing::instrument(level = "debug", name = "sst_block_read", skip(file, handle), fields(block_size = handle.size))]
 fn read_block_from_file_traced(file: &std::fs::File, handle: &BlockHandle) -> Result<Vec<u8>> {
     read_block_from_file(file, handle)
 }

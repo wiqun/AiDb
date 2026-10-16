@@ -39,7 +39,6 @@ use openraft::{
     LogId, RaftLogReader, Snapshot, SnapshotMeta, StoredMembership, Vote,
 };
 use parking_lot::RwLock;
-use tracing::instrument;
 
 pub use keys::DEFAULT_GROUP_ID;
 
@@ -169,7 +168,6 @@ impl RaftLogStorage<TypeConfig> for OpenRaftStorage {
         self.clone()
     }
 
-    #[instrument(name = "raft_save_vote", skip(self), fields(term = vote.leader_id.term))]
     async fn save_vote(&mut self, vote: &VOf) -> std::result::Result<(), std::io::Error> {
         if let Some(ref committer) = self.committer {
             // 先更新内存状态, 再异步写 DB.
@@ -371,7 +369,6 @@ impl RaftStateMachine<TypeConfig> for OpenRaftStorage {
         snapshot::OpenRaftSnapshotBuilder::new(self.db.clone(), self.group_id)
     }
 
-    #[instrument(name = "raft_install_snapshot", skip(self, snapshot))]
     async fn install_snapshot(
         &mut self,
         meta: &SMOf,
@@ -433,7 +430,6 @@ impl RaftStateMachine<TypeConfig> for OpenRaftStorage {
     }
 
     #[allow(clippy::type_complexity)]
-    #[instrument(name = "raft_snapshot", skip(self))]
     async fn get_current_snapshot(
         &mut self,
     ) -> std::result::Result<

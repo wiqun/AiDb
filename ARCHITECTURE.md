@@ -285,7 +285,7 @@ flowchart TD
 - **默认策略**: 启用 feature 时 `Options::default()` 默认采用 Snap 压缩.
 
 ### 5.3 链路追踪与指标观测 (`monitoring`)
-- **Tracing 跟踪**: 热路径 (`put/get/write/WAL/MemTable/SSTable/Raft apply`) 的 `#[tracing::instrument]` 统一设为 `level = "debug"`, 生产在 `RUST_LOG=info` 下零性能开销.
+- **Tracing 跟踪**: 只允许 `db_flush`, `cmp_run`, `raft_propose`. 采样关闭时不创建这些 span.
 - **OpenTelemetry 指标**: 内部指标统一采用 `aidb_*` 前缀. AiDb 不自建 HTTP 服务, 由宿主应用设置全局 `MeterProvider` 并调用 `aidb::metrics::init()` 后经 OTLP 统一管道导出.
 
 ---

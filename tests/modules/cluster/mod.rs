@@ -13,5 +13,6 @@ mod partition;
 mod promote;
 mod remote_read;
 mod slot_migration;
+mod statistics_test;
 mod storage;
 mod types;

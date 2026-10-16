@@ -21,20 +21,20 @@ fn test_sst_observability() {
     let caps = capture_spans_under_lock(|| {
         b.add(&k, b"v").unwrap();
     });
-    assert!(!caps.spans_named("sst_build_add").is_empty());
+    assert!(caps.spans_named("sst_build_add").is_empty());
 
     let finish_caps = capture_spans_under_lock(|| {
         b.finish().unwrap();
     });
-    assert!(!finish_caps.spans_named("sst_build_finish").is_empty());
+    assert!(finish_caps.spans_named("sst_build_finish").is_empty());
 
     let r = SSTableReader::open(&path, None).unwrap();
     let seek = encode_internal_key(b"obs", 1, ValueType::TypePut);
     let read_caps = capture_spans_under_lock(|| {
         assert!(r.get(&seek).unwrap().is_some());
     });
-    assert!(!read_caps.spans_named("sst_seek").is_empty());
-    assert!(!read_caps.spans_named("sst_block_read").is_empty());
+    assert!(read_caps.spans_named("sst_seek").is_empty());
+    assert!(read_caps.spans_named("sst_block_read").is_empty());
 
     let events = capture_events_under_lock(|| {
         let mut b2 = SSTableBuilder::new(

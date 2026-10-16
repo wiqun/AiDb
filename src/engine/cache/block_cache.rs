@@ -23,9 +23,12 @@
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use parking_lot::Mutex;
+
+use crate::statistics::Statistics;
 
 const NUM_SHARDS: usize = 16;
 const SHARD_MASK: usize = NUM_SHARDS - 1;
@@ -172,10 +175,15 @@ pub struct BlockCache {
     misses: AtomicU64,
     insertions: AtomicU64,
     evictions: AtomicU64,
+    stats: Option<Arc<Statistics>>,
 }
 
 impl BlockCache {
     pub fn new(capacity: usize) -> Self {
+        Self::new_with_stats(capacity, None)
+    }
+
+    pub fn new_with_stats(capacity: usize, stats: Option<Arc<Statistics>>) -> Self {
         let capacity_per_shard = if capacity == 0 {
             0
         } else {
@@ -197,25 +205,22 @@ impl BlockCache {
             misses: AtomicU64::new(0),
             insertions: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
+            stats,
         };
-        #[cfg(feature = "monitoring")]
-        crate::metrics::set_block_cache_capacity(cache.capacity() as u64);
+        if let Some(ref s) = cache.stats {
+            s.block_cache_capacity
+                .store(cache.capacity() as u64, Ordering::Relaxed);
+        }
         cache
     }
 
-    #[tracing::instrument(
-    level = "debug",
-    name = "cache_get",
-    skip(self),
-    fields(file_number = key.file_number, offset = key.offset, hit)
-  )]
     pub fn get(&self, key: CacheKey) -> Option<Bytes> {
         self.lookups.fetch_add(1, Ordering::Relaxed);
         if self.capacity_per_shard == 0 {
             self.misses.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "monitoring")]
-            crate::metrics::record_block_cache_miss();
-            tracing::Span::current().record("hit", false);
+            if let Some(ref s) = self.stats {
+                s.block_cache_misses.fetch_add(1, Ordering::Relaxed);
+            }
             tracing::debug!(target: "cache", "cache.miss");
             return None;
         }
@@ -245,28 +250,22 @@ impl BlockCache {
 
             drop(guard);
             self.hits.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "monitoring")]
-            crate::metrics::record_block_cache_hit();
-            tracing::Span::current().record("hit", true);
+            if let Some(ref s) = self.stats {
+                s.block_cache_hits.fetch_add(1, Ordering::Relaxed);
+            }
             tracing::debug!(target: "cache", "cache.hit");
             Some(result)
         } else {
             drop(guard);
             self.misses.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "monitoring")]
-            crate::metrics::record_block_cache_miss();
-            tracing::Span::current().record("hit", false);
+            if let Some(ref s) = self.stats {
+                s.block_cache_misses.fetch_add(1, Ordering::Relaxed);
+            }
             tracing::debug!(target: "cache", "cache.miss");
             None
         }
     }
 
-    #[tracing::instrument(
-    level = "debug",
-    name = "cache_insert",
-    skip(self, value),
-    fields(file_number = key.file_number, offset = key.offset, bytes = value.len())
-  )]
     pub fn insert(&self, key: CacheKey, value: Bytes) {
         if self.capacity_per_shard == 0 {
             return;
@@ -325,8 +324,9 @@ impl BlockCache {
         self.insertions.fetch_add(1, Ordering::Relaxed);
         tracing::debug!(target: "cache", "cache.insert");
         drop(guard);
-        #[cfg(feature = "monitoring")]
-        crate::metrics::set_block_cache_size(self.size());
+        if let Some(ref s) = self.stats {
+            s.block_cache_size.store(self.size(), Ordering::Relaxed);
+        }
     }
 
     pub fn clear(&self) {
@@ -338,8 +338,9 @@ impl BlockCache {
             // 不清空 pin_counts: 旧 PinGuard drop 后自然归零.
             // 调用方应在 clear() 前确保无活跃 PinGuard.
         }
-        #[cfg(feature = "monitoring")]
-        crate::metrics::set_block_cache_size(0);
+        if let Some(ref s) = self.stats {
+            s.block_cache_size.store(0, Ordering::Relaxed);
+        }
     }
 
     /// 为已缓存的 entry 加 pin. 返回 PinGuard 表示 entry 被锁定,

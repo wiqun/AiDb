@@ -1,25 +1,30 @@
 //! RecoveryManager: 从备份恢复数据目录.
 
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
-
-use tracing::instrument;
 
 use crate::backup::manager::{BackupId, BackupManifest};
 use crate::backup::storage::BackupStorage;
 use crate::backup::util;
 use crate::config::Options;
 use crate::error::{Error, Result};
+use crate::statistics::{BackupOp, Statistics};
 use crate::DB;
 
 /// 恢复管理器.
 pub struct RecoveryManager {
     storage: Arc<dyn BackupStorage>,
+    stats: Option<Arc<Statistics>>,
 }
 
 impl RecoveryManager {
     pub fn new(storage: Arc<dyn BackupStorage>) -> Self {
-        Self { storage }
+        Self::new_with_stats(storage, None)
+    }
+
+    pub fn new_with_stats(storage: Arc<dyn BackupStorage>, stats: Option<Arc<Statistics>>) -> Self {
+        Self { storage, stats }
     }
 
     /// 从备份恢复数据目录.
@@ -29,7 +34,6 @@ impl RecoveryManager {
     /// 3. 逐文件恢复到临时目录, 验证 SHA256
     /// 4. 用 DB::open 验证 SSTable 完整性
     /// 5. 原子 rename 临时目录 → 目标目录
-    #[instrument(name = "backup_restore", skip(self), fields(backup_id = id))]
     pub fn restore(&self, id: BackupId, db_path: &Path) -> Result<()> {
         if db_path.exists() {
             let has_files = db_path
@@ -132,15 +136,15 @@ impl RecoveryManager {
             }
         }
 
-        #[cfg(feature = "monitoring")]
-        crate::metrics::record_backup_restore();
+        if let Some(ref stats) = self.stats {
+            stats.backup_total[BackupOp::Restore as usize].fetch_add(1, Ordering::Relaxed);
+        }
         tracing::info!(backup_id = id, "backup.restore.complete");
 
         Ok(())
     }
 
     /// 校验备份完整性 (不恢复).
-    #[instrument(name = "backup_verify", skip(self), fields(backup_id = id))]
     pub fn verify_backup(&self, id: BackupId) -> Result<bool> {
         let manifest_path = self.storage.backup_path(id).join("backup_manifest.json");
         if !manifest_path.exists() {

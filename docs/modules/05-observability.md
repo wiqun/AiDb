@@ -23,7 +23,7 @@ description: AiDb 可观测性 — OTel 指标 (monitoring feature)、tracing sp
 | `src/lib.rs` | `#[cfg(feature = "monitoring")] pub mod metrics` 声明 | — |
 | `tests/common/observability.rs` | `EventCatcher`、tracing 捕获与测试锁 | 跨模块 tracing 验收 |
 | `tests/metrics.rs` | cache / bloom / DB histogram 指标导出测试 (InMemory exporter) | `--test metrics` |
-| `tests/span_contract.rs` | 热路径 span `level = "debug"` 静态源码扫描契约测试 | `--test span_contract` |
+| `tests/span_contract.rs` | 只允许 `db_flush`, `cmp_run`, `raft_propose` 的源码扫描 | `--test span_contract` |
 
 **嵌入集成机制**: 下游应用 (AiKv) 设置全局 `MeterProvider` 后调用 `aidb::metrics::init()`; 与上层业务指标共用 OTLP 导出管道, 由 Collector 转发至 Prometheus / Grafana.
 
@@ -62,32 +62,36 @@ flowchart LR
 | 指标全名 | 类型 | 标签 (Labels) | 触发与采集时机 |
 | --- | --- | --- | --- |
 | `aidb_wal_size_bytes` | Gauge | — | WAL 追加与轮转清理时刷新 |
-| `aidb_memtable_size_bytes` | Gauge | `aidb.memtable.state=active\|frozen` | MemTable 写入与冻结时统计 |
-| `aidb_sstable_count` | Gauge | `aidb.sstable.level` | flush 与 compaction 产生/删除 SST 时更新 |
-| `aidb_sstable_size_bytes` | Gauge | `aidb.sstable.level` | 同上 |
-| `aidb_operations_total` | Counter | `aidb.operation.name` | `put`, `get`, `delete`, `write_batch`, `write_batch_no_wal`, `snapshot`, `stall_stop`, `stall_slowdown` |
-| `aidb_operation_duration_seconds` | Histogram | `aidb.operation.name` | 核心同步操作耗时分布 |
+| `aidb_memtable_active_bytes` | Gauge | — | 活跃 MemTable |
+| `aidb_memtable_frozen_bytes` | Gauge | — | 已冻结 MemTable |
+| `aidb_memtable_limit_bytes` | Gauge | — | 启动时的 MemTable 上限 |
+| `aidb_l0_files` | Gauge | — | L0 文件数 |
+| `aidb_sstable_count` | Gauge | `level` | flush 与 compaction 产生/删除 SST 时更新 |
+| `aidb_sstable_size_bytes` | Gauge | `level` | 同上. 未启用 Raft 时没有 `group` |
+| `aidb_operations_total` | Counter | `aidb.operation.name` | `put`, `get`, `delete`, `write_batch`, `write_batch_no_wal`, `snapshot`. 不含 stall |
+| `aidb_engine_write_duration_seconds` | Histogram | — | 每个用户写批次一次真实耗时, 不重放桶中点 |
 | `db.client.operations` | Counter | `db.system`, `db.operation.name` | OpenTelemetry 标准语义双写 |
-| `db.client.operation.duration` | Histogram | `db.system`, `db.operation.name` | OpenTelemetry 标准语义双写 |
-| `aidb_flush_total` | Counter | — | MemTable flush 完成时累加 |
-| `aidb_flush_duration_seconds` | Histogram | — | MemTable flush 执行耗时 |
+| `aidb_flush_last_duration_seconds` | Gauge | — | 最近一次 flush 耗时 |
+| `aidb_flush_total` | Counter | — | flush 完成时内部累加. `INFO storage` 可读. 生产导出快照不包含这条, 只有测试调用 `sync_to_otel` 才登记到旧 meter |
+| `aidb_compaction_last_duration_seconds` | Gauge | — | 最近一次 compaction 耗时 |
 | `aidb_block_cache_size_bytes` | Gauge | — | 16 分片 LRU 当前缓存占用 |
 | `aidb_block_cache_capacity_bytes` | Gauge | — | BlockCache 总容量上限 |
 | `aidb_block_cache_hits_total` | Counter | — | BlockCache 读取命中 |
 | `aidb_block_cache_misses_total` | Counter | — | BlockCache 读取未命中 |
 | `aidb_bloom_false_positive_total` | Counter | — | Bloom Filter 假阳性穿透判定 |
 | `aidb_sequence` | Gauge | — | 最新已分配的全局 Sequence 编号 |
-| `aidb_total_key_count` | Gauge | — | 逻辑 Key 总数 (`key_exists` + overlay 同源计数, AtomicUsize; 不持久化) |
-| `aidb_compaction_total` | Counter | `aidb.compaction.phase=pick\|run\|apply` | Compaction 各阶段累加 |
-| `aidb_compaction_duration_seconds` | Histogram | `aidb.compaction.phase=pick\|run\|apply` | Compaction 各阶段耗时分布 |
-| `aidb_backup_total` | Counter | `aidb.backup.operation=create\|delete\|restore` | 备份与恢复操作统计 |
-| `aidb_backup_size_bytes` | Gauge | — | 最近一次备份总大小 |
-| `aidb_backup_duration_seconds` | Histogram | — | 备份打包耗时分布 |
+| `aidb_compaction_total` | Counter | `aidb.compaction.phase=pick\|run\|apply` | 各阶段内部累加. 生产导出快照不包含这条, 只有测试调用 `sync_to_otel` 才登记到旧 meter |
+| `aidb_write_stall_total` | Counter | `cause`, `kind` | 六种写停顿次数 |
+| `aidb_write_stall_window_max_us` | Gauge | — | 本导出周期最大停顿微秒, 读出后清零 |
 
 ### 集群指标 (`src/cluster/metrics.rs`, 需 `monitoring` + `cluster`)
 
 | 指标全名 | 类型 | 标签 (Labels) | 触发与采集时机 |
 | --- | --- | --- | --- |
+| `aidb_raft_apply_lag_entries` | Gauge | `group` | 导出时 `commit - applied`, 不在请求路径计算 |
+| `aidb_raft_replication_lag_entries` | Gauge | `group` | leader 上 `last_log - max matched`, 其他角色是 0 |
+| `aidb_raft_leader_contact_age_seconds` | Gauge | `group` | 导出值固定为 0. follower 距上次心跳的秒数尚未接入 |
+| `aidb_raft_role` | Gauge | `group`, `role` | 只输出当前角色, 值是 1 |
 | `aidb_raft_rpc_total` | Counter | `aidb.raft.rpc.type=vote\|append_entries\|install_snapshot`<br>`aidb.raft.rpc.direction=incoming\|outgoing` | Raft RPC 消息收发计数 |
 | `aidb_raft_log_entries_total` | Counter | — | AppendEntries 入站 entry 数量累加 |
 | `aidb_raft_group_fatal_total` | Counter | `aidb.raft.group.id` | Group 进入 OpenRaft Fatal 状态时记录 |
@@ -95,24 +99,18 @@ flowchart LR
 
 ## Tracing Span 索引
 
-| 模块域 | Instrument Span 名 | 主要 Event (`target`) |
+| 模块域 | Span 名 | 主要 Event (`target`) |
 | --- | --- | --- |
-| **WAL** | `wal_open`, `wal_write`, `wal_replay` | `wal`: `wal.write.*`, `wal.sync.*` |
-| **MemTable** | `mem_put`, `mem_get`, `mem_freeze` | `mem`: `mem.put`, `mem.get.hit/miss` |
-| **SSTable** | `sst_seek`, `sst_block_read`, `sst_build_add` | `sst`: `sst.seek.result`; `bloom_build` |
-| **Cache** | `cache_get`, `cache_insert` | — |
-| **DB 核心** | `db_open`, `db_put`, `db_get`, `db_scan`, `db_flush`, `db_close` | `db`: `db.put`, `db.get.result`, `db.flush.complete` |
-| **Compaction** | `cmp_pick`, `cmp_run`, `cmp_merge`, `cmp_apply` | — |
-| **Checkpoint** | `bgsave_checkpoint` | `db`: `checkpoint.create.complete` |
-| **Backup** | `backup_create`, `backup_restore`, `backup_list`, `backup_delete` | — |
-| **Raft 存储** | `raft_save_vote`, `raft_recv_snapshot`, `raft_install_snapshot` | `raft_append_log` (`target: "perf"`) |
-| **Raft RPC** | `raft_rpc_ae`, `raft_rpc_vote`, `raft_rpc_full_snapshot` | — |
-| **Meta 控制面**| `meta_propose`, `meta_apply`, `meta_slot_query` | — |
+| **DB 核心** | `db_flush` | `db`: `db.flush.complete` |
+| **Compaction** | `cmp_run` | `cmp`: `compaction start`, `compaction end` |
+| **Raft propose** | `raft_propose` | `forward retry` |
 
-### 热路径 Span 级别硬约束
+只允许这三个 span. 采样率为 0 或未配置 OTLP 端点时不创建它们. block 解码, WAL 记录, get, put, backup 和 Raft RPC 没有 span.
 
-- **约束原则**: 生产环境默认 `RUST_LOG=info`. 为防止高频热路径 (put/get/scan/wal/block/raft RPC 等) 产生海量无用 Span 拖慢性能, 热路径 `#[tracing::instrument]` **必须显式声明 `level = "debug"`**.
-- **契约测试保障**: 通过 `tests/span_contract.rs` 源码静态 AST 扫描强制执行该约束, 违反规则将直接导致 CI 报错:
+### Span 允许名单
+
+- **约束原则**: 除 `db_flush`, `cmp_run`, `raft_propose` 外不得创建 span.
+- **契约测试保障**: `tests/span_contract.rs` 扫描源码, 出现 `#[instrument]` 或其他 span 名字时失败:
 
 ```bash
 cargo test --test span_contract -- --test-threads=1
@@ -160,7 +158,7 @@ cargo test --test span_contract -- --test-threads=1
 | 测试集 | 覆盖 |
 | --- | --- |
 | `tests/metrics.rs` | BlockCache 命中/未命中 Counter、Bloom 假阳性 Counter、DB 操作与 Flush 耗时 Histogram |
-| `tests/span_contract.rs` | 源码扫描契约: 强制校验所有热路径 Span 必须为 Debug 级别 |
+| `tests/span_contract.rs` | 源码扫描契约: 只允许 `db_flush`, `cmp_run`, `raft_propose` |
 
 ## 已知限制
 
