@@ -466,17 +466,11 @@ fn last_local_user_pair_sync_missing_group() {
     let err = node
         .last_local_user_pair_sync(1, b"", b"")
         .expect_err("missing group");
-    assert!(
-        err.to_string().contains("not found locally"),
-        "{err}"
-    );
+    assert!(err.to_string().contains("not found locally"), "{err}");
     let err = node
         .scan_local_pairs_in_range_sync(1, b"", None)
         .expect_err("missing group");
-    assert!(
-        err.to_string().contains("not found locally"),
-        "{err}"
-    );
+    assert!(err.to_string().contains("not found locally"), "{err}");
 }
 
 #[test]

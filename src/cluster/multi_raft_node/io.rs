@@ -241,7 +241,7 @@ impl MultiRaftNode {
         match node {
             Some(node) => {
                 let storage = node.storage();
-                storage.get_state_machine_value(key).map_err(Into::into)
+                storage.get_state_machine_value(key)
             }
             None => Err(ClusterError::Raft(format!("group {group_id} not found locally")).into()),
         }
