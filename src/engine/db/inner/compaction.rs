@@ -216,6 +216,7 @@ impl DB {
                 self.l0_sstable_count
                     .fetch_add(l0_output_count, AtomicOrdering::Relaxed);
             }
+            self.update_write_stall_state();
             self.stats.compaction_phases[CompactionPhase::Apply as usize]
                 .fetch_add(1, AtomicOrdering::Relaxed);
             self.stats.compaction_durations[CompactionPhase::Apply as usize]
@@ -339,6 +340,7 @@ impl DB {
             if task.output_level == 0 {
                 self.l0_sstable_count.fetch_add(1, AtomicOrdering::Relaxed);
             }
+            self.update_write_stall_state();
         }
 
         let pending = self.pending_compaction_bytes();

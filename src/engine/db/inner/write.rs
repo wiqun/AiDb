@@ -38,11 +38,29 @@ impl DB {
             .fetch_max(elapsed_us, AtomicOrdering::Relaxed);
     }
 
+    #[inline(always)]
     fn check_write_stall(&self) {
         if !self.options.background_compaction {
             return;
         }
+        if !self.is_write_stall_active() {
+            return;
+        }
+        self.check_write_stall_slow();
+    }
 
+    pub(crate) fn update_write_stall_state(&self) {
+        if !self.options.background_compaction {
+            return;
+        }
+        let l0 = self.l0_sstable_count.load(AtomicOrdering::Relaxed);
+        let imm_count = self.immutable_memtables.read().len();
+        let should_stall = l0 >= self.options.level0_slowdown_writes_trigger
+            || imm_count >= self.options.max_write_buffer_number.saturating_sub(1);
+        self.set_write_stall_active(should_stall);
+    }
+
+    fn check_write_stall_slow(&self) {
         // === MemTable 总内存 stall (F-020) — 优先于 L0 检查 ===
         // MemTable 内存问题 (OOM 风险) > L0 文件数问题 (读放大).
         let mt_mem = self
@@ -188,6 +206,7 @@ impl DB {
                 break; // 一次只 stall 最严重的一层
             }
         }
+        self.update_write_stall_state();
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -293,17 +312,42 @@ impl DB {
 
         if self.options.use_wal {
             let mut wal = self.wal.write();
-            let batch_start = WalEntry {
-                sequence: 0,
-                op_type: OpType::BatchStart,
-                has_value: true,
-                key: vec![],
-                value: Some((n as u32).to_le_bytes().to_vec()),
-            };
             let mut encoded: Vec<Vec<u8>> = Vec::with_capacity(1 + batch.operations.len());
-            encoded.push(batch_start.encode());
+            let mut start_buf = Vec::new();
+            WalEntry::encode_to_buf(
+                0,
+                OpType::BatchStart,
+                true,
+                &[],
+                Some(&(n as u32).to_le_bytes()),
+                &mut start_buf,
+            );
+            encoded.push(start_buf);
             for (i, op) in batch.operations.iter().enumerate() {
-                encoded.push(wal_entry_for_op(op, base + i as u64)?.encode());
+                let mut op_buf = Vec::new();
+                match op {
+                    WriteOp::Put { key, value } => {
+                        WalEntry::encode_to_buf(
+                            base + i as u64,
+                            OpType::TypePut,
+                            true,
+                            key,
+                            Some(value),
+                            &mut op_buf,
+                        );
+                    }
+                    WriteOp::Delete { key } => {
+                        WalEntry::encode_to_buf(
+                            base + i as u64,
+                            OpType::TypeDelete,
+                            false,
+                            key,
+                            None,
+                            &mut op_buf,
+                        );
+                    }
+                }
+                encoded.push(op_buf);
             }
             wal.append_encoded_write_batch(&encoded, base)?;
         }
@@ -444,16 +488,8 @@ impl DB {
         if !self.options.use_wal {
             return Ok(());
         }
-        let entry = WalEntry {
-            sequence: seq,
-            op_type: OpType::TypePut,
-            has_value: true,
-            key: key.to_vec(),
-            value: Some(value.to_vec()),
-        };
         let mut wal = self.wal.write();
-        wal.append(&entry.encode())?;
-        wal.note_appended_sequence(seq);
+        wal.append_entry(seq, OpType::TypePut, true, key, Some(value))?;
         if self.options.sync_wal && sync_now {
             wal.sync()?;
         }
@@ -464,16 +500,8 @@ impl DB {
         if !self.options.use_wal {
             return Ok(());
         }
-        let entry = WalEntry {
-            sequence: seq,
-            op_type: OpType::TypeDelete,
-            has_value: false,
-            key: key.to_vec(),
-            value: None,
-        };
         let mut wal = self.wal.write();
-        wal.append(&entry.encode())?;
-        wal.note_appended_sequence(seq);
+        wal.append_entry(seq, OpType::TypeDelete, false, key, None)?;
         if self.options.sync_wal && sync_now {
             wal.sync()?;
         }
@@ -490,16 +518,8 @@ impl DB {
         if !self.options.use_wal {
             return Ok(());
         }
-        let entry = WalEntry {
-            sequence: seq,
-            op_type: OpType::TypeDeleteRange,
-            has_value: true,
-            key: start.to_vec(),
-            value: Some(end.to_vec()),
-        };
         let mut wal = self.wal.write();
-        wal.append(&entry.encode())?;
-        wal.note_appended_sequence(seq);
+        wal.append_entry(seq, OpType::TypeDeleteRange, true, start, Some(end))?;
         if self.options.sync_wal && sync_now {
             wal.sync()?;
         }
@@ -556,6 +576,7 @@ impl DB {
         let old = std::mem::take(&mut *mem);
         let frozen = old.freeze(flush_seq);
         self.immutable_memtables.write().push(frozen);
+        self.update_write_stall_state();
         Ok(())
     }
 
@@ -590,25 +611,6 @@ impl DB {
         );
         self.immutable_memtables.write().push(old.freeze(flush_seq));
         Ok(())
-    }
-}
-
-fn wal_entry_for_op(op: &WriteOp, seq: u64) -> Result<WalEntry> {
-    match op {
-        WriteOp::Put { key, value } => Ok(WalEntry {
-            sequence: seq,
-            op_type: OpType::TypePut,
-            has_value: true,
-            key: key.clone(),
-            value: Some(value.clone()),
-        }),
-        WriteOp::Delete { key } => Ok(WalEntry {
-            sequence: seq,
-            op_type: OpType::TypeDelete,
-            has_value: false,
-            key: key.clone(),
-            value: None,
-        }),
     }
 }
 
@@ -707,5 +709,20 @@ mod sequence_tests {
                 self.fields.push_str(&format!("{}={value} ", field.name()));
             }
         }
+    }
+
+    #[test]
+    fn test_write_stall_fast_path_active_flag() {
+        let temp = tempfile::tempdir().unwrap();
+        let opts = crate::config::Options::default();
+        let db = DB::open(temp.path(), opts).unwrap();
+
+        // 默认状态下无 stall, 标志应为 false, 写入直接短路
+        assert!(!db.is_write_stall_active());
+
+        // 写入普通数据
+        db.put(b"k1", b"v1").unwrap();
+        assert_eq!(db.get(b"k1").unwrap().unwrap(), b"v1");
+        assert!(!db.is_write_stall_active());
     }
 }

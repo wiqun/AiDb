@@ -82,6 +82,7 @@ pub struct WALManager {
     lock_file: std::fs::File,
     options: Arc<Options>,
     stats: Option<Arc<Statistics>>,
+    encode_buf: Vec<u8>,
 }
 
 impl WALManager {
@@ -140,6 +141,7 @@ impl WALManager {
             lock_file,
             options,
             stats,
+            encode_buf: Vec::with_capacity(1024),
         })
     }
 
@@ -194,6 +196,25 @@ impl WALManager {
     pub fn append(&mut self, data: &[u8]) -> Result<()> {
         self.append_record(data)?;
         self.maybe_auto_rotate()?;
+        Ok(())
+    }
+
+    /// 追加一条未预先序列化的 WalEntry 到当前活跃 WAL, 复用内部缓冲区避免堆分配.
+    pub fn append_entry(
+        &mut self,
+        seq: u64,
+        op_type: OpType,
+        has_value: bool,
+        key: &[u8],
+        value: Option<&[u8]>,
+    ) -> Result<()> {
+        let mut buf = std::mem::take(&mut self.encode_buf);
+        buf.clear();
+        WalEntry::encode_to_buf(seq, op_type, has_value, key, value, &mut buf);
+        let res = self.append(&buf);
+        self.encode_buf = buf;
+        res?;
+        self.note_appended_sequence(seq);
         Ok(())
     }
 

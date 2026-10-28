@@ -130,6 +130,37 @@ impl WalEntry {
         buf
     }
 
+    /// 零堆分配序列化 WalEntry 到指定的输出缓冲区中 (借用切片, 无所有权转移)
+    pub fn encode_to_buf(
+        sequence: u64,
+        op_type: OpType,
+        has_value: bool,
+        key: &[u8],
+        value: Option<&[u8]>,
+        buf: &mut Vec<u8>,
+    ) {
+        let key_len = key.len() as u16;
+        let value_len = value.map(|v| v.len() as u32).unwrap_or(0);
+
+        let needed = 8 + 1 + 1 + 2 + key.len() + if has_value { 4 + value_len as usize } else { 0 };
+        buf.reserve(needed);
+
+        buf.extend_from_slice(&sequence.to_be_bytes()); // 8B BE
+        buf.push(op_type as u8); // 1B
+        buf.push(has_value as u8); // 1B
+        buf.extend_from_slice(&key_len.to_le_bytes()); // 2B LE
+        buf.extend_from_slice(key); // key
+
+        if has_value {
+            if let Some(val) = value {
+                buf.extend_from_slice(&value_len.to_le_bytes()); // 4B LE
+                buf.extend_from_slice(val);
+            } else {
+                buf.extend_from_slice(&0u32.to_le_bytes());
+            }
+        }
+    }
+
     /// 从字节序列解码 WalEntry
     pub fn decode(data: &[u8]) -> Result<Self> {
         if data.len() < 12 {
@@ -440,5 +471,47 @@ mod tests {
         let val = decoded.value.unwrap();
         assert_eq!(val.len(), 100000);
         assert_eq!(val, large_val);
+    }
+
+    #[test]
+    fn test_encode_to_buf_matches_encode() {
+        let entry = WalEntry {
+            sequence: 12345678,
+            op_type: OpType::TypePut,
+            has_value: true,
+            key: b"test_key".to_vec(),
+            value: Some(b"test_value".to_vec()),
+        };
+        let expected = entry.encode();
+        let mut buf = Vec::new();
+        WalEntry::encode_to_buf(
+            entry.sequence,
+            entry.op_type,
+            entry.has_value,
+            &entry.key,
+            entry.value.as_deref(),
+            &mut buf,
+        );
+        assert_eq!(buf, expected);
+
+        // Delete test
+        let del_entry = WalEntry {
+            sequence: 98765432,
+            op_type: OpType::TypeDelete,
+            has_value: false,
+            key: b"del_key".to_vec(),
+            value: None,
+        };
+        let del_expected = del_entry.encode();
+        buf.clear();
+        WalEntry::encode_to_buf(
+            del_entry.sequence,
+            del_entry.op_type,
+            del_entry.has_value,
+            &del_entry.key,
+            None,
+            &mut buf,
+        );
+        assert_eq!(buf, del_expected);
     }
 }

@@ -123,6 +123,7 @@ impl DB {
             let mut tables = self.sstables.write();
             tables[0].insert(0, Arc::clone(&reader));
             self.l0_sstable_count.fetch_add(1, AtomicOrdering::Relaxed);
+            self.update_write_stall_state();
             let mut vs = self.version_set.write();
             vs.apply_edit(&VersionEdit::AddFile {
                 level: 0,

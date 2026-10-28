@@ -119,6 +119,9 @@ pub struct DB {
     /// L0 SSTable count for lock-free stall checks (F-050/051/054).
     /// Maintained atomically inside all `sstables.write()` critical sections.
     l0_sstable_count: AtomicUsize,
+    /// 全局写停顿状态原子标志: 仅当触发 L0/MemTable/LevelSize stall 时为 true.
+    /// 前台写路径通过 Relaxed 检查实现纳秒级短路, 消除正常写入下的全层读锁遍历开销.
+    write_stall_active: AtomicBool,
     pub(crate) stats: Arc<Statistics>,
 }
 
@@ -126,6 +129,18 @@ impl DB {
     /// 访问当前 DB 实例绑定的无锁原子指标集合
     pub fn statistics(&self) -> Arc<Statistics> {
         Arc::clone(&self.stats)
+    }
+
+    /// 查询当前是否存在写停顿 (Write Stall)
+    #[inline(always)]
+    pub fn is_write_stall_active(&self) -> bool {
+        self.write_stall_active.load(AtomicOrdering::Relaxed)
+    }
+
+    /// 更新写停顿状态原子标志
+    pub(crate) fn set_write_stall_active(&self, active: bool) {
+        self.write_stall_active
+            .store(active, AtomicOrdering::Relaxed);
     }
 
     pub fn open(path: impl AsRef<Path>, options: Options) -> Result<Arc<Self>> {
@@ -306,6 +321,7 @@ impl DB {
             group_commit_lock: Mutex::new(()),
             group_commit_synced_seq: AtomicU64::new(0),
             l0_sstable_count: AtomicUsize::new(l0_sstable_count_init),
+            write_stall_active: AtomicBool::new(false),
             stats: Arc::clone(&stats),
         });
 
