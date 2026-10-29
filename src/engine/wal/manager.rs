@@ -195,6 +195,7 @@ impl WALManager {
     /// 追加一条编码后的 WalEntry 到当前活跃 WAL
     pub fn append(&mut self, data: &[u8]) -> Result<()> {
         self.append_record(data)?;
+        self.writer.flush_buffer()?;
         self.maybe_auto_rotate()?;
         Ok(())
     }
@@ -254,6 +255,7 @@ impl WALManager {
                 self.note_appended_sequence(base_seq + (i - 1) as u64);
             }
         }
+        self.writer.flush_buffer()?;
         Ok(())
     }
 

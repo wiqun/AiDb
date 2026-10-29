@@ -8,7 +8,7 @@ use super::{
     WriteBatch, WriteOp, DB, SEQUENCE_LIMIT,
 };
 use super::write_thread::{
-    WriteGroupStatus, Writer, STATE_COMPLETED, STATE_FAILED, STATE_MEMTABLE, STATE_MEMTABLE_DONE,
+    WriteGroupStatus, Writer, STATE_COMPLETED, STATE_FAILED, STATE_MEMTABLE_DONE,
 };
 use crate::statistics::{DbOp, WriteStallKind};
 
@@ -401,7 +401,8 @@ impl DB {
                 }
 
                 if self.options.use_wal {
-                    let mut encoded: Vec<Vec<u8>> = Vec::new();
+                    let mut encoded: Vec<Vec<u8>> =
+                        Vec::with_capacity(total_ops as usize + group.len());
                     for &w_ptr in group {
                         let w = unsafe { &*w_ptr };
                         if !w.use_wal || unsafe { (*w.batch).is_empty() } {
@@ -467,28 +468,11 @@ impl DB {
                     }
                 }
 
-                // 唤醒 Followers 进行无锁并发 MemTable 写入
-                for (idx, &w_ptr) in group.iter().enumerate() {
-                    if idx > 0 {
-                        let w = unsafe { &mut *w_ptr };
-                        w.state.store(STATE_MEMTABLE, AtomicOrdering::Release);
-                        w.unparker.unpark();
-                    }
-                }
-
-                // Leader 自身写入 MemTable
-                let leader_w = unsafe { &*group[0] };
-                let leader_b = unsafe { &*leader_w.batch };
-                self.insert_batch_to_memtable(leader_b, leader_w.seq)?;
-
-                // Leader 等待所有 Followers 完成 MemTable 写入
-                for (idx, &w_ptr) in group.iter().enumerate() {
-                    if idx > 0 {
-                        let w = unsafe { &*w_ptr };
-                        while w.state.load(AtomicOrdering::Acquire) != STATE_MEMTABLE_DONE {
-                            std::hint::spin_loop();
-                        }
-                    }
+                // Leader 统一将当前 Group 中所有批次顺序写入 MemTable (消除 Followers 线程上下文切换与自旋空转)
+                for &w_ptr in group {
+                    let w = unsafe { &*w_ptr };
+                    let b = unsafe { &*w.batch };
+                    self.insert_batch_to_memtable(b, w.seq)?;
                 }
 
                 // 原子推进 committed_sequence (短暂持有 write_lock 与 snapshot 注册保持互斥)
@@ -512,7 +496,7 @@ impl DB {
                         .store(last_seq, AtomicOrdering::Release);
                 }
 
-                // 唤醒全部 Followers 完成写入
+                // 一次性唤醒全部 Followers 完成写入 (消除二次 park 与二次唤醒开销)
                 for (idx, &w_ptr) in group.iter().enumerate() {
                     if idx > 0 {
                         let w = unsafe { &mut *w_ptr };
@@ -579,7 +563,7 @@ impl DB {
         let flush_seq = self.sequence.load(AtomicOrdering::SeqCst);
         let old = std::mem::take(&mut *mem);
         let frozen = old.freeze(flush_seq);
-        self.immutable_memtables.write().push(frozen);
+        self.immutable_memtables.write().push(Arc::new(frozen));
         self.update_write_stall_state();
         Ok(())
     }
@@ -613,7 +597,7 @@ impl DB {
             &mut *mem,
             MemTable::new_with_stats(Some(Arc::clone(&self.stats))),
         );
-        self.immutable_memtables.write().push(old.freeze(flush_seq));
+        self.immutable_memtables.write().push(Arc::new(old.freeze(flush_seq)));
         Ok(())
     }
 }

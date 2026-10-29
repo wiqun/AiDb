@@ -87,7 +87,7 @@ pub struct DB {
     path: PathBuf,
     options: Arc<Options>,
     memtable: RwLock<MemTable>,
-    immutable_memtables: RwLock<Vec<ImmutableMemTable>>,
+    immutable_memtables: RwLock<Vec<Arc<ImmutableMemTable>>>,
     wal: RwLock<WALManager>,
     sstables: RwLock<Vec<Vec<Arc<SSTableReader>>>>,
     version_set: RwLock<VersionSet>,
@@ -494,9 +494,10 @@ impl DB {
         self.block_cache.reset_stats()
     }
 
-    /// 清空 block cache 条目 (不重置统计).
+    /// 清空 block cache 与 row cache 条目 (不重置统计).
     pub fn clear_cache(&self) {
-        self.block_cache.clear()
+        self.block_cache.clear();
+        self.row_cache.clear();
     }
 
     /// 当前 block cache 占用字节.

@@ -344,7 +344,7 @@ fn push_range_records(
 
 fn collect_range_tombstones(
     memtable: &MemTable,
-    immutables: &[ImmutableMemTable],
+    immutables: &[Arc<ImmutableMemTable>],
     sstables: &[Vec<Arc<SSTableReader>>],
     start: Option<&[u8]>,
     end: Option<&[u8]>,
@@ -374,7 +374,7 @@ fn collect_range_tombstones(
 impl DBIterator {
     pub fn new(
         memtable: &MemTable,
-        immutables: &[ImmutableMemTable],
+        immutables: &[Arc<ImmutableMemTable>],
         sstables: &[Vec<Arc<SSTableReader>>],
         sequence: u64,
         start: Option<&[u8]>,
