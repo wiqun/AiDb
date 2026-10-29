@@ -61,6 +61,8 @@ pub struct Options {
     pub block_restart_interval: usize,
     /// Block cache 容量 (默认 64 MiB)
     pub block_cache_size: usize,
+    /// Row cache 容量 (默认 32 MiB, 0 表示禁用)
+    pub row_cache_size: usize,
     /// 压缩算法 (Snap/Lz4 需要 `compression` feature, 否则读写均报
     /// `InvalidArgument`; 默认 None 不压缩)
     pub compression: CompressionType,
@@ -136,6 +138,7 @@ impl Default for Options {
             block_size: 4 * 1024,
             block_restart_interval: 16,
             block_cache_size: 64 * 1024 * 1024,
+            row_cache_size: 32 * 1024 * 1024,
             // 生产 (启用 compression feature) 默认 Snap 压缩; 无 feature 时默认
             // None, 保证默认构建 (cargo test / 无 feature 部署) 可正常读写 SST.
             // 避免 "默认 Options 声明 Snap 但 feature 未启用" 的不一致 (见 A-001).
@@ -191,6 +194,7 @@ impl Options {
             block_size: 512,
             block_restart_interval: 16,
             block_cache_size: 1024 * 1024,
+            row_cache_size: 1024 * 1024,
             compression: CompressionType::None,
             bloom_false_positive_rate: 0.0,
             use_wal: true,

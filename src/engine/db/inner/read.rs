@@ -18,7 +18,26 @@ impl DB {
         Self::validate_user_key(key)?;
         self.stats.operations[DbOp::Get as usize].fetch_add(1, AtomicOrdering::Relaxed);
         let max_seq = self.sequence.load(AtomicOrdering::SeqCst);
+
+        // 1. 优先查 RowCache (命中时仅需数十纳秒, 绕过全部 LSM 解码)
+        if let Some(val) = self.row_cache.get(key, max_seq) {
+            let bytes = val.len();
+            self.stats.note_logical_read(bytes);
+            self.stats.operation_durations[DbOp::Get as usize]
+                .record(op_start.elapsed().as_micros() as u64);
+            return Ok(Some(val.to_vec()));
+        }
+
+        // 2. 未命中查 LSM
         let r = self.get_at_sequence(key, max_seq)?;
+
+        // 3. 回填 RowCache
+        if let Some(ref v) = r {
+            let committed = self.committed_sequence.load(AtomicOrdering::Acquire);
+            self.row_cache
+                .insert(key, bytes::Bytes::copy_from_slice(v), committed);
+        }
+
         tracing::debug!(target: "db", found = r.is_some(), "db.get.result");
         self.stats.operation_durations[DbOp::Get as usize]
             .record(op_start.elapsed().as_micros() as u64);

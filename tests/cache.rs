@@ -8,3 +8,5 @@ mod block_cache;
 mod common;
 #[path = "modules/cache/dataflow.rs"]
 mod dataflow;
+#[path = "modules/cache/row_cache.rs"]
+mod row_cache;

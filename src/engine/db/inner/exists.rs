@@ -18,6 +18,9 @@ impl DB {
         self.check_not_closed()?;
         Self::validate_user_key(key)?;
         let max_seq = self.sequence.load(AtomicOrdering::SeqCst);
+        if self.row_cache.get(key, max_seq).is_some() {
+            return Ok(true);
+        }
         self.key_exists_internal(key, max_seq, true)
     }
 
@@ -26,6 +29,9 @@ impl DB {
         self.check_not_closed()?;
         Self::validate_user_key(key)?;
         let max_seq = self.sequence.load(AtomicOrdering::SeqCst);
+        if self.row_cache.get(key, max_seq).is_some() {
+            return Ok(true);
+        }
         self.key_exists_internal(key, max_seq, false)
     }
 

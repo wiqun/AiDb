@@ -491,10 +491,13 @@ impl DB {
                     }
                 }
 
-                // 原子推进 committed_sequence
+                // 原子推进 committed_sequence (短暂持有 write_lock 与 snapshot 注册保持互斥)
                 let last_seq = base_seq + total_ops - 1;
-                self.committed_sequence
-                    .fetch_max(last_seq, AtomicOrdering::SeqCst);
+                {
+                    let _guard = self.write_lock.lock();
+                    self.committed_sequence
+                        .fetch_max(last_seq, AtomicOrdering::SeqCst);
+                }
 
                 // 如果任何一个写入者请求 sync WAL, 则执行 sync
                 let need_sync = self.options.sync_wal
@@ -547,9 +550,18 @@ impl DB {
         for (i, op) in batch.operations.iter().enumerate() {
             let seq = base_seq + i as u64;
             match op {
-                WriteOp::Put { key, value } => mt.put(key, value, seq)?,
-                WriteOp::Delete { key } => mt.delete(key, seq)?,
-                WriteOp::DeleteRange { start, end } => mt.put_range_delete(start, end, seq)?,
+                WriteOp::Put { key, value } => {
+                    mt.put(key, value, seq)?;
+                    self.row_cache.invalidate(key);
+                }
+                WriteOp::Delete { key } => {
+                    mt.delete(key, seq)?;
+                    self.row_cache.invalidate(key);
+                }
+                WriteOp::DeleteRange { start, end } => {
+                    mt.put_range_delete(start, end, seq)?;
+                    self.row_cache.clear();
+                }
             }
         }
         Ok(())
