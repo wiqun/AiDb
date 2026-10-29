@@ -221,7 +221,7 @@ impl Default for RaftNodeConfig {
             election_timeout_max: 1000,
             heartbeat_interval: 100,
             max_payload_entries: 512,
-            snapshot_logs_since_last: 1000,
+            snapshot_logs_since_last: 50_000,
             snapshot_size_threshold: None,
             linearizable_read: false,
             max_entry_size: 8 * 1024 * 1024,
@@ -306,7 +306,7 @@ mod tests {
         assert_eq!(cfg.heartbeat_interval, 100);
         assert_eq!(cfg.election_timeout_min, 500);
         assert_eq!(cfg.election_timeout_max, 1000);
-        assert_eq!(cfg.snapshot_logs_since_last, 1000);
+        assert_eq!(cfg.snapshot_logs_since_last, 50_000);
     }
 
     #[test]
