@@ -45,6 +45,7 @@ mod exists;
 mod flush;
 mod read;
 mod write;
+pub mod write_thread;
 
 pub(super) use super::iterator::DbIterGuard;
 pub(super) use super::numbers::scan_next_wal_file_number;
@@ -97,6 +98,7 @@ pub struct DB {
     /// (见 A-005 竞态).
     committed_sequence: AtomicU64,
     write_lock: Mutex<()>,
+    write_thread: write_thread::WriteThread,
     flush_lock: Mutex<()>,
     flush_shutdown: Arc<AtomicBool>,
     flush_handle: Mutex<Option<JoinHandle<()>>>,
@@ -112,8 +114,6 @@ pub struct DB {
     checkpoint_in_progress: AtomicBool,
     block_cache: Arc<BlockCache>,
     pub(crate) snapshots: Arc<SnapshotList>,
-    /// Group commit: leader election mutex
-    group_commit_lock: Mutex<()>,
     /// Group commit: last synced sequence number (monotonic)
     group_commit_synced_seq: AtomicU64,
     /// L0 SSTable count for lock-free stall checks (F-050/051/054).
@@ -305,6 +305,7 @@ impl DB {
             sequence: AtomicU64::new(last_sequence),
             committed_sequence: AtomicU64::new(last_sequence),
             write_lock: Mutex::new(()),
+            write_thread: write_thread::WriteThread::new(),
             flush_lock: Mutex::new(()),
             flush_shutdown: Arc::new(AtomicBool::new(false)),
             flush_handle: Mutex::new(None),
@@ -318,7 +319,6 @@ impl DB {
             checkpoint_in_progress: AtomicBool::new(false),
             block_cache,
             snapshots: SnapshotList::new(),
-            group_commit_lock: Mutex::new(()),
             group_commit_synced_seq: AtomicU64::new(0),
             l0_sstable_count: AtomicUsize::new(l0_sstable_count_init),
             write_stall_active: AtomicBool::new(false),

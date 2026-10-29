@@ -7,6 +7,7 @@ use std::collections::VecDeque;
 pub enum WriteOp {
     Put { key: Vec<u8>, value: Vec<u8> },
     Delete { key: Vec<u8> },
+    DeleteRange { start: Vec<u8>, end: Vec<u8> },
 }
 
 /// 批量写: 共享连续 sequence, 一次 WAL sync.
@@ -32,6 +33,13 @@ impl WriteBatch {
         let key = key.into();
         self.approximate_size += key.len();
         self.operations.push_back(WriteOp::Delete { key });
+    }
+
+    pub fn delete_range(&mut self, start: impl Into<Vec<u8>>, end: impl Into<Vec<u8>>) {
+        let start = start.into();
+        let end = end.into();
+        self.approximate_size += start.len() + end.len();
+        self.operations.push_back(WriteOp::DeleteRange { start, end });
     }
 
     pub fn len(&self) -> usize {

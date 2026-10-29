@@ -7,6 +7,9 @@ use super::{
     Arc, AtomicOrdering, CompactionPicker, Duration, Error, MemTable, OpType, Result, WalEntry,
     WriteBatch, WriteOp, DB, SEQUENCE_LIMIT,
 };
+use super::write_thread::{
+    WriteGroupStatus, Writer, STATE_COMPLETED, STATE_FAILED, STATE_MEMTABLE, STATE_MEMTABLE_DONE,
+};
 use crate::statistics::{DbOp, WriteStallKind};
 
 impl DB {
@@ -219,23 +222,10 @@ impl DB {
             .logical_write_bytes
             .fetch_add((key.len() + value.len()) as u64, AtomicOrdering::Relaxed);
 
-        // 序号分配, WAL 追加, MemTable 插入与 committed 推进处于同一临界区 (与 write() 一致);
-        // fsync 等待在锁外, 写入插入即可见.
-        let seq;
-        {
-            let _guard = self.write_lock.lock();
-            seq = self.alloc_sequence(1)?;
-            self.write_put_to_wal(seq, key, value, false)?;
-            self.memtable.read().put(key, value, seq)?;
-            self.committed_sequence
-                .fetch_max(seq, AtomicOrdering::SeqCst);
-        }
+        let mut batch = WriteBatch::new();
+        batch.put(key, value);
+        self.write_internal(&batch, true, self.options.sync_wal)?;
 
-        if self.options.sync_wal {
-            self.wait_group_commit_sync(seq)?;
-        }
-
-        self.maybe_freeze()?;
         tracing::debug!(target: "db", "db.put");
         self.stats.operation_durations[DbOp::Put as usize]
             .record(op_start.elapsed().as_micros() as u64);
@@ -254,27 +244,27 @@ impl DB {
             .logical_write_bytes
             .fetch_add(key.len() as u64, AtomicOrdering::Relaxed);
 
-        // 与 put() 相同: 插入与 committed 推进在写锁内完成, fsync 等待在锁外.
-        let seq;
-        {
-            let _guard = self.write_lock.lock();
-            seq = self.alloc_sequence(1)?;
-            self.write_delete_to_wal(seq, key, false)?;
-            self.memtable.read().delete(key, seq)?;
-            self.committed_sequence
-                .fetch_max(seq, AtomicOrdering::SeqCst);
-        }
+        let mut batch = WriteBatch::new();
+        batch.delete(key);
+        self.write_internal(&batch, true, self.options.sync_wal)?;
 
-        if self.options.sync_wal {
-            self.wait_group_commit_sync(seq)?;
-        }
-
-        self.maybe_freeze()?;
         tracing::debug!(target: "db", "db.delete");
         self.stats.operation_durations[DbOp::Delete as usize]
             .record(op_start.elapsed().as_micros() as u64);
         self.stats
             .note_engine_write(op_start.elapsed().as_micros() as u64);
+        Ok(())
+    }
+
+    pub fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<()> {
+        self.check_not_closed()?;
+        if start >= end {
+            return Ok(());
+        }
+        self.check_write_stall();
+        let mut batch = WriteBatch::new();
+        batch.delete_range(start, end);
+        self.write_internal(&batch, true, self.options.sync_wal)?;
         Ok(())
     }
 
@@ -287,7 +277,7 @@ impl DB {
         self.check_not_closed()?;
         self.check_write_stall();
         self.stats.operations[DbOp::WriteBatch as usize].fetch_add(1, AtomicOrdering::Relaxed);
-        // 整批先校验再分配序号与写 WAL, 避免非法 key 留下前缀写入.
+
         let mut batch_bytes = 0u64;
         for op in &batch.operations {
             match op {
@@ -299,90 +289,22 @@ impl DB {
                     Self::validate_user_key(key)?;
                     batch_bytes += key.len() as u64;
                 }
+                WriteOp::DeleteRange { start, end } => {
+                    batch_bytes += (start.len() + end.len()) as u64;
+                }
             }
         }
         self.stats
             .logical_write_bytes
             .fetch_add(batch_bytes, AtomicOrdering::Relaxed);
 
-        let n = batch.len() as u64;
-        let _guard = self.write_lock.lock();
-        let lock_acquired = std::time::Instant::now();
-        let base = self.alloc_sequence(n)?;
+        self.write_internal(batch, true, self.options.sync_wal)?;
 
-        if self.options.use_wal {
-            let mut wal = self.wal.write();
-            let mut encoded: Vec<Vec<u8>> = Vec::with_capacity(1 + batch.operations.len());
-            let mut start_buf = Vec::new();
-            WalEntry::encode_to_buf(
-                0,
-                OpType::BatchStart,
-                true,
-                &[],
-                Some(&(n as u32).to_le_bytes()),
-                &mut start_buf,
-            );
-            encoded.push(start_buf);
-            for (i, op) in batch.operations.iter().enumerate() {
-                let mut op_buf = Vec::new();
-                match op {
-                    WriteOp::Put { key, value } => {
-                        WalEntry::encode_to_buf(
-                            base + i as u64,
-                            OpType::TypePut,
-                            true,
-                            key,
-                            Some(value),
-                            &mut op_buf,
-                        );
-                    }
-                    WriteOp::Delete { key } => {
-                        WalEntry::encode_to_buf(
-                            base + i as u64,
-                            OpType::TypeDelete,
-                            false,
-                            key,
-                            None,
-                            &mut op_buf,
-                        );
-                    }
-                }
-                encoded.push(op_buf);
-            }
-            wal.append_encoded_write_batch(&encoded, base)?;
-        }
-
-        {
-            let mt = self.memtable.read();
-            for (i, op) in batch.operations.iter().enumerate() {
-                let seq = base + i as u64;
-                match op {
-                    WriteOp::Put { key, value } => mt.put(key, value, seq)?,
-                    WriteOp::Delete { key } => mt.delete(key, seq)?,
-                }
-            }
-        }
-        self.committed_sequence.fetch_max(
-            base.saturating_add(n.saturating_sub(1)),
-            AtomicOrdering::SeqCst,
-        );
-        // Release the write lock before maybe_freeze to prevent holding both
-        // locks simultaneously if a freeze is triggered.
-        drop(_guard);
-
-        if self.options.sync_wal {
-            let last_seq = base + n - 1;
-            self.wait_group_commit_sync(last_seq)?;
-        }
-
-        let lock_hold_us = lock_acquired.elapsed().as_micros();
-        self.maybe_freeze()?;
         let total_us = t0.elapsed().as_micros();
         tracing::debug!(
             target: "perf",
             op_count = batch.len(),
             total_us,
-            lock_hold_us,
             "db_write_done"
         );
         tracing::debug!(target: "db", op_count = batch.len(), "db.write_batch");
@@ -408,47 +330,22 @@ impl DB {
             match op {
                 WriteOp::Put { key, value } => batch_bytes += (key.len() + value.len()) as u64,
                 WriteOp::Delete { key } => batch_bytes += key.len() as u64,
+                WriteOp::DeleteRange { start, end } => {
+                    batch_bytes += (start.len() + end.len()) as u64;
+                }
             }
         }
         self.stats
             .logical_write_bytes
             .fetch_add(batch_bytes, AtomicOrdering::Relaxed);
 
-        let n = batch.len() as u64;
-        let _guard = self.write_lock.lock();
-        let lock_acquired = std::time::Instant::now();
-        let base = self.alloc_sequence(n)?;
+        self.write_internal(batch, false, false)?;
 
-        {
-            let mt = self.memtable.read();
-            for (i, op) in batch.operations.iter().enumerate() {
-                let seq = base + i as u64;
-                match op {
-                    WriteOp::Put { key, value } => {
-                        Self::validate_user_key(key)?;
-                        mt.put(key, value, seq)?;
-                    }
-                    WriteOp::Delete { key } => {
-                        Self::validate_user_key(key)?;
-                        mt.delete(key, seq)?;
-                    }
-                }
-            }
-        }
-        self.committed_sequence.fetch_max(
-            base.saturating_add(n.saturating_sub(1)),
-            AtomicOrdering::SeqCst,
-        );
-        drop(_guard);
-
-        let lock_hold_us = lock_acquired.elapsed().as_micros();
-        self.maybe_freeze()?;
         let total_us = t0.elapsed().as_micros();
         tracing::debug!(
             target: "perf",
             op_count = batch.len(),
             total_us,
-            lock_hold_us,
             "db_write_no_wal_done"
         );
         tracing::debug!(target: "db", op_count = batch.len(), "db.write_batch_no_wal");
@@ -457,109 +354,204 @@ impl DB {
         Ok(())
     }
 
-    /// 删除 `[start, end)` 半开区间内的全部 user key (RangeTombstone, O(1) 写入).
-    pub fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<()> {
-        self.check_not_closed()?;
-        if start >= end {
+    /// 基于 WriteThread 协作状态机与 Leader Group Commit 的统一内部写入管线 (ADR-006).
+    fn write_internal(&self, batch: &WriteBatch, use_wal: bool, sync_wal: bool) -> Result<()> {
+        if batch.is_empty() {
             return Ok(());
         }
-        self.check_write_stall();
+        let parker = crossbeam::sync::Parker::new();
+        let unparker = parker.unparker().clone();
+        let mut writer = Writer::new(batch, unparker, use_wal, sync_wal);
 
-        // 与 put() 相同: RangeTombstone 插入与 committed 推进在写锁内完成, fsync 等待在锁外.
-        let seq;
-        {
-            let _guard = self.write_lock.lock();
-            seq = self.alloc_sequence(1)?;
-            self.write_delete_range_to_wal(seq, start, end, false)?;
-            self.memtable.read().put_range_delete(start, end, seq)?;
-            self.committed_sequence
-                .fetch_max(seq, AtomicOrdering::SeqCst);
+        match self.write_thread.join_batch_group(&mut writer, &parker)? {
+            WriteGroupStatus::Leader(leader) => {
+                let group = &leader.group;
+                let mut total_ops = 0u64;
+                for &w_ptr in group {
+                    let w = unsafe { &*w_ptr };
+                    let b = unsafe { &*w.batch };
+                    total_ops += b.len() as u64;
+                }
+
+                if total_ops == 0 {
+                    for (idx, &w_ptr) in group.iter().enumerate() {
+                        if idx > 0 {
+                            let w = unsafe { &mut *w_ptr };
+                            w.state.store(STATE_COMPLETED, AtomicOrdering::Release);
+                            w.unparker.unpark();
+                        }
+                    }
+                    return Ok(());
+                }
+
+                let base_seq = match self.alloc_sequence(total_ops) {
+                    Ok(seq) => seq,
+                    Err(e) => {
+                        self.write_thread.fail_group(group, &e.to_string());
+                        return Err(e);
+                    }
+                };
+
+                let mut cur_seq = base_seq;
+                for &w_ptr in group {
+                    let w = unsafe { &mut *w_ptr };
+                    let b = unsafe { &*w.batch };
+                    w.seq = cur_seq;
+                    cur_seq += b.len() as u64;
+                }
+
+                if self.options.use_wal {
+                    let mut encoded: Vec<Vec<u8>> = Vec::new();
+                    for &w_ptr in group {
+                        let w = unsafe { &*w_ptr };
+                        if !w.use_wal || unsafe { (*w.batch).is_empty() } {
+                            continue;
+                        }
+                        let b = unsafe { &*w.batch };
+                        if b.len() > 1 {
+                            let mut start_buf = Vec::new();
+                            WalEntry::encode_to_buf(
+                                0,
+                                OpType::BatchStart,
+                                true,
+                                &[],
+                                Some(&(b.len() as u32).to_le_bytes()),
+                                &mut start_buf,
+                            );
+                            encoded.push(start_buf);
+                        }
+                        for (i, op) in b.operations.iter().enumerate() {
+                            let seq = w.seq + i as u64;
+                            let mut op_buf = Vec::new();
+                            match op {
+                                WriteOp::Put { key, value } => {
+                                    WalEntry::encode_to_buf(
+                                        seq,
+                                        OpType::TypePut,
+                                        true,
+                                        key,
+                                        Some(value),
+                                        &mut op_buf,
+                                    );
+                                }
+                                WriteOp::Delete { key } => {
+                                    WalEntry::encode_to_buf(
+                                        seq,
+                                        OpType::TypeDelete,
+                                        false,
+                                        key,
+                                        None,
+                                        &mut op_buf,
+                                    );
+                                }
+                                WriteOp::DeleteRange { start, end } => {
+                                    WalEntry::encode_to_buf(
+                                        seq,
+                                        OpType::TypeDeleteRange,
+                                        true,
+                                        start,
+                                        Some(end),
+                                        &mut op_buf,
+                                    );
+                                }
+                            }
+                            encoded.push(op_buf);
+                        }
+                    }
+                    if !encoded.is_empty() {
+                        let mut wal = self.wal.write();
+                        if let Err(e) = wal.append_encoded_write_batch(&encoded, base_seq) {
+                            self.write_thread.fail_group(group, &e.to_string());
+                            return Err(e);
+                        }
+                    }
+                }
+
+                // 唤醒 Followers 进行无锁并发 MemTable 写入
+                for (idx, &w_ptr) in group.iter().enumerate() {
+                    if idx > 0 {
+                        let w = unsafe { &mut *w_ptr };
+                        w.state.store(STATE_MEMTABLE, AtomicOrdering::Release);
+                        w.unparker.unpark();
+                    }
+                }
+
+                // Leader 自身写入 MemTable
+                let leader_w = unsafe { &*group[0] };
+                let leader_b = unsafe { &*leader_w.batch };
+                self.insert_batch_to_memtable(leader_b, leader_w.seq)?;
+
+                // Leader 等待所有 Followers 完成 MemTable 写入
+                for (idx, &w_ptr) in group.iter().enumerate() {
+                    if idx > 0 {
+                        let w = unsafe { &*w_ptr };
+                        while w.state.load(AtomicOrdering::Acquire) != STATE_MEMTABLE_DONE {
+                            std::hint::spin_loop();
+                        }
+                    }
+                }
+
+                // 原子推进 committed_sequence
+                let last_seq = base_seq + total_ops - 1;
+                self.committed_sequence
+                    .fetch_max(last_seq, AtomicOrdering::SeqCst);
+
+                // 如果任何一个写入者请求 sync WAL, 则执行 sync
+                let need_sync = self.options.sync_wal
+                    || group.iter().any(|&w_ptr| unsafe { (*w_ptr).sync });
+                if need_sync && self.options.use_wal {
+                    let mut wal = self.wal.write();
+                    if let Err(e) = wal.sync() {
+                        self.write_thread.fail_group(group, &e.to_string());
+                        return Err(e);
+                    }
+                    self.group_commit_synced_seq
+                        .store(last_seq, AtomicOrdering::Release);
+                }
+
+                // 唤醒全部 Followers 完成写入
+                for (idx, &w_ptr) in group.iter().enumerate() {
+                    if idx > 0 {
+                        let w = unsafe { &mut *w_ptr };
+                        w.state.store(STATE_COMPLETED, AtomicOrdering::Release);
+                        w.unparker.unpark();
+                    }
+                }
+
+                self.maybe_freeze()?;
+                Ok(())
+            }
+            WriteGroupStatus::FollowerMemtable(seq) => {
+                let b = unsafe { &*writer.batch };
+                self.insert_batch_to_memtable(b, seq)?;
+                writer.state.store(STATE_MEMTABLE_DONE, AtomicOrdering::Release);
+
+                while writer.state.load(AtomicOrdering::Acquire) != STATE_COMPLETED {
+                    if writer.state.load(AtomicOrdering::Acquire) == STATE_FAILED {
+                        let msg = writer
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "write group failed".to_string());
+                        return Err(Error::InvalidState(msg));
+                    }
+                    parker.park_timeout(Duration::from_micros(50));
+                }
+                Ok(())
+            }
+            WriteGroupStatus::Completed => Ok(()),
         }
-
-        if self.options.sync_wal {
-            self.wait_group_commit_sync(seq)?;
-        }
-
-        self.maybe_freeze()?;
-        Ok(())
     }
 
-    fn write_put_to_wal(&self, seq: u64, key: &[u8], value: &[u8], sync_now: bool) -> Result<()> {
-        if !self.options.use_wal {
-            return Ok(());
+    fn insert_batch_to_memtable(&self, batch: &WriteBatch, base_seq: u64) -> Result<()> {
+        let mt = self.memtable.read();
+        for (i, op) in batch.operations.iter().enumerate() {
+            let seq = base_seq + i as u64;
+            match op {
+                WriteOp::Put { key, value } => mt.put(key, value, seq)?,
+                WriteOp::Delete { key } => mt.delete(key, seq)?,
+                WriteOp::DeleteRange { start, end } => mt.put_range_delete(start, end, seq)?,
+            }
         }
-        let mut wal = self.wal.write();
-        wal.append_entry(seq, OpType::TypePut, true, key, Some(value))?;
-        if self.options.sync_wal && sync_now {
-            wal.sync()?;
-        }
-        Ok(())
-    }
-
-    fn write_delete_to_wal(&self, seq: u64, key: &[u8], sync_now: bool) -> Result<()> {
-        if !self.options.use_wal {
-            return Ok(());
-        }
-        let mut wal = self.wal.write();
-        wal.append_entry(seq, OpType::TypeDelete, false, key, None)?;
-        if self.options.sync_wal && sync_now {
-            wal.sync()?;
-        }
-        Ok(())
-    }
-
-    fn write_delete_range_to_wal(
-        &self,
-        seq: u64,
-        start: &[u8],
-        end: &[u8],
-        sync_now: bool,
-    ) -> Result<()> {
-        if !self.options.use_wal {
-            return Ok(());
-        }
-        let mut wal = self.wal.write();
-        wal.append_entry(seq, OpType::TypeDeleteRange, true, start, Some(end))?;
-        if self.options.sync_wal && sync_now {
-            wal.sync()?;
-        }
-        Ok(())
-    }
-
-    /// Group commit synchronization.
-    ///
-    /// When sync_wal is true, multiple concurrent writers cooperate so that
-    /// a single fdatasync covers all outstanding WAL records.  The first writer
-    /// to acquire group_commit_lock becomes the leader and performs the sync;
-    /// subsequent writers double-check synced_seq and return immediately.
-    fn wait_group_commit_sync(&self, my_seq: u64) -> Result<()> {
-        // Fast path: already covered by a previous sync
-        if self.group_commit_synced_seq.load(AtomicOrdering::Acquire) >= my_seq {
-            return Ok(());
-        }
-
-        let _lock = self.group_commit_lock.lock();
-
-        // Double-check: another leader might have completed while we waited
-        if self.group_commit_synced_seq.load(AtomicOrdering::Acquire) >= my_seq {
-            return Ok(());
-        }
-
-        // Optional batching window
-        if self.options.group_commit_batch_us > 0 {
-            std::thread::sleep(Duration::from_micros(self.options.group_commit_batch_us));
-        }
-
-        // One fdatasync covers all records appended so far
-        let synced_seq = {
-            let mut wal = self.wal.write();
-            let max = wal.max_seq();
-            wal.sync()?;
-            max
-        };
-
-        self.group_commit_synced_seq
-            .store(synced_seq, AtomicOrdering::Release);
         Ok(())
     }
 

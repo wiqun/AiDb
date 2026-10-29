@@ -13,3 +13,5 @@ pub use iterator::{DBIterator, DbIterGuard};
 pub use replay::replay_entries;
 pub use snapshot::Snapshot;
 pub use write_batch::{WriteBatch, WriteOp};
+#[doc(hidden)]
+pub use inner::write_thread;
