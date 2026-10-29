@@ -51,6 +51,7 @@ pub(super) use super::iterator::DbIterGuard;
 pub(super) use super::numbers::scan_next_wal_file_number;
 pub(super) use super::replay::replay_entries;
 pub(super) use super::snapshot::{Snapshot, SnapshotList};
+pub(super) use super::pinned::PinnableSlice;
 pub(super) use super::write_batch::{WriteBatch, WriteOp};
 pub(super) use crate::config::Options;
 pub(super) use crate::engine::cache::{BlockCache, CacheStats, RowCache};

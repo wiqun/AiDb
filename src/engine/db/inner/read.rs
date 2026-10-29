@@ -5,43 +5,50 @@
 
 use super::{
     encode_internal_key_buffered, extract_sequence, AtomicOrdering, DbIterGuard, Error, MemTable,
-    PointState, Result, SSTableReader, Snapshot, ValueType, DB,
+    PinnableSlice, PointState, Result, SSTableReader, Snapshot, ValueType, DB,
 };
 use crate::engine::memtable::{max_covering_range_tombstone_seq, RangeTombstoneRecord};
 use crate::statistics::DbOp;
 use std::sync::Arc;
 
 impl DB {
-    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    /// 零拷贝点查 API (ADR-007): 优先命中 RowCache 或共享底层内存, 避免 to_vec() 堆分配.
+    pub fn get_pinned<'a>(&'a self, key: &[u8]) -> Result<Option<PinnableSlice<'a>>> {
         let op_start = std::time::Instant::now();
         self.check_not_closed()?;
         Self::validate_user_key(key)?;
         self.stats.operations[DbOp::Get as usize].fetch_add(1, AtomicOrdering::Relaxed);
         let max_seq = self.sequence.load(AtomicOrdering::SeqCst);
 
-        // 1. 优先查 RowCache (命中时仅需数十纳秒, 绕过全部 LSM 解码)
+        // 1. 优先查 RowCache (命中时零拷贝借用返回 Shared(Bytes))
         if let Some(val) = self.row_cache.get(key, max_seq) {
             let bytes = val.len();
             self.stats.note_logical_read(bytes);
             self.stats.operation_durations[DbOp::Get as usize]
                 .record(op_start.elapsed().as_micros() as u64);
-            return Ok(Some(val.to_vec()));
+            return Ok(Some(PinnableSlice::Shared(val)));
         }
 
         // 2. 未命中查 LSM
         let r = self.get_at_sequence(key, max_seq)?;
 
-        // 3. 回填 RowCache
-        if let Some(ref v) = r {
+        // 3. 回填 RowCache 并返回
+        if let Some(v) = r {
             let committed = self.committed_sequence.load(AtomicOrdering::Acquire);
-            self.row_cache
-                .insert(key, bytes::Bytes::copy_from_slice(v), committed);
+            let b = bytes::Bytes::from(v);
+            self.row_cache.insert(key, b.clone(), committed);
+            self.stats.operation_durations[DbOp::Get as usize]
+                .record(op_start.elapsed().as_micros() as u64);
+            return Ok(Some(PinnableSlice::Shared(b)));
         }
 
-        tracing::debug!(target: "db", found = r.is_some(), "db.get.result");
         self.stats.operation_durations[DbOp::Get as usize]
             .record(op_start.elapsed().as_micros() as u64);
-        Ok(r)
+        Ok(None)
+    }
+
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok(self.get_pinned(key)?.map(|p| p.into_vec()))
     }
 
     pub(crate) fn get_at_sequence(&self, key: &[u8], max_seq: u64) -> Result<Option<Vec<u8>>> {
