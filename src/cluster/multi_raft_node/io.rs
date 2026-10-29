@@ -237,23 +237,17 @@ impl MultiRaftNode {
     }
 
     pub fn get_local_sync(&self, group_id: u64, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let node = self.groups.read().get(&group_id).cloned();
-        match node {
-            Some(node) => {
-                let storage = node.storage();
-                storage.get_state_machine_value(key)
-            }
+        let groups = self.groups.read();
+        match groups.get(&group_id) {
+            Some(node) => node.storage().get_state_machine_value(key),
             None => Err(ClusterError::Raft(format!("group {group_id} not found locally")).into()),
         }
     }
 
     pub fn get_local_bytes_sync(&self, group_id: u64, key: &[u8]) -> Result<Option<bytes::Bytes>> {
-        let node = self.groups.read().get(&group_id).cloned();
-        match node {
-            Some(node) => {
-                let storage = node.storage();
-                storage.get_state_machine_bytes(key)
-            }
+        let groups = self.groups.read();
+        match groups.get(&group_id) {
+            Some(node) => node.storage().get_state_machine_bytes(key),
             None => Err(ClusterError::Raft(format!("group {group_id} not found locally")).into()),
         }
     }
