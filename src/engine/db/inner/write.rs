@@ -374,20 +374,14 @@ impl DB {
                 }
 
                 if total_ops == 0 {
-                    for (idx, &w_ptr) in group.iter().enumerate() {
-                        if idx > 0 {
-                            let w = unsafe { &mut *w_ptr };
-                            w.state.store(STATE_COMPLETED, AtomicOrdering::Release);
-                            w.unparker.unpark();
-                        }
-                    }
+                    leader.complete();
                     return Ok(());
                 }
 
                 let base_seq = match self.alloc_sequence(total_ops) {
                     Ok(seq) => seq,
                     Err(e) => {
-                        self.write_thread.fail_group(group, &e.to_string());
+                        leader.fail(&e.to_string());
                         return Err(e);
                     }
                 };
@@ -462,7 +456,7 @@ impl DB {
                     if !encoded.is_empty() {
                         let mut wal = self.wal.write();
                         if let Err(e) = wal.append_encoded_write_batch(&encoded, base_seq) {
-                            self.write_thread.fail_group(group, &e.to_string());
+                            leader.fail(&e.to_string());
                             return Err(e);
                         }
                     }
@@ -489,7 +483,7 @@ impl DB {
                 if need_sync && self.options.use_wal {
                     let mut wal = self.wal.write();
                     if let Err(e) = wal.sync() {
-                        self.write_thread.fail_group(group, &e.to_string());
+                        leader.fail(&e.to_string());
                         return Err(e);
                     }
                     self.group_commit_synced_seq
@@ -497,13 +491,7 @@ impl DB {
                 }
 
                 // 一次性唤醒全部 Followers 完成写入 (消除二次 park 与二次唤醒开销)
-                for (idx, &w_ptr) in group.iter().enumerate() {
-                    if idx > 0 {
-                        let w = unsafe { &mut *w_ptr };
-                        w.state.store(STATE_COMPLETED, AtomicOrdering::Release);
-                        w.unparker.unpark();
-                    }
-                }
+                leader.complete();
 
                 self.maybe_freeze()?;
                 Ok(())

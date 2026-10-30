@@ -66,16 +66,9 @@ fn test_write_thread_concurrency_group_commit() {
                         }
                     }
 
-                    // 3. 标记所有 Followers 已完成并唤醒
-                    for (idx, w_ptr) in group.iter().enumerate() {
-                        if idx > 0 {
-                            unsafe {
-                                let w = &mut **w_ptr;
-                                w.state.store(STATE_COMPLETED, Ordering::Release);
-                                w.unparker.unpark();
-                            }
-                        }
-                    }
+                    // 3. 标记所有 Followers 已完成并唤醒 (发布终态后 Follower 随时可能销毁自己的 Writer,
+                    //    必须走 `complete()`, 不能自己在 store 之后再访问 w.unparker)
+                    leader.complete();
                     completed.fetch_add(1, Ordering::Relaxed);
                 }
                 WriteGroupStatus::FollowerMemtable(seq) => {
