@@ -424,9 +424,8 @@ impl DBIterator {
         end: Option<&[u8]>,
         stats: Option<Arc<Statistics>>,
     ) -> Self {
-        let mut it = Self::new_unpositioned(
-            memtable, immutables, sstables, sequence, start, end, stats,
-        );
+        let mut it =
+            Self::new_unpositioned(memtable, immutables, sstables, sequence, start, end, stats);
         match start {
             Some(start) => it.seek(start),
             None => {

@@ -104,7 +104,8 @@ fn reverse_scan_on_snapshot_ignores_later_writes() {
     assert_eq!(collect_reverse(&mut live), keys(&[b"c", b"b"]));
 }
 
-/// scan_limited 反向跳表遍历测试: 覆盖边界截断、limit、多版本与删除 tombstone 语义.
+/// 场景 (Issue #84): `scan_limited` 纯内存跳表反向有界扫描需处理多版本覆盖与尾部连续墓碑.
+/// 期望: 区间截断, `limit` 限制, 删除后重写及超 8 版本跳跃回退的结果与合并迭代器完全一致.
 #[test]
 fn test_scan_limited_reverse_in_memtable() {
     let (_dir, db) = open_db();
@@ -142,9 +143,17 @@ fn test_scan_limited_reverse_in_memtable() {
     }
     db.delete(b"d").unwrap();
     let res = db.scan_limited(Some(b"b"), Some(b"e"), 2, true).unwrap();
-    assert_eq!(res, vec![(b"c".to_vec(), b"vc_11".to_vec()), (b"b".to_vec(), b"v".to_vec())]);
+    assert_eq!(
+        res,
+        vec![
+            (b"c".to_vec(), b"vc_11".to_vec()),
+            (b"b".to_vec(), b"v".to_vec())
+        ]
+    );
 }
 
+/// 场景 (Issue #84): 存在与查询区间不重叠的磁盘 SSTable 时, `scan_limited` 仍应命中纯内存跳表快速路径.
+/// 期望: 正确跳过 `m3` 墓碑并逆序返回 `[m2, m1]`.
 #[test]
 fn test_scan_limited_reverse_with_sst_and_non_overlapping_sst() {
     let (_dir, db) = open_db();
