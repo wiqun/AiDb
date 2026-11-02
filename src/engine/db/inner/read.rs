@@ -353,14 +353,24 @@ impl DB {
             (pure, mem.rep().shared_map())
         };
 
-        if is_pure_mem && !reverse {
-            return Ok(scan_memtable_limited_forward(
-                &shared_map,
-                seq,
-                start,
-                end,
-                limit,
-            ));
+        if is_pure_mem {
+            if reverse {
+                return Ok(scan_memtable_limited_backward(
+                    &shared_map,
+                    seq,
+                    start,
+                    end,
+                    limit,
+                ));
+            } else {
+                return Ok(scan_memtable_limited_forward(
+                    &shared_map,
+                    seq,
+                    start,
+                    end,
+                    limit,
+                ));
+            }
         }
 
         let mut iter = self.scan(start, end)?;
@@ -476,6 +486,65 @@ fn scan_memtable_limited_forward(
             }
         }
         entry = e.next();
+    }
+    out
+}
+
+/// 纯 MemTable 单层极速反向有界扫描: 零多路归并、零堆分配, 结合 upper_bound 与 lower_bound 快速反向跳跃.
+fn scan_memtable_limited_backward(
+    map: &SharedSkipMap,
+    committed_seq: u64,
+    start: Option<&[u8]>,
+    end: Option<&[u8]>,
+    limit: usize,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut out = Vec::with_capacity(limit.min(4096));
+    let mut entry = match end {
+        Some(e) => {
+            let encoded = encode_internal_key(e, K_MAX_SEQUENCE, ValueType::TypePut);
+            let seek = InternalKeyBytes::from_slice(&encoded);
+            map.upper_bound(Bound::Excluded(&seek))
+        }
+        None => map.back(),
+    };
+
+    while let Some(e) = entry {
+        let internal_key = e.key().as_ref();
+        let curr_user_key = extract_user_key(internal_key);
+        if start.is_some_and(|s| curr_user_key < s) {
+            break;
+        }
+
+        let seek_latest = encode_internal_key(curr_user_key, K_MAX_SEQUENCE, ValueType::TypePut);
+        let seek_k = InternalKeyBytes::from_slice(&seek_latest);
+        let mut le_opt = map.lower_bound(Bound::Included(&seek_k));
+        let mut latest_val = None;
+        while let Some(le) = le_opt {
+            let l_ikey = le.key().as_ref();
+            if extract_user_key(l_ikey) != curr_user_key {
+                break;
+            }
+            if let Ok(seq) = extract_sequence(l_ikey) {
+                if seq <= committed_seq {
+                    let vtype = extract_value_type(l_ikey).unwrap_or(ValueType::TypeDelete);
+                    if vtype == ValueType::TypePut {
+                        latest_val = Some(le.value().to_vec());
+                    }
+                    break;
+                }
+            }
+            le_opt = le.next();
+        }
+
+        if let Some(val) = latest_val {
+            out.push((curr_user_key.to_vec(), val));
+            if out.len() >= limit {
+                break;
+            }
+        }
+
+        let prev_seek = InternalKeyBytes::from_slice(&seek_latest);
+        entry = map.upper_bound(Bound::Excluded(&prev_seek));
     }
     out
 }

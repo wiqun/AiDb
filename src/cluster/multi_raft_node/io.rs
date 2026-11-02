@@ -20,15 +20,13 @@ fn last_sm_user_pair(
 
     let start = sm_key(group_id, start_user);
     let end = sm_key(group_id, end_user);
-    let mut iter = db.scan(Some(start.as_slice()), Some(end.as_slice()))?;
-    iter.seek_to_last();
-    let (Some(key), Some(value)) = (iter.key(), iter.value()) else {
-        return Ok(None);
-    };
-    let Some(user_key) = user_key_from_sm_key(group_id, key) else {
-        return Ok(None);
-    };
-    Ok(Some((user_key, value.to_vec())))
+    let pairs = db.scan_limited(Some(&start), Some(&end), 1, true)?;
+    for (k, v) in pairs {
+        if let Some(user_key) = user_key_from_sm_key(group_id, &k) {
+            return Ok(Some((user_key, v)));
+        }
+    }
+    Ok(None)
 }
 
 /// 半开用户 key 区间 `[start_user, end_user)` 内至多 `limit` 条, `reverse` 时从区间末尾向前取.

@@ -103,3 +103,33 @@ fn reverse_scan_on_snapshot_ignores_later_writes() {
     let mut live = db.scan(None, None).unwrap();
     assert_eq!(collect_reverse(&mut live), keys(&[b"c", b"b"]));
 }
+
+/// scan_limited 反向跳表遍历测试: 覆盖边界截断、limit、多版本与删除 tombstone 语义.
+#[test]
+fn test_scan_limited_reverse_in_memtable() {
+    let (_dir, db) = open_db();
+    for k in [b"a", b"b", b"c", b"d", b"e"] {
+        db.put(k, b"v").unwrap();
+    }
+    // 区间 [b, e) limit=2 reverse=true -> [d, c]
+    let res = db.scan_limited(Some(b"b"), Some(b"e"), 2, true).unwrap();
+    let res_keys: Vec<_> = res.into_iter().map(|(k, _)| k).collect();
+    assert_eq!(res_keys, keys(&[b"d", b"c"]));
+
+    // limit=1 -> [d]
+    let res = db.scan_limited(Some(b"b"), Some(b"e"), 1, true).unwrap();
+    let res_keys: Vec<_> = res.into_iter().map(|(k, _)| k).collect();
+    assert_eq!(res_keys, keys(&[b"d"]));
+
+    // 删除 d 后, 期望返回 [c, b]
+    db.delete(b"d").unwrap();
+    let res = db.scan_limited(Some(b"b"), Some(b"e"), 2, true).unwrap();
+    let res_keys: Vec<_> = res.into_iter().map(|(k, _)| k).collect();
+    assert_eq!(res_keys, keys(&[b"c", b"b"]));
+
+    // 重新 put d, 期望返回 [d, c]
+    db.put(b"d", b"v2").unwrap();
+    let res = db.scan_limited(Some(b"b"), Some(b"e"), 2, true).unwrap();
+    let res_keys: Vec<_> = res.into_iter().map(|(k, _)| k).collect();
+    assert_eq!(res_keys, keys(&[b"d", b"c"]));
+}
