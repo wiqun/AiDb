@@ -51,14 +51,14 @@ impl DB {
     fn flush_immutable_memtables(&self) -> Result<usize> {
         let mut flushed = 0usize;
         loop {
-            let has_front = !self.immutable_memtables.read().is_empty();
-            if !has_front {
-                break;
-            }
-            {
+            let table = {
                 let imm = self.immutable_memtables.read();
-                self.flush_memtable_to_sstable(imm[0].inner())?;
-            }
+                imm.first().cloned()
+            };
+            let Some(table) = table else {
+                break;
+            };
+            self.flush_memtable_to_sstable(table.inner())?;
             let removed = self.immutable_memtables.write().remove(0);
             let removed_size = removed.approximate_size() as u64;
             let _ = self.stats.memtable_size_bytes[1].try_update(
@@ -132,6 +132,7 @@ impl DB {
                 largest_key: reader.largest_key().to_vec(),
             })?;
         }
+        self.update_write_stall_state();
         let pending = self.pending_compaction_bytes();
         update_sstable_metrics(&self.sstables.read(), &self.stats, pending);
         tracing::info!(target: "db", file_number, file_size, "db.flush.complete");

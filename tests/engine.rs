@@ -30,3 +30,9 @@ mod large_flush_repro;
 
 #[path = "engine/recovery_compaction.rs"]
 mod recovery_compaction;
+
+#[path = "engine/write_thread.rs"]
+mod write_thread;
+
+#[path = "engine/pinnable_slice.rs"]
+mod pinnable_slice;

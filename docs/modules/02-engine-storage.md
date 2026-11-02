@@ -39,6 +39,7 @@ description: AiDb 持久化层 — SSTable 布局、层级 compaction、布隆�
 | `engine/filter/bloom.rs` | SST 级 Bloom Filter (user_key 散列) | `BloomFilter`, `Filter` |
 | `engine/cache/mod.rs` | Cache 模块根; re-export | — |
 | `engine/cache/block_cache.rs` | 16 分片 LRU Data Block cache | `BlockCache::get/insert` |
+| `engine/cache/row_cache.rs` | 32 分片并发 LRU 行级缓存 (ADR-007) | `RowCache::get/insert/invalidate` |
 | `engine/checkpoint/mod.rs` | 目录一致性硬链接快照 | `Checkpoint::create`, `verify_openable` |
 
 **DB 协调入口** (`engine/db/inner/`):

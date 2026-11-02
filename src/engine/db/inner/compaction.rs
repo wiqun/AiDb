@@ -225,6 +225,7 @@ impl DB {
                 AtomicOrdering::Relaxed,
             );
         }
+        self.update_write_stall_state();
 
         let pending = self.pending_compaction_bytes();
         update_sstable_metrics(&self.sstables.read(), &self.stats, pending);
@@ -340,6 +341,7 @@ impl DB {
                 self.l0_sstable_count.fetch_add(1, AtomicOrdering::Relaxed);
             }
         }
+        self.update_write_stall_state();
 
         let pending = self.pending_compaction_bytes();
         update_sstable_metrics(&self.sstables.read(), &self.stats, pending);

@@ -49,6 +49,7 @@ fn test_db_clear_cache() {
     let dir = tempdir().unwrap();
     let mut opts = Options::for_testing();
     opts.block_cache_size = 256 * 1024;
+    opts.row_cache_size = 0;
     opts.memtable_size = 256;
 
     let db = DB::open(dir.path(), opts).unwrap();

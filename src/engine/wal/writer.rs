@@ -51,12 +51,17 @@ fn preallocate_file(_file: &std::fs::File, _size: u64) -> Result<()> {
 /// WAL 默认 block 大小
 pub const BLOCK_SIZE: usize = 32768;
 
+/// WAL 缓冲区容量 (64 KiB), 用于合并连续写入为批次系统调用
+pub const WAL_BUFFER_CAPACITY: usize = 65536;
+
 /// 预分配零填充 buffer, 避免每次 padding 分配 vec (F-014).
 static ZEROS: [u8; BLOCK_SIZE] = [0u8; BLOCK_SIZE];
 
 pub struct Writer {
     file: std::fs::File,
     block_offset: usize,
+    buf: Vec<u8>,
+    flushed_size: u64,
 }
 
 impl Writer {
@@ -100,8 +105,24 @@ impl Writer {
             preallocate_file(&file, size)?;
         }
 
-        let block_offset = (file.metadata()?.len() % BLOCK_SIZE as u64) as usize;
-        Ok(Writer { file, block_offset })
+        let file_len = file.metadata()?.len();
+        let block_offset = (file_len % BLOCK_SIZE as u64) as usize;
+        Ok(Writer {
+            file,
+            block_offset,
+            buf: Vec::with_capacity(WAL_BUFFER_CAPACITY),
+            flushed_size: file_len,
+        })
+    }
+
+    /// 刷新用户态缓冲区至 OS Page Cache
+    pub fn flush_buffer(&mut self) -> Result<()> {
+        if !self.buf.is_empty() {
+            self.file.write_all(&self.buf)?;
+            self.flushed_size += self.buf.len() as u64;
+            self.buf.clear();
+        }
+        Ok(())
     }
 
     /// 单条 Record 的 data 最大长度 (Length 字段为 u16)
@@ -123,7 +144,10 @@ impl Writer {
             if self.block_offset + HEADER_SIZE >= BLOCK_SIZE {
                 let remaining = BLOCK_SIZE - self.block_offset;
                 if remaining > 0 {
-                    self.file.write_all(&ZEROS[..remaining])?;
+                    if self.buf.len() + remaining > WAL_BUFFER_CAPACITY {
+                        self.flush_buffer()?;
+                    }
+                    self.buf.extend_from_slice(&ZEROS[..remaining]);
                 }
                 self.block_offset = 0;
             }
@@ -178,7 +202,10 @@ impl Writer {
         if BLOCK_SIZE - self.block_offset < needed {
             let remaining = BLOCK_SIZE - self.block_offset;
             if remaining > 0 {
-                self.file.write_all(&ZEROS[..remaining])?;
+                if self.buf.len() + remaining > WAL_BUFFER_CAPACITY {
+                    self.flush_buffer()?;
+                }
+                self.buf.extend_from_slice(&ZEROS[..remaining]);
             }
             self.block_offset = 0;
         }
@@ -190,15 +217,16 @@ impl Writer {
         h.update(data);
         let crc = h.finalize();
 
-        // 合并 header + data 为单次 write (F-012): 4 次 write_all → 1 次 syscall
-        let mut buf = Vec::with_capacity(HEADER_SIZE + data_len);
-        buf.extend_from_slice(&crc.to_le_bytes());
-        buf.extend_from_slice(&(data_len as u16).to_le_bytes());
-        buf.extend_from_slice(&[record_type as u8]);
-        buf.extend_from_slice(data);
-        self.file.write_all(&buf)?;
+        // 写入连续用户态缓冲区 (避免逐次动态分配与单条 record 系统调用)
+        if self.buf.len() + needed > WAL_BUFFER_CAPACITY {
+            self.flush_buffer()?;
+        }
+        self.buf.extend_from_slice(&crc.to_le_bytes());
+        self.buf.extend_from_slice(&(data_len as u16).to_le_bytes());
+        self.buf.extend_from_slice(&[record_type as u8]);
+        self.buf.extend_from_slice(data);
 
-        self.block_offset += HEADER_SIZE + data_len;
+        self.block_offset += needed;
 
         tracing::debug!(
           target: "wal",
@@ -213,6 +241,7 @@ impl Writer {
     /// Flush 文件缓冲区
     pub fn flush(&mut self) -> Result<()> {
         tracing::debug!(target: "wal", "wal.flush.start");
+        self.flush_buffer()?;
         self.file.flush()?;
         tracing::debug!(target: "wal", "wal.flush.complete");
         Ok(())
@@ -221,6 +250,7 @@ impl Writer {
     /// fdatasync — 仅 data+size, 跳过 mtime 元数据同步 (F-013)
     pub fn sync_data(&mut self) -> Result<()> {
         tracing::debug!(target: "wal", "wal.sync.start");
+        self.flush_buffer()?;
         self.file.sync_data()?;
         tracing::debug!(target: "wal", "wal.sync.complete");
         Ok(())
@@ -231,9 +261,9 @@ impl Writer {
         self.block_offset
     }
 
-    /// 获取文件大小
+    /// 获取文件逻辑大小 (含未刷盘的缓冲区字节)
     pub fn file_size(&self) -> Result<u64> {
-        Ok(self.file.metadata()?.len())
+        Ok(self.flushed_size + self.buf.len() as u64)
     }
 
     /// 估算一条 Record 落盘字节数 (含 block padding), 以及写入后的 block_offset.
@@ -265,29 +295,40 @@ impl Writer {
     }
 
     /// 重建 Reader 用
-    pub fn try_clone_file(&self) -> Result<std::fs::File> {
-        // 需要读权限, 以 read-write 方式打开
-        // 但这里我们只是尝试副本
+    pub fn try_clone_file(&mut self) -> Result<std::fs::File> {
+        self.flush_buffer()?;
         Ok(self.file.try_clone()?)
     }
 }
 
 impl Write for Writer {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.flush_buffer()
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         self.file.write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        self.flush_buffer()
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         self.file.flush()
     }
 }
 
 impl Seek for Writer {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.flush_buffer()
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         let new_pos = self.file.seek(pos)?;
-        // 重新计算 block_offset (仅在确定性 seek 后有效)
+        self.flushed_size = new_pos;
         self.block_offset = (new_pos as usize) % BLOCK_SIZE;
         Ok(new_pos)
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        let _ = self.flush_buffer();
     }
 }
 

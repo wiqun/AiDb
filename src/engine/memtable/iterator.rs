@@ -1,7 +1,7 @@
 //! MemTable 迭代器: seek / seek_to_first / next / prev.
 
-use super::internal_key::{encode_internal_key, ValueType, K_MAX_SEQUENCE};
-use super::key_bytes::InternalKeyBytes;
+use super::internal_key::{encode_internal_key_buffered, ValueType, K_MAX_SEQUENCE};
+use super::key_bytes::{InternalKeyBytes, InternalKeySlice};
 use super::rep::MemTableRep;
 use super::skiplist_rep::SkipMapRep;
 use super::MemTable;
@@ -25,9 +25,15 @@ impl<'a> MemTableIterator<'a> {
 
     /// 定位到 >= target_user_key 的第一个 entry (含所有版本).
     pub fn seek(&mut self, target_user_key: &[u8]) {
-        let encoded = encode_internal_key(target_user_key, K_MAX_SEQUENCE, ValueType::TypePut);
-        let seek = InternalKeyBytes::from_slice(&encoded);
-        self.current = self.rep.lower_bound(Bound::Included(&seek));
+        self.current = encode_internal_key_buffered(
+            target_user_key,
+            K_MAX_SEQUENCE,
+            ValueType::TypePut,
+            |seek| {
+                self.rep
+                    .lower_bound(Bound::Included(InternalKeySlice::from_slice(seek)))
+            },
+        );
     }
 
     pub fn seek_to_first(&mut self) {

@@ -16,6 +16,7 @@ fn test_block_seek_count_hit_and_miss() {
     let dir = TempDir::new().unwrap();
     let opts = Options {
         block_size: 256,
+        row_cache_size: 0,
         ..Default::default()
     };
     let db = DB::open(dir.path(), opts).unwrap();

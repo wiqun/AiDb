@@ -5,24 +5,54 @@
 
 use super::{
     encode_internal_key_buffered, extract_sequence, AtomicOrdering, DbIterGuard, Error, MemTable,
-    PointState, Result, SSTableReader, Snapshot, ValueType, DB,
+    PinnableSlice, PointState, Result, SSTableReader, Snapshot, ValueType, DB,
 };
-use crate::engine::memtable::{max_covering_range_tombstone_seq, RangeTombstoneRecord};
+use crate::engine::memtable::{
+    extract_user_key, extract_value_type, max_covering_range_tombstone_seq, InternalKeyBytes,
+    InternalKeySlice, RangeTombstoneRecord, SharedSkipMap, K_MAX_SEQUENCE,
+};
 use crate::statistics::DbOp;
+use std::ops::Bound;
 use std::sync::Arc;
 
 impl DB {
-    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    /// 零拷贝点查 API (ADR-007): 优先命中 RowCache 或共享底层内存, 避免 to_vec() 堆分配.
+    pub fn get_pinned<'a>(&'a self, key: &[u8]) -> Result<Option<PinnableSlice<'a>>> {
         let op_start = std::time::Instant::now();
         self.check_not_closed()?;
         Self::validate_user_key(key)?;
         self.stats.operations[DbOp::Get as usize].fetch_add(1, AtomicOrdering::Relaxed);
         let max_seq = self.sequence.load(AtomicOrdering::SeqCst);
+
+        // 1. 优先查 RowCache (命中时零拷贝借用返回 Shared(Bytes))
+        if let Some(val) = self.row_cache.get(key, max_seq) {
+            let bytes = val.len();
+            self.stats.note_logical_read(bytes);
+            self.stats.operation_durations[DbOp::Get as usize]
+                .record(op_start.elapsed().as_micros() as u64);
+            return Ok(Some(PinnableSlice::Shared(val)));
+        }
+
+        // 2. 未命中查 LSM
         let r = self.get_at_sequence(key, max_seq)?;
-        tracing::debug!(target: "db", found = r.is_some(), "db.get.result");
+
+        // 3. 回填 RowCache 并返回
+        if let Some(v) = r {
+            let committed = self.committed_sequence.load(AtomicOrdering::Acquire);
+            let b = bytes::Bytes::from(v);
+            self.row_cache.insert(key, b.clone(), committed);
+            self.stats.operation_durations[DbOp::Get as usize]
+                .record(op_start.elapsed().as_micros() as u64);
+            return Ok(Some(PinnableSlice::Shared(b)));
+        }
+
         self.stats.operation_durations[DbOp::Get as usize]
             .record(op_start.elapsed().as_micros() as u64);
-        Ok(r)
+        Ok(None)
+    }
+
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok(self.get_pinned(key)?.map(|p| p.into_vec()))
     }
 
     pub(crate) fn get_at_sequence(&self, key: &[u8], max_seq: u64) -> Result<Option<Vec<u8>>> {
@@ -300,6 +330,91 @@ impl DB {
             Some(Arc::clone(&self.stats)),
         ))
     }
+
+    /// 有界范围扫描: 优先命中单层纯内存跳表快路径, 避免构造完整 DBIterator 及墓碑多版本归并放大.
+    pub fn scan_limited(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        limit: usize,
+        reverse: bool,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.check_not_closed()?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let seq = self.committed_sequence.load(AtomicOrdering::SeqCst);
+        let (is_pure_mem, shared_map) = {
+            let mem = self.memtable.read();
+            let imm = self.immutable_memtables.read();
+            let sst = self.sstables.read();
+            let no_sst_overlap = sst.iter().all(|level| {
+                level
+                    .iter()
+                    .all(|r| !crate::engine::db::iterator::sst_overlaps(r, start, end))
+            });
+            let pure = imm.is_empty() && no_sst_overlap && !mem.has_range_tombstones();
+            (pure, mem.rep().shared_map())
+        };
+
+        if is_pure_mem {
+            if reverse {
+                return Ok(scan_memtable_limited_backward(
+                    &shared_map,
+                    seq,
+                    start,
+                    end,
+                    limit,
+                ));
+            } else {
+                return Ok(scan_memtable_limited_forward(
+                    &shared_map,
+                    seq,
+                    start,
+                    end,
+                    limit,
+                ));
+            }
+        }
+
+        let mut out = Vec::with_capacity(limit.min(4096));
+        if reverse {
+            let mut iter = {
+                let mem = self.memtable.read();
+                let imm = self.immutable_memtables.read();
+                let sst = self.sstables.read();
+                crate::engine::db::DBIterator::new_unpositioned(
+                    &mem,
+                    &imm,
+                    &sst,
+                    seq,
+                    start,
+                    end,
+                    Some(Arc::clone(&self.stats)),
+                )
+            };
+            iter.seek_to_last();
+            while out.len() < limit {
+                let (Some(key), Some(value)) = (iter.key(), iter.value()) else {
+                    break;
+                };
+                out.push((key.to_vec(), value.to_vec()));
+                if !iter.prev() {
+                    break;
+                }
+            }
+            return Ok(out);
+        }
+        let iter = self.scan(start, end)?;
+        for item in iter {
+            let (key, value) = item?;
+            out.push((key, value));
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
 }
 
 pub(super) fn min_sequence_in_memtable(mt: &MemTable) -> Option<u64> {
@@ -339,6 +454,165 @@ fn user_key_in_sstable_range(user_key: &[u8], smallest: &[u8], largest: &[u8]) -
     let s_user = &smallest[..smallest.len() - 8];
     let l_user = &largest[..largest.len() - 8];
     user_key >= s_user && user_key <= l_user
+}
+
+/// 纯 MemTable 单层极速正向有界扫描: 零多路归并抽象、零墓碑多版本堆分配、一路跳表链表前进.
+fn scan_memtable_limited_forward(
+    map: &SharedSkipMap,
+    committed_seq: u64,
+    start: Option<&[u8]>,
+    end: Option<&[u8]>,
+    limit: usize,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut out = Vec::with_capacity(limit.min(4096));
+    let mut entry = match start {
+        Some(s) => encode_internal_key_buffered(s, K_MAX_SEQUENCE, ValueType::TypePut, |seek| {
+            map.lower_bound(Bound::Included(InternalKeySlice::from_slice(seek)))
+        }),
+        None => map.front(),
+    };
+    let mut last_user_key = Vec::new();
+    let mut has_last = false;
+    while let Some(e) = entry {
+        let internal_key = e.key().as_ref();
+        let user_key = extract_user_key(internal_key);
+        if end.is_some_and(|end| user_key >= end) {
+            break;
+        }
+        if has_last && last_user_key.as_slice() == user_key {
+            entry = e.next();
+            continue;
+        }
+        let Ok(seq) = extract_sequence(internal_key) else {
+            entry = e.next();
+            continue;
+        };
+        if seq > committed_seq {
+            entry = e.next();
+            continue;
+        }
+        has_last = true;
+        last_user_key.clear();
+        last_user_key.extend_from_slice(user_key);
+        let vtype = extract_value_type(internal_key).unwrap_or(ValueType::TypeDelete);
+        if vtype == ValueType::TypePut {
+            out.push((user_key.to_vec(), e.value().to_vec()));
+            if out.len() >= limit {
+                break;
+            }
+        }
+        entry = e.next();
+    }
+    out
+}
+
+type SkipEntry<'a> = crossbeam_skiplist::map::Entry<'a, InternalKeyBytes, Arc<[u8]>>;
+
+/// 沿跳表反向消费 `curr_user_key` 的版本组:
+/// - 若组内版本数 <= 8, 直接通过 `prev()` 顺序回退拿到最新可见版本并落到前一个 `user_key` 末尾 (零分配、零跳表搜索).
+/// - 若单 key 版本数 > 8, 切换为 `lower_bound` 读最新版本 + `upper_bound` 直接跳过整组.
+fn consume_memtable_group_backward<'a>(
+    map: &'a SharedSkipMap,
+    first_entry: SkipEntry<'a>,
+    curr_user_key: &[u8],
+    committed_seq: u64,
+) -> (Option<Vec<u8>>, Option<SkipEntry<'a>>) {
+    let mut best: Option<(u64, ValueType, SkipEntry<'a>)> = None;
+    let mut cur = Some(first_entry);
+    let mut steps = 0usize;
+    while let Some(e) = cur {
+        let ikey = e.key().as_ref();
+        if extract_user_key(ikey) != curr_user_key {
+            let val = best
+                .and_then(|(_, vt, win)| (vt == ValueType::TypePut).then(|| win.value().to_vec()));
+            return (val, Some(e));
+        }
+        if let Ok(seq) = extract_sequence(ikey) {
+            if seq <= committed_seq {
+                let vt = extract_value_type(ikey).unwrap_or(ValueType::TypeDelete);
+                let wins = best.as_ref().is_none_or(|(b_seq, _, _)| {
+                    seq > *b_seq || (seq == *b_seq && vt == ValueType::TypeDelete)
+                });
+                if wins {
+                    best = Some((seq, vt, e.clone()));
+                }
+            }
+        }
+        steps += 1;
+        if steps > 8 {
+            return jump_memtable_group_backward(map, curr_user_key, committed_seq);
+        }
+        cur = e.prev();
+    }
+    let val =
+        best.and_then(|(_, vt, win)| (vt == ValueType::TypePut).then(|| win.value().to_vec()));
+    (val, None)
+}
+
+fn jump_memtable_group_backward<'a>(
+    map: &'a SharedSkipMap,
+    curr_user_key: &[u8],
+    committed_seq: u64,
+) -> (Option<Vec<u8>>, Option<SkipEntry<'a>>) {
+    encode_internal_key_buffered(curr_user_key, K_MAX_SEQUENCE, ValueType::TypePut, |seek| {
+        let seek_slice = InternalKeySlice::from_slice(seek);
+        let mut le_opt = map.lower_bound(Bound::Included(seek_slice));
+        let mut latest_val = None;
+        while let Some(le) = le_opt {
+            let l_ikey = le.key().as_ref();
+            if extract_user_key(l_ikey) != curr_user_key {
+                break;
+            }
+            if let Ok(seq) = extract_sequence(l_ikey) {
+                if seq <= committed_seq {
+                    let vtype = extract_value_type(l_ikey).unwrap_or(ValueType::TypeDelete);
+                    if vtype == ValueType::TypePut {
+                        latest_val = Some(le.value().to_vec());
+                    }
+                    break;
+                }
+            }
+            le_opt = le.next();
+        }
+        let prev_entry = map.upper_bound(Bound::Excluded(seek_slice));
+        (latest_val, prev_entry)
+    })
+}
+
+/// 纯 MemTable 单层极速反向有界扫描: 优先链表 `prev()` 零搜索回退, 超长版本组自动切换 `upper_bound` 跳跃.
+fn scan_memtable_limited_backward(
+    map: &SharedSkipMap,
+    committed_seq: u64,
+    start: Option<&[u8]>,
+    end: Option<&[u8]>,
+    limit: usize,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut out = Vec::with_capacity(limit.min(4096));
+    let mut entry = match end {
+        Some(e) => encode_internal_key_buffered(e, K_MAX_SEQUENCE, ValueType::TypePut, |seek| {
+            map.upper_bound(Bound::Excluded(InternalKeySlice::from_slice(seek)))
+        }),
+        None => map.back(),
+    };
+    let mut curr_key_buf = Vec::new();
+    while let Some(e) = entry {
+        let curr_user_key = extract_user_key(e.key().as_ref());
+        if start.is_some_and(|s| curr_user_key < s) {
+            break;
+        }
+        curr_key_buf.clear();
+        curr_key_buf.extend_from_slice(curr_user_key);
+        let (latest_val, prev_entry) =
+            consume_memtable_group_backward(map, e, &curr_key_buf, committed_seq);
+        if let Some(val) = latest_val {
+            out.push((curr_key_buf.clone(), val));
+            if out.len() >= limit {
+                break;
+            }
+        }
+        entry = prev_entry;
+    }
+    out
 }
 
 #[cfg(test)]

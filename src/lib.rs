@@ -16,7 +16,7 @@ pub mod metrics;
 
 pub use engine::cache::{BlockCache, CacheStats};
 pub use engine::checkpoint::Checkpoint;
-pub use engine::db::{DbIterGuard, Snapshot, WriteBatch, WriteOp, DB};
+pub use engine::db::{DbIterGuard, PinnableSlice, Snapshot, WriteBatch, WriteOp, DB};
 pub use error::{Error, Result};
 
 pub mod statistics;

@@ -483,6 +483,15 @@ impl OpenRaftStorage {
             .map_err(|e| Error::Cluster(map_db_err(e)))
     }
 
+    pub fn get_state_machine_bytes(&self, user_key: &[u8]) -> Result<Option<bytes::Bytes>> {
+        let key = sm_key(self.group_id, user_key);
+        let pinned = self
+            .db
+            .get_pinned(&key)
+            .map_err(|e| Error::Cluster(map_db_err(e)))?;
+        Ok(pinned.map(|p| p.into_bytes()))
+    }
+
     /// 读取本 group 在 `epoch` 下的迁移 oplog tip; 缺失视为 0 (从未写过).
     pub fn get_migration_tip(&self, epoch: u64) -> Result<u64> {
         let key = mig_tip_key(self.group_id, epoch);

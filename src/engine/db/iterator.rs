@@ -315,7 +315,11 @@ pub struct DBIterator {
 
 /// SSTable 的 user key 范围 `[smallest, largest]` 与查询区间 `[start, end)` 是否相交.
 /// 空文件或键长异常时保守视为相交.
-fn sst_overlaps(reader: &SSTableReader, start: Option<&[u8]>, end: Option<&[u8]>) -> bool {
+pub(crate) fn sst_overlaps(
+    reader: &SSTableReader,
+    start: Option<&[u8]>,
+    end: Option<&[u8]>,
+) -> bool {
     let (smallest, largest) = (reader.smallest_key(), reader.largest_key());
     if smallest.len() < 8 || largest.len() < 8 {
         return true;
@@ -344,7 +348,7 @@ fn push_range_records(
 
 fn collect_range_tombstones(
     memtable: &MemTable,
-    immutables: &[ImmutableMemTable],
+    immutables: &[Arc<ImmutableMemTable>],
     sstables: &[Vec<Arc<SSTableReader>>],
     start: Option<&[u8]>,
     end: Option<&[u8]>,
@@ -372,9 +376,9 @@ fn collect_range_tombstones(
 }
 
 impl DBIterator {
-    pub fn new(
+    pub(crate) fn new_unpositioned(
         memtable: &MemTable,
-        immutables: &[ImmutableMemTable],
+        immutables: &[Arc<ImmutableMemTable>],
         sstables: &[Vec<Arc<SSTableReader>>],
         sequence: u64,
         start: Option<&[u8]>,
@@ -400,7 +404,7 @@ impl DBIterator {
             }
         }
 
-        let mut it = Self {
+        Self {
             current: None,
             sequence,
             layers,
@@ -408,7 +412,20 @@ impl DBIterator {
             end_key: end.map(<[u8]>::to_vec),
             range_tombstones: collect_range_tombstones(memtable, immutables, sstables, start, end),
             stats,
-        };
+        }
+    }
+
+    pub fn new(
+        memtable: &MemTable,
+        immutables: &[Arc<ImmutableMemTable>],
+        sstables: &[Vec<Arc<SSTableReader>>],
+        sequence: u64,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        stats: Option<Arc<Statistics>>,
+    ) -> Self {
+        let mut it =
+            Self::new_unpositioned(memtable, immutables, sstables, sequence, start, end, stats);
         match start {
             Some(start) => it.seek(start),
             None => {

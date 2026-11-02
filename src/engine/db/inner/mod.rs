@@ -45,14 +45,16 @@ mod exists;
 mod flush;
 mod read;
 mod write;
+pub mod write_thread;
 
 pub(super) use super::iterator::DbIterGuard;
 pub(super) use super::numbers::scan_next_wal_file_number;
+pub(super) use super::pinned::PinnableSlice;
 pub(super) use super::replay::replay_entries;
 pub(super) use super::snapshot::{Snapshot, SnapshotList};
 pub(super) use super::write_batch::{WriteBatch, WriteOp};
 pub(super) use crate::config::Options;
-pub(super) use crate::engine::cache::{BlockCache, CacheStats};
+pub(super) use crate::engine::cache::{BlockCache, CacheStats, RowCache};
 pub(super) use crate::engine::compaction::{
     current_exists, load_sstables_from_version, remove_orphan_sstables,
     scan_version_edits_from_dir, CompactionFilter, CompactionJob, CompactionPicker,
@@ -85,7 +87,7 @@ pub struct DB {
     path: PathBuf,
     options: Arc<Options>,
     memtable: RwLock<MemTable>,
-    immutable_memtables: RwLock<Vec<ImmutableMemTable>>,
+    immutable_memtables: RwLock<Vec<Arc<ImmutableMemTable>>>,
     wal: RwLock<WALManager>,
     sstables: RwLock<Vec<Vec<Arc<SSTableReader>>>>,
     version_set: RwLock<VersionSet>,
@@ -97,6 +99,7 @@ pub struct DB {
     /// (见 A-005 竞态).
     committed_sequence: AtomicU64,
     write_lock: Mutex<()>,
+    write_thread: write_thread::WriteThread,
     flush_lock: Mutex<()>,
     flush_shutdown: Arc<AtomicBool>,
     flush_handle: Mutex<Option<JoinHandle<()>>>,
@@ -111,21 +114,40 @@ pub struct DB {
     compaction_removal_listener: RwLock<Option<Arc<dyn CompactionRemovalListener>>>,
     checkpoint_in_progress: AtomicBool,
     block_cache: Arc<BlockCache>,
+    pub(crate) row_cache: Arc<RowCache>,
     pub(crate) snapshots: Arc<SnapshotList>,
-    /// Group commit: leader election mutex
-    group_commit_lock: Mutex<()>,
     /// Group commit: last synced sequence number (monotonic)
     group_commit_synced_seq: AtomicU64,
     /// L0 SSTable count for lock-free stall checks (F-050/051/054).
     /// Maintained atomically inside all `sstables.write()` critical sections.
     l0_sstable_count: AtomicUsize,
+    /// 全局写停顿状态原子标志: 仅当触发 L0/MemTable/LevelSize stall 时为 true.
+    /// 前台写路径通过 Relaxed 检查实现纳秒级短路, 消除正常写入下的全层读锁遍历开销.
+    write_stall_active: AtomicBool,
     pub(crate) stats: Arc<Statistics>,
 }
 
 impl DB {
+    /// 访问当前 DB 绑定的行级缓存句柄
+    pub fn row_cache(&self) -> &Arc<RowCache> {
+        &self.row_cache
+    }
+
     /// 访问当前 DB 实例绑定的无锁原子指标集合
     pub fn statistics(&self) -> Arc<Statistics> {
         Arc::clone(&self.stats)
+    }
+
+    /// 查询当前是否存在写停顿 (Write Stall)
+    #[inline(always)]
+    pub fn is_write_stall_active(&self) -> bool {
+        self.write_stall_active.load(AtomicOrdering::Relaxed)
+    }
+
+    /// 更新写停顿状态原子标志
+    pub(crate) fn set_write_stall_active(&self, active: bool) {
+        self.write_stall_active
+            .store(active, AtomicOrdering::Relaxed);
     }
 
     pub fn open(path: impl AsRef<Path>, options: Options) -> Result<Arc<Self>> {
@@ -280,7 +302,7 @@ impl DB {
 
         let db = Arc::new(DB {
             path,
-            options,
+            options: Arc::clone(&options),
             memtable: RwLock::new(memtable),
             immutable_memtables: RwLock::new(Vec::new()),
             wal: RwLock::new(wal),
@@ -290,6 +312,7 @@ impl DB {
             sequence: AtomicU64::new(last_sequence),
             committed_sequence: AtomicU64::new(last_sequence),
             write_lock: Mutex::new(()),
+            write_thread: write_thread::WriteThread::new(),
             flush_lock: Mutex::new(()),
             flush_shutdown: Arc::new(AtomicBool::new(false)),
             flush_handle: Mutex::new(None),
@@ -302,10 +325,11 @@ impl DB {
             compaction_removal_listener: RwLock::new(None),
             checkpoint_in_progress: AtomicBool::new(false),
             block_cache,
+            row_cache: Arc::new(RowCache::new(options.row_cache_size)),
             snapshots: SnapshotList::new(),
-            group_commit_lock: Mutex::new(()),
             group_commit_synced_seq: AtomicU64::new(0),
             l0_sstable_count: AtomicUsize::new(l0_sstable_count_init),
+            write_stall_active: AtomicBool::new(false),
             stats: Arc::clone(&stats),
         });
 
@@ -470,9 +494,10 @@ impl DB {
         self.block_cache.reset_stats()
     }
 
-    /// 清空 block cache 条目 (不重置统计).
+    /// 清空 block cache 与 row cache 条目 (不重置统计).
     pub fn clear_cache(&self) {
-        self.block_cache.clear()
+        self.block_cache.clear();
+        self.row_cache.clear();
     }
 
     /// 当前 block cache 占用字节.

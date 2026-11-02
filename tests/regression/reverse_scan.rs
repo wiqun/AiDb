@@ -103,3 +103,68 @@ fn reverse_scan_on_snapshot_ignores_later_writes() {
     let mut live = db.scan(None, None).unwrap();
     assert_eq!(collect_reverse(&mut live), keys(&[b"c", b"b"]));
 }
+
+/// 场景 (Issue #84): `scan_limited` 纯内存跳表反向有界扫描需处理多版本覆盖与尾部连续墓碑.
+/// 期望: 区间截断, `limit` 限制, 删除后重写及超 8 版本跳跃回退的结果与合并迭代器完全一致.
+#[test]
+fn test_scan_limited_reverse_in_memtable() {
+    let (_dir, db) = open_db();
+    for k in [b"a", b"b", b"c", b"d", b"e"] {
+        db.put(k, b"v").unwrap();
+    }
+    // 区间 [b, e) limit=2 reverse=true -> [d, c]
+    let res = db.scan_limited(Some(b"b"), Some(b"e"), 2, true).unwrap();
+    let res_keys: Vec<_> = res.into_iter().map(|(k, _)| k).collect();
+    assert_eq!(res_keys, keys(&[b"d", b"c"]));
+
+    // limit=1 -> [d]
+    let res = db.scan_limited(Some(b"b"), Some(b"e"), 1, true).unwrap();
+    let res_keys: Vec<_> = res.into_iter().map(|(k, _)| k).collect();
+    assert_eq!(res_keys, keys(&[b"d"]));
+
+    // 删除 d 后, 期望返回 [c, b]
+    db.delete(b"d").unwrap();
+    let res = db.scan_limited(Some(b"b"), Some(b"e"), 2, true).unwrap();
+    let res_keys: Vec<_> = res.into_iter().map(|(k, _)| k).collect();
+    assert_eq!(res_keys, keys(&[b"c", b"b"]));
+
+    // 重新 put d, 期望返回 [d, c]
+    db.put(b"d", b"v2").unwrap();
+    let res = db.scan_limited(Some(b"b"), Some(b"e"), 2, true).unwrap();
+    let res_keys: Vec<_> = res.into_iter().map(|(k, _)| k).collect();
+    assert_eq!(res_keys, keys(&[b"d", b"c"]));
+
+    // 单 key 超过 8 个版本 + 尾部大量墓碑, 验证链表回退与跳跃切换一致
+    for i in 0..12 {
+        db.put(b"c", format!("vc_{i}").as_bytes()).unwrap();
+    }
+    for i in 0..12 {
+        db.put(b"d", format!("vd_{i}").as_bytes()).unwrap();
+    }
+    db.delete(b"d").unwrap();
+    let res = db.scan_limited(Some(b"b"), Some(b"e"), 2, true).unwrap();
+    assert_eq!(
+        res,
+        vec![
+            (b"c".to_vec(), b"vc_11".to_vec()),
+            (b"b".to_vec(), b"v".to_vec())
+        ]
+    );
+}
+
+/// 场景 (Issue #84): 存在与查询区间不重叠的磁盘 SSTable 时, `scan_limited` 仍应命中纯内存跳表快速路径.
+/// 期望: 正确跳过 `m3` 墓碑并逆序返回 `[m2, m1]`.
+#[test]
+fn test_scan_limited_reverse_with_sst_and_non_overlapping_sst() {
+    let (_dir, db) = open_db();
+    db.put(b"a_sst", b"1").unwrap();
+    db.flush().unwrap();
+
+    for k in [b"m1", b"m2", b"m3"] {
+        db.put(k, b"v").unwrap();
+    }
+    db.delete(b"m3").unwrap();
+    let res = db.scan_limited(Some(b"m0"), Some(b"m9"), 2, true).unwrap();
+    let res_keys: Vec<_> = res.into_iter().map(|(k, _)| k).collect();
+    assert_eq!(res_keys, keys(&[b"m2", b"m1"]));
+}

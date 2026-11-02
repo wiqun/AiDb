@@ -20,15 +20,40 @@ fn last_sm_user_pair(
 
     let start = sm_key(group_id, start_user);
     let end = sm_key(group_id, end_user);
-    let mut iter = db.scan(Some(start.as_slice()), Some(end.as_slice()))?;
-    iter.seek_to_last();
-    let (Some(key), Some(value)) = (iter.key(), iter.value()) else {
-        return Ok(None);
-    };
-    let Some(user_key) = user_key_from_sm_key(group_id, key) else {
-        return Ok(None);
-    };
-    Ok(Some((user_key, value.to_vec())))
+    let pairs = db.scan_limited(Some(&start), Some(&end), 1, true)?;
+    for (k, v) in pairs {
+        if let Some(user_key) = user_key_from_sm_key(group_id, &k) {
+            return Ok(Some((user_key, v)));
+        }
+    }
+    Ok(None)
+}
+
+/// 半开用户 key 区间 `[start_user, end_user)` 内至多 `limit` 条, `reverse` 时从区间末尾向前取.
+/// 只读取需要的条数, 供有序索引 (如 ZSet score 索引) 的 TopN / 分页读取.
+pub fn scan_sm_user_pairs_limited(
+    db: &crate::DB,
+    group_id: u64,
+    start_user: &[u8],
+    end_user: &[u8],
+    limit: usize,
+    reverse: bool,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    use crate::cluster::storage::keys::{sm_key, user_key_from_sm_key};
+
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let start = sm_key(group_id, start_user);
+    let end = sm_key(group_id, end_user);
+    let pairs = db.scan_limited(Some(&start), Some(&end), limit, reverse)?;
+    let mut out = Vec::with_capacity(pairs.len());
+    for (k, v) in pairs {
+        if let Some(user_key) = user_key_from_sm_key(group_id, &k) {
+            out.push((user_key, v));
+        }
+    }
+    Ok(out)
 }
 
 /// 按用户 key 的半开区间读取 group 状态机. `end_user == None` 扫到该 group 末尾.
@@ -237,12 +262,17 @@ impl MultiRaftNode {
     }
 
     pub fn get_local_sync(&self, group_id: u64, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let node = self.groups.read().get(&group_id).cloned();
-        match node {
-            Some(node) => {
-                let storage = node.storage();
-                storage.get_state_machine_value(key)
-            }
+        let groups = self.groups.read();
+        match groups.get(&group_id) {
+            Some(node) => node.storage().get_state_machine_value(key),
+            None => Err(ClusterError::Raft(format!("group {group_id} not found locally")).into()),
+        }
+    }
+
+    pub fn get_local_bytes_sync(&self, group_id: u64, key: &[u8]) -> Result<Option<bytes::Bytes>> {
+        let groups = self.groups.read();
+        match groups.get(&group_id) {
+            Some(node) => node.storage().get_state_machine_bytes(key),
             None => Err(ClusterError::Raft(format!("group {group_id} not found locally")).into()),
         }
     }
@@ -253,6 +283,10 @@ impl MultiRaftNode {
     /// 状态机, 供数据面读路径 (leader 直读 / 只读副本) 使用.
     pub async fn get_local(&self, group_id: u64, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.get_local_sync(group_id, key)
+    }
+
+    pub async fn get_local_bytes(&self, group_id: u64, key: &[u8]) -> Result<Option<bytes::Bytes>> {
+        self.get_local_bytes_sync(group_id, key)
     }
 
     /// 本地各 group 引擎条目估值之和. 每个 group 有独立 DB, 直接读 SST 与 MemTable 计数, 不扫描.
@@ -303,6 +337,60 @@ impl MultiRaftNode {
             };
             match db {
                 Some(db) => last_sm_user_pair(&db, group_id, &start_user, &end_user),
+                None => {
+                    Err(ClusterError::Raft(format!("group {group_id} not found locally")).into())
+                }
+            }
+        })
+        .await
+        .map_err(|e| ClusterError::Internal(e.to_string()))?
+    }
+
+    /// 半开区间内至多 `limit` 条用户 key 记录 (`reverse` 时从末尾向前). 直接读本地状态机.
+    pub fn scan_local_user_pairs_limited_sync(
+        &self,
+        group_id: u64,
+        start_user: &[u8],
+        end_user: &[u8],
+        limit: usize,
+        reverse: bool,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let db = {
+            let storages = self.storages.read();
+            storages.get(&group_id).map(|storage| storage.db().clone())
+        };
+        match db {
+            Some(db) => {
+                scan_sm_user_pairs_limited(&db, group_id, start_user, end_user, limit, reverse)
+            }
+            None => Err(ClusterError::Raft(format!("group {group_id} not found locally")).into()),
+        }
+    }
+
+    /// `scan_local_user_pairs_limited_sync` 的异步版本, 在 `spawn_blocking` 中读取.
+    pub async fn scan_local_user_pairs_limited(
+        &self,
+        group_id: u64,
+        start_user: Vec<u8>,
+        end_user: Vec<u8>,
+        limit: usize,
+        reverse: bool,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let storages = Arc::clone(&self.storages);
+        tokio::task::spawn_blocking(move || {
+            let db = {
+                let guard = storages.read();
+                guard.get(&group_id).map(|storage| storage.db().clone())
+            };
+            match db {
+                Some(db) => scan_sm_user_pairs_limited(
+                    &db,
+                    group_id,
+                    &start_user,
+                    &end_user,
+                    limit,
+                    reverse,
+                ),
                 None => {
                     Err(ClusterError::Raft(format!("group {group_id} not found locally")).into())
                 }
@@ -478,7 +566,7 @@ impl MultiRaftNode {
 
 #[cfg(test)]
 mod tests {
-    use super::visit_sm_user_pairs;
+    use super::{scan_sm_user_pairs_limited, visit_sm_user_pairs};
     use crate::cluster::storage::{OpenRaftStorage, DEFAULT_GROUP_ID};
     use crate::cluster::types::ThinWriteBatch;
     use crate::config::Options;
@@ -524,5 +612,52 @@ mod tests {
         )
         .unwrap();
         assert_eq!(seen, 1);
+    }
+    #[test]
+    fn limited_scan_honours_limit_direction_and_bounds() {
+        let dir = TempDir::new().unwrap();
+        let db = DB::open(dir.path(), Options::for_testing()).unwrap();
+        let storage = OpenRaftStorage::new(db, DEFAULT_GROUP_ID, None).unwrap();
+        let mut batch = ThinWriteBatch::new();
+        for k in [b"p:a", b"p:b", b"p:c", b"p:d", b"p:e"] {
+            batch.put(k.to_vec(), k.to_vec());
+        }
+        batch.put(b"q:z".to_vec(), b"other".to_vec());
+        storage.apply_batch_to_sm(&batch).unwrap();
+        let keys = |pairs: Vec<(Vec<u8>, Vec<u8>)>| -> Vec<Vec<u8>> {
+            pairs.into_iter().map(|(k, _)| k).collect()
+        };
+        let scan = |start: &[u8], end: &[u8], limit: usize, reverse: bool| {
+            keys(
+                scan_sm_user_pairs_limited(
+                    storage.db(),
+                    DEFAULT_GROUP_ID,
+                    start,
+                    end,
+                    limit,
+                    reverse,
+                )
+                .unwrap(),
+            )
+        };
+
+        assert_eq!(
+            scan(b"p:", b"p;", 2, false),
+            vec![b"p:a".to_vec(), b"p:b".to_vec()]
+        );
+        assert_eq!(
+            scan(b"p:", b"p;", 2, true),
+            vec![b"p:e".to_vec(), b"p:d".to_vec()]
+        );
+        assert_eq!(
+            scan(b"p:b", b"p:d", 10, false),
+            vec![b"p:b".to_vec(), b"p:c".to_vec()]
+        );
+        assert_eq!(
+            scan(b"p:b", b"p:d", 10, true),
+            vec![b"p:c".to_vec(), b"p:b".to_vec()]
+        );
+        assert_eq!(scan(b"p:", b"p;", 0, false), Vec::<Vec<u8>>::new());
+        assert_eq!(scan(b"x:", b"x;", 5, true), Vec::<Vec<u8>>::new());
     }
 }

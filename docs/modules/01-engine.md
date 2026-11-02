@@ -45,7 +45,7 @@ description: AiDb 写路径 — WAL、MemTable、DB API、WriteBatch、MVCC 快�
 ## 关键 invariant (勿破坏)
 
 - **写顺序**: WAL append **先于** MemTable 写入 (`put`/`delete`/`delete_range`/`write` 均如此).
-- **写临界区**: `put`/`delete`/`delete_range`/`write` 在 `write_lock` 内完成序号分配, WAL 追加, MemTable 插入与 `committed_sequence` 推进; `sync_wal` 的 fsync 等待在锁外 (组提交). 因此写入在插入后即对 `iter`/`scan`/`snapshot` 可见; 若 fsync 失败, 调用方收到 `Err` 但写入已可见.
+- **写入协作 (WriteThread Group Commit)**: 废除前台全局写排队锁, 采用 WriteThread Group 批量合并写入机制. Leader 批量分配全局连续 sequence 并单次合并追加 WAL (带 64KB 用户态缓冲); 随后由 Leader 在内存中统一顺序写入 MemTable, 彻底消除 Followers 多次 futex 挂起唤醒开销与 Leader 自旋空转; 全部完成后原子推进 `committed_sequence` 并按需 sync WAL, 最后一次性唤醒等待的 Followers.
 - **Sequence**: 合法范围 `[1, 2^56)`; `alloc_sequence` 与 `check_sequence` 双重校验; overflow → `Error::InvalidState`.
 - **User key**: 非空; 空 key → `Error::InvalidArgument`. `write` 在分配序号与写 WAL 之前整批校验, 含非法 key 的批次整体失败且不留前缀.
 - **单进程**: 数据目录 `LOCK` 文件 + `fs2` 独占锁; 多进程打开 → `Error::Busy`.
@@ -60,17 +60,21 @@ description: AiDb 写路径 — WAL、MemTable、DB API、WriteBatch、MVCC 快�
 ### 写入 (put / write)
 
 ```mermaid
-flowchart LR
-    W[check_write_stall] --> L[write_lock]
-    L --> S[alloc_sequence]
-    S --> WAL[WAL append]
-    WAL --> MT[MemTable put/delete]
-    MT --> CM[committed 推进]
-    CM --> UL[解锁]
-    UL --> SY[sync 等待 组提交]
-    SY --> F{memtable_size?}
-    F -->|yes| FR[freeze → immutable]
-    FR --> BG[后台 flush 线程]
+flowchart TD
+    W[检查写停顿] --> Q[加入 WriteThread 无锁队列]
+    Q --> E{竞选 Leader}
+    E -->|成功 Leader| L1[批量分配连续 sequence]
+    L1 --> L2[单次合并追加 WAL 缓冲区]
+    L2 --> L3[Leader 统一顺序写入 MemTable]
+    E -->|等待 Follower| P[park 挂起等待 Leader 批处理]
+    L3 --> C[原子推进 committed_sequence]
+    C --> U[一次性唤醒所有 Followers]
+    P -.->|被唤醒| R
+    U --> S{是否需要 sync_wal}
+    S -->|是| SY[单次 sync WAL]
+    S -->|否| F[检查是否需要 freeze MemTable]
+    SY --> F
+    F --> R[返回客户端]
 ```
 
 ### 打开 (open + recover)
