@@ -7,7 +7,7 @@ use std::sync::Arc;
 use crossbeam_skiplist::map::Entry;
 use crossbeam_skiplist::SkipMap;
 
-use super::key_bytes::InternalKeyBytes;
+use super::key_bytes::{InternalKeyBytes, InternalKeySlice};
 use super::rep::MemTableRep;
 
 /// 可跨迭代器共享的 SkipMap 句柄: 迭代器持有它即可在不持有 MemTable 锁的情况下惰性定位.
@@ -50,7 +50,7 @@ impl MemTableRep for SkipMapRep {
 
     fn lower_bound(
         &self,
-        bound: Bound<&InternalKeyBytes>,
+        bound: Bound<&InternalKeySlice>,
     ) -> Option<Entry<'_, InternalKeyBytes, Arc<[u8]>>> {
         self.map.lower_bound(bound)
     }

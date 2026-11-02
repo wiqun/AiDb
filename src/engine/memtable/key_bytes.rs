@@ -20,9 +20,39 @@ impl AsRef<[u8]> for InternalKeyBytes {
     }
 }
 
-impl Borrow<[u8]> for InternalKeyBytes {
-    fn borrow(&self) -> &[u8] {
-        &self.0
+#[repr(transparent)]
+pub(crate) struct InternalKeySlice([u8]);
+
+impl InternalKeySlice {
+    pub(crate) fn from_slice(bytes: &[u8]) -> &Self {
+        // SAFETY: InternalKeySlice is #[repr(transparent)] over [u8]
+        unsafe { &*(bytes as *const [u8] as *const Self) }
+    }
+}
+
+impl Borrow<InternalKeySlice> for InternalKeyBytes {
+    fn borrow(&self) -> &InternalKeySlice {
+        InternalKeySlice::from_slice(&self.0)
+    }
+}
+
+impl PartialEq for InternalKeySlice {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for InternalKeySlice {}
+
+impl PartialOrd for InternalKeySlice {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for InternalKeySlice {
+    fn cmp(&self, other: &Self) -> Ordering {
+        compare_internal_key(&self.0, &other.0)
     }
 }
 

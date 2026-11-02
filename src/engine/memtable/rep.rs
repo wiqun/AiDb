@@ -5,7 +5,7 @@
 use std::ops::Bound;
 use std::sync::Arc;
 
-use super::key_bytes::InternalKeyBytes;
+use super::key_bytes::{InternalKeyBytes, InternalKeySlice};
 
 /// 抽象 MemTable 底层存储 (对应 RocksDB MemTableRepFactory).
 pub(crate) trait MemTableRep {
@@ -15,7 +15,7 @@ pub(crate) trait MemTableRep {
         Self: 'a;
 
     fn insert(&self, key: InternalKeyBytes, value: Arc<[u8]>);
-    fn lower_bound(&self, bound: Bound<&InternalKeyBytes>) -> Option<Self::EntryRef<'_>>;
+    fn lower_bound(&self, bound: Bound<&InternalKeySlice>) -> Option<Self::EntryRef<'_>>;
     fn front(&self) -> Option<Self::EntryRef<'_>>;
     fn back(&self) -> Option<Self::EntryRef<'_>>;
 

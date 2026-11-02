@@ -132,4 +132,30 @@ fn test_scan_limited_reverse_in_memtable() {
     let res = db.scan_limited(Some(b"b"), Some(b"e"), 2, true).unwrap();
     let res_keys: Vec<_> = res.into_iter().map(|(k, _)| k).collect();
     assert_eq!(res_keys, keys(&[b"d", b"c"]));
+
+    // 单 key 超过 8 个版本 + 尾部大量墓碑, 验证链表回退与跳跃切换一致
+    for i in 0..12 {
+        db.put(b"c", format!("vc_{i}").as_bytes()).unwrap();
+    }
+    for i in 0..12 {
+        db.put(b"d", format!("vd_{i}").as_bytes()).unwrap();
+    }
+    db.delete(b"d").unwrap();
+    let res = db.scan_limited(Some(b"b"), Some(b"e"), 2, true).unwrap();
+    assert_eq!(res, vec![(b"c".to_vec(), b"vc_11".to_vec()), (b"b".to_vec(), b"v".to_vec())]);
+}
+
+#[test]
+fn test_scan_limited_reverse_with_sst_and_non_overlapping_sst() {
+    let (_dir, db) = open_db();
+    db.put(b"a_sst", b"1").unwrap();
+    db.flush().unwrap();
+
+    for k in [b"m1", b"m2", b"m3"] {
+        db.put(k, b"v").unwrap();
+    }
+    db.delete(b"m3").unwrap();
+    let res = db.scan_limited(Some(b"m0"), Some(b"m9"), 2, true).unwrap();
+    let res_keys: Vec<_> = res.into_iter().map(|(k, _)| k).collect();
+    assert_eq!(res_keys, keys(&[b"m2", b"m1"]));
 }

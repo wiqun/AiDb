@@ -14,11 +14,11 @@
 //! - freeze 后不可再写入, 新写入进入新的 active MemTable.
 
 use super::internal_key::{
-    check_sequence, encode_internal_key, encode_internal_key_arc, extract_sequence,
+    check_sequence, encode_internal_key_arc, encode_internal_key_buffered, extract_sequence,
     extract_user_key, extract_value_type, ValueType, K_MAX_SEQUENCE,
 };
 use super::iterator::MemTableIterator;
-use super::key_bytes::InternalKeyBytes;
+use super::key_bytes::{InternalKeyBytes, InternalKeySlice};
 use super::range_tombstone::{max_covering_range_tombstone_seq, RangeTombstoneRecord};
 use super::rep::MemTableRep;
 use super::skiplist_rep::SkipMapRep;
@@ -194,9 +194,12 @@ impl MemTable {
 
     /// 同 user_key 在 `max_seq` 下的 point 状态 (不含 range tombstone 覆盖判定).
     pub fn point_state(&self, key: &[u8], max_seq: u64) -> Result<PointState> {
-        let seek_key = encode_internal_key(key, max_seq, ValueType::TypePut);
-        let bound = InternalKeyBytes::from_slice(&seek_key);
-        let Some(entry) = self.rep.lower_bound(Bound::Included(&bound)) else {
+        let Some(entry) =
+            encode_internal_key_buffered(key, max_seq, ValueType::TypePut, |seek_key| {
+                self.rep
+                    .lower_bound(Bound::Included(InternalKeySlice::from_slice(seek_key)))
+            })
+        else {
             return Ok(PointState::Absent);
         };
         let ik = entry.key().as_ref();
@@ -232,8 +235,11 @@ impl MemTable {
     }
 
     pub fn get(&self, key: &[u8], snapshot_seq: u64) -> Result<Option<Vec<u8>>> {
-        let seek_key = encode_internal_key(key, snapshot_seq, ValueType::TypePut);
-        match self.search(&seek_key)? {
+        let found =
+            encode_internal_key_buffered(key, snapshot_seq, ValueType::TypePut, |seek_key| {
+                self.search(seek_key)
+            })?;
+        match found {
             Some((value, ValueType::TypePut)) => {
                 tracing::debug!(target: "mem", "mem.get.hit");
                 Ok(Some(value.as_ref().to_vec()))
@@ -250,8 +256,8 @@ impl MemTable {
     }
 
     pub fn search(&self, seek_key: &[u8]) -> Result<Option<(Arc<[u8]>, ValueType)>> {
-        let bound = InternalKeyBytes::from_slice(seek_key);
-        let Some(entry) = self.rep.lower_bound(Bound::Included(&bound)) else {
+        let bound = InternalKeySlice::from_slice(seek_key);
+        let Some(entry) = self.rep.lower_bound(Bound::Included(bound)) else {
             return Ok(None);
         };
         let entry_key = entry.key().as_ref();
@@ -270,8 +276,11 @@ impl MemTable {
     /// 检查 key 是否存在 (不拷贝 value).
     /// 内部调用 `search()`, 仅返回 bool.
     pub fn contains_key(&self, key: &[u8], snapshot_seq: u64) -> Result<bool> {
-        let seek_key = encode_internal_key(key, snapshot_seq, ValueType::TypePut);
-        match self.search(&seek_key)? {
+        let found =
+            encode_internal_key_buffered(key, snapshot_seq, ValueType::TypePut, |seek_key| {
+                self.search(seek_key)
+            })?;
+        match found {
             Some((_, ValueType::TypePut)) => Ok(true),
             _ => Ok(false),
         }

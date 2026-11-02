@@ -14,7 +14,7 @@ pub use internal_key::{
     ValueType, K_MAX_SEQUENCE, K_TYPE_SEEK, SEQUENCE_LIMIT,
 };
 pub use iterator::MemTableIterator;
-pub(crate) use key_bytes::InternalKeyBytes;
+pub(crate) use key_bytes::{InternalKeyBytes, InternalKeySlice};
 pub use range_tombstone::{
     max_covering_range_tombstone_seq, range_covers, range_overlaps, RangeTombstoneRecord,
 };
