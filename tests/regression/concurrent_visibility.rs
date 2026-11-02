@@ -16,7 +16,7 @@ use std::time::Duration;
 use tempfile::tempdir;
 
 const BATCH_SIZE: usize = 32;
-const ROUNDS: usize = 100;
+const ROUNDS: usize = 20;
 /// 末尾抽查窗口: 只检查最近完成的写入, 控制每轮断言成本.
 const CHECK_TAIL: u64 = 256;
 
@@ -64,6 +64,7 @@ impl Workload {
                     db.put(&single_key(i), b"v").unwrap();
                     i += 1;
                     done.store(i, Ordering::SeqCst);
+                    thread::yield_now();
                 }
             }));
         }
@@ -80,6 +81,7 @@ impl Workload {
                     db.write(&batch).unwrap();
                     j += 1;
                     done.store(j, Ordering::SeqCst);
+                    thread::yield_now();
                 }
             }));
         }

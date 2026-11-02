@@ -44,6 +44,7 @@ jobs:
   # 默认 feature 的全量测试 (与 lint 串行: 通过才值得跑测试)
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     needs: lint
     steps:
       - uses: actions/checkout@v4
@@ -57,6 +58,7 @@ jobs:
   # cluster + monitoring feature, 与默认 feature 并行独立
   test-cluster:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
