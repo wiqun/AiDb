@@ -39,7 +39,8 @@ impl WriteBatch {
         let start = start.into();
         let end = end.into();
         self.approximate_size += start.len() + end.len();
-        self.operations.push_back(WriteOp::DeleteRange { start, end });
+        self.operations
+            .push_back(WriteOp::DeleteRange { start, end });
     }
 
     pub fn len(&self) -> usize {

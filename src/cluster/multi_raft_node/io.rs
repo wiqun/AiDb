@@ -43,35 +43,16 @@ pub fn scan_sm_user_pairs_limited(
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
     use crate::cluster::storage::keys::{sm_key, user_key_from_sm_key};
 
-    let mut out = Vec::new();
     if limit == 0 {
-        return Ok(out);
+        return Ok(Vec::new());
     }
     let start = sm_key(group_id, start_user);
     let end = sm_key(group_id, end_user);
-    let mut iter = db.scan(Some(start.as_slice()), Some(end.as_slice()))?;
-    if reverse {
-        iter.seek_to_last();
-        while out.len() < limit {
-            let (Some(key), Some(value)) = (iter.key(), iter.value()) else {
-                break;
-            };
-            if let Some(user_key) = user_key_from_sm_key(group_id, key) {
-                out.push((user_key, value.to_vec()));
-            }
-            if !iter.prev() {
-                break;
-            }
-        }
-        return Ok(out);
-    }
-    for item in iter {
-        let (k, v) = item?;
+    let pairs = db.scan_limited(Some(&start), Some(&end), limit, reverse)?;
+    let mut out = Vec::with_capacity(pairs.len());
+    for (k, v) in pairs {
         if let Some(user_key) = user_key_from_sm_key(group_id, &k) {
             out.push((user_key, v));
-        }
-        if out.len() >= limit {
-            break;
         }
     }
     Ok(out)

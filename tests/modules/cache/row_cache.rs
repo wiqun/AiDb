@@ -1,8 +1,8 @@
 //! @component aidb-cache
 //! RowCache 分片并发 LRU 缓存与写提交失效测试
 
-use std::sync::Arc;
 use bytes::Bytes;
+use std::sync::Arc;
 use tempfile::tempdir;
 
 use aidb::config::Options;

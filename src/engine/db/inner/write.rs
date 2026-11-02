@@ -3,12 +3,12 @@
 //! 写顺序不变量 (见 `mod.rs` # Invariant): WAL append 先于 MemTable 写入.
 //! 冻结逻辑 (`maybe_freeze` / `wait_for_memtable_slot`) 也在此维护.
 
+use super::write_thread::{
+    WriteGroupStatus, Writer, STATE_COMPLETED, STATE_FAILED, STATE_MEMTABLE_DONE,
+};
 use super::{
     Arc, AtomicOrdering, CompactionPicker, Duration, Error, MemTable, OpType, Result, WalEntry,
     WriteBatch, WriteOp, DB, SEQUENCE_LIMIT,
-};
-use super::write_thread::{
-    WriteGroupStatus, Writer, STATE_COMPLETED, STATE_FAILED, STATE_MEMTABLE_DONE,
 };
 use crate::statistics::{DbOp, WriteStallKind};
 
@@ -478,8 +478,8 @@ impl DB {
                 }
 
                 // 如果任何一个写入者请求 sync WAL, 则执行 sync
-                let need_sync = self.options.sync_wal
-                    || group.iter().any(|&w_ptr| unsafe { (*w_ptr).sync });
+                let need_sync =
+                    self.options.sync_wal || group.iter().any(|&w_ptr| unsafe { (*w_ptr).sync });
                 if need_sync && self.options.use_wal {
                     let mut wal = self.wal.write();
                     if let Err(e) = wal.sync() {
@@ -499,7 +499,9 @@ impl DB {
             WriteGroupStatus::FollowerMemtable(seq) => {
                 let b = unsafe { &*writer.batch };
                 self.insert_batch_to_memtable(b, seq)?;
-                writer.state.store(STATE_MEMTABLE_DONE, AtomicOrdering::Release);
+                writer
+                    .state
+                    .store(STATE_MEMTABLE_DONE, AtomicOrdering::Release);
 
                 while writer.state.load(AtomicOrdering::Acquire) != STATE_COMPLETED {
                     if writer.state.load(AtomicOrdering::Acquire) == STATE_FAILED {
@@ -585,7 +587,9 @@ impl DB {
             &mut *mem,
             MemTable::new_with_stats(Some(Arc::clone(&self.stats))),
         );
-        self.immutable_memtables.write().push(Arc::new(old.freeze(flush_seq)));
+        self.immutable_memtables
+            .write()
+            .push(Arc::new(old.freeze(flush_seq)));
         Ok(())
     }
 }

@@ -7,8 +7,12 @@ use super::{
     encode_internal_key_buffered, extract_sequence, AtomicOrdering, DbIterGuard, Error, MemTable,
     PinnableSlice, PointState, Result, SSTableReader, Snapshot, ValueType, DB,
 };
-use crate::engine::memtable::{max_covering_range_tombstone_seq, RangeTombstoneRecord};
+use crate::engine::memtable::{
+    encode_internal_key, extract_user_key, extract_value_type, max_covering_range_tombstone_seq,
+    InternalKeyBytes, RangeTombstoneRecord, SharedSkipMap, K_MAX_SEQUENCE,
+};
 use crate::statistics::DbOp;
+use std::ops::Bound;
 use std::sync::Arc;
 
 impl DB {
@@ -326,6 +330,63 @@ impl DB {
             Some(Arc::clone(&self.stats)),
         ))
     }
+
+    /// 有界范围扫描: 优先命中单层纯内存跳表快路径, 避免构造完整 DBIterator 及墓碑多版本归并放大.
+    pub fn scan_limited(
+        &self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        limit: usize,
+        reverse: bool,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.check_not_closed()?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let seq = self.committed_sequence.load(AtomicOrdering::SeqCst);
+        let (is_pure_mem, shared_map) = {
+            let mem = self.memtable.read();
+            let imm = self.immutable_memtables.read();
+            let sst = self.sstables.read();
+            let pure =
+                imm.is_empty() && sst.iter().all(|l| l.is_empty()) && !mem.has_range_tombstones();
+            (pure, mem.rep().shared_map())
+        };
+
+        if is_pure_mem && !reverse {
+            return Ok(scan_memtable_limited_forward(
+                &shared_map,
+                seq,
+                start,
+                end,
+                limit,
+            ));
+        }
+
+        let mut iter = self.scan(start, end)?;
+        let mut out = Vec::with_capacity(limit.min(4096));
+        if reverse {
+            iter.seek_to_last();
+            while out.len() < limit {
+                let (Some(key), Some(value)) = (iter.key(), iter.value()) else {
+                    break;
+                };
+                out.push((key.to_vec(), value.to_vec()));
+                if !iter.prev() {
+                    break;
+                }
+            }
+            return Ok(out);
+        }
+        for item in iter {
+            let (key, value) = item?;
+            out.push((key, value));
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
 }
 
 pub(super) fn min_sequence_in_memtable(mt: &MemTable) -> Option<u64> {
@@ -365,6 +426,58 @@ fn user_key_in_sstable_range(user_key: &[u8], smallest: &[u8], largest: &[u8]) -
     let s_user = &smallest[..smallest.len() - 8];
     let l_user = &largest[..largest.len() - 8];
     user_key >= s_user && user_key <= l_user
+}
+
+/// 纯 MemTable 单层极速正向有界扫描: 零多路归并抽象、零墓碑多版本堆分配、一路跳表链表前进.
+fn scan_memtable_limited_forward(
+    map: &SharedSkipMap,
+    committed_seq: u64,
+    start: Option<&[u8]>,
+    end: Option<&[u8]>,
+    limit: usize,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut out = Vec::with_capacity(limit.min(4096));
+    let mut entry = match start {
+        Some(s) => {
+            let encoded = encode_internal_key(s, K_MAX_SEQUENCE, ValueType::TypePut);
+            let seek = InternalKeyBytes::from_slice(&encoded);
+            map.lower_bound(Bound::Included(&seek))
+        }
+        None => map.front(),
+    };
+    let mut last_user_key = Vec::new();
+    let mut has_last = false;
+    while let Some(e) = entry {
+        let internal_key = e.key().as_ref();
+        let user_key = extract_user_key(internal_key);
+        if end.is_some_and(|end| user_key >= end) {
+            break;
+        }
+        if has_last && last_user_key.as_slice() == user_key {
+            entry = e.next();
+            continue;
+        }
+        let Ok(seq) = extract_sequence(internal_key) else {
+            entry = e.next();
+            continue;
+        };
+        if seq > committed_seq {
+            entry = e.next();
+            continue;
+        }
+        has_last = true;
+        last_user_key.clear();
+        last_user_key.extend_from_slice(user_key);
+        let vtype = extract_value_type(internal_key).unwrap_or(ValueType::TypeDelete);
+        if vtype == ValueType::TypePut {
+            out.push((user_key.to_vec(), e.value().to_vec()));
+            if out.len() >= limit {
+                break;
+            }
+        }
+        entry = e.next();
+    }
+    out
 }
 
 #[cfg(test)]

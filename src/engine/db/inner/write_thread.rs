@@ -1,11 +1,11 @@
 //! WriteThread: 基于无锁队列与 Leader-Follower 协作状态机的高性能 Group Commit 写入管线.
 //! 依据 ADR-006: 彻底废除写路径单核互斥锁, 实现动态 WAL 批量合并与全核心无锁 MemTable 并发写入.
 
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::time::Duration;
 use crossbeam::queue::SegQueue;
 use crossbeam::sync::{Parker, Unparker};
 use parking_lot::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::Duration;
 
 use crate::engine::db::WriteBatch;
 use crate::error::Result;

@@ -1,8 +1,8 @@
 //! PinnableSlice: 零拷贝或共享所有权的字节切片封装 (ADR-007).
 //! 对应 RocksDB PinnableSlice, 消除点查路径中高频的堆内存分配与数据克隆.
 
-use std::ops::Deref;
 use bytes::Bytes;
+use std::ops::Deref;
 
 /// 零拷贝或共享所有权的切片借用封装 (对应 RocksDB PinnableSlice).
 #[derive(Debug, Clone)]

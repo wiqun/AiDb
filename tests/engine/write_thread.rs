@@ -1,10 +1,10 @@
 //! WriteThread Leader-Follower Group Commit 并发协作测试
 //! @component aidb-engine
 
+use crossbeam::sync::Parker;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use crossbeam::sync::Parker;
 
 use aidb::engine::db::write_thread::{
     WriteGroupStatus, WriteThread, Writer, STATE_COMPLETED, STATE_MEMTABLE, STATE_MEMTABLE_DONE,
@@ -36,7 +36,10 @@ fn test_write_thread_concurrency_group_commit() {
 
             let mut writer = Box::new(Writer::new(&batch, unparker, true, false));
 
-            match wt.join_batch_group(&mut writer, &parker).expect("join group") {
+            match wt
+                .join_batch_group(&mut writer, &parker)
+                .expect("join group")
+            {
                 WriteGroupStatus::Leader(leader) => {
                     let group = &leader.group;
                     leaders.fetch_add(1, Ordering::Relaxed);
@@ -72,7 +75,10 @@ fn test_write_thread_concurrency_group_commit() {
                     completed.fetch_add(1, Ordering::Relaxed);
                 }
                 WriteGroupStatus::FollowerMemtable(seq) => {
-                    assert!(seq >= 1000, "Follower 必须获取到 Leader 分配的自增 sequence");
+                    assert!(
+                        seq >= 1000,
+                        "Follower 必须获取到 Leader 分配的自增 sequence"
+                    );
                     // 模拟 Follower 插入 MemTable 完成
                     writer.state.store(STATE_MEMTABLE_DONE, Ordering::Release);
 

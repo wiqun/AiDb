@@ -485,7 +485,10 @@ impl OpenRaftStorage {
 
     pub fn get_state_machine_bytes(&self, user_key: &[u8]) -> Result<Option<bytes::Bytes>> {
         let key = sm_key(self.group_id, user_key);
-        let pinned = self.db.get_pinned(&key).map_err(|e| Error::Cluster(map_db_err(e)))?;
+        let pinned = self
+            .db
+            .get_pinned(&key)
+            .map_err(|e| Error::Cluster(map_db_err(e)))?;
         Ok(pinned.map(|p| p.into_bytes()))
     }
 
