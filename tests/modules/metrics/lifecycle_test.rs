@@ -1,3 +1,5 @@
+//! @component aidb-metrics
+
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tempfile::TempDir;

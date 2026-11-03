@@ -6,7 +6,9 @@ use aidb::DB;
 use std::sync::Arc;
 use tempfile::tempdir;
 
-/// 验证 Compaction 压实后 0 字节空 Value 的记录不被误剔除
+/// bug: Compaction 阶段若将 0 字节空 Value 误判为删除标记, 会导致合法空记录被误剔除.
+/// 期望: 压实后 0 字节空 Value 记录正常保留, `get` 返回 `Some(vec![])`.
+/// Issue: #24
 #[test]
 fn regression_empty_value_not_removed_by_compaction() {
     let dir = tempdir().unwrap();

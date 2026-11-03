@@ -116,6 +116,17 @@ flowchart LR
 cargo test --test span_contract -- --test-threads=1
 ```
 
+### Target "perf" 微秒级插桩日志
+
+针对写提交, Group Commit 与 Raft propose 等性能敏感路径, 采用 `tracing::debug!(target: "perf", ...)` 提供微秒级精度耗时插桩:
+- 默认日志级别下不产生开销;
+- 诊断调优时可在日志过滤器中指定 `RUST_LOG=perf=debug` 独立输出微秒级耗时指标, 避免全量 debug 带来的 I/O 干扰.
+
+### 键数量估值与集群响应契约
+
+- **`estimate_entry_count`**: 由已打开 SSTable 的 `num_entries` 与活跃/不可变 MemTable 的 `entry_count` 之和组成, 涵盖历史多版本与 Tombstone, 供宿主应用 `DBSIZE` 与 INFO `keys_estimate` 纳秒级获取近似键数量, 避免全库扫描.
+- **`Response::Ok`**: 集群数据面写操作 (`Put`, `Delete`, `WriteBatch`, `MigrationWrite`) apply 成功时统一返回 `Response::Ok`, 杜绝在 apply 内部二次执行存在性读检查.
+
 ## 常见任务
 
 ### 宿主应用绑定 MeterProvider 并导出指标

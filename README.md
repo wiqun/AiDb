@@ -5,22 +5,24 @@
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#许可证)
 [![CI Status](https://img.shields.io/badge/CI-passing-brightgreen.svg)](.github/workflows/ci.yml)
 
-> **AiDb** 是一个纯 Rust 实现的高性能、轻量级**嵌入式 LSM-Tree 键值存储引擎库** (lib crate).
+> **AiDb** 是一个纯 Rust 实现的高性能, 轻量级**嵌入式 LSM-Tree 键值存储引擎库** (lib crate).
 > 既可作为单机应用内嵌的零依赖 KV 存储, 也可通过 Cargo Feature 开启基于 Raft 的分布式集群能力.
 
 ## 为什么开发 AiDb (Why AiDb?)
 
 - **摆脱传统 C/C++ 引擎的包袱与 FFI 痛点**: RocksDB, LevelDB 等为兼容各方历史需求愈发庞大厚重; 引入 C++ FFI 亦带来跨平台编译负担与内存安全盲区.
-- **弥补纯 Rust 生产级与分布式存储空白**: 现有纯 Rust 方案多偏向教学原型或局限于单机, 缺乏完善的 Compaction 机制、MVCC 快照与向分布式共识平滑扩展的能力.
-- **发挥 Rust 现代语言优势**: 结合内存安全与无畏并发, 打造轻量纯粹、零 C/C++ 依赖、兼具单机极简内嵌与 Raft 集群扩展的现代化 LSM 存储底座.
+- **弥补纯 Rust 生产级与分布式存储空白**: 现有纯 Rust 方案多偏向教学原型或局限于单机, 缺乏完善的 Compaction 机制, MVCC 快照与向分布式共识平滑扩展的能力.
+- **发挥 Rust 现代语言优势**: 结合内存安全与无畏并发, 打造轻量纯粹, 零 C/C++ 依赖, 兼具单机极简内嵌与 Raft 集群扩展的现代化 LSM 存储底座.
 
 ## 核心亮点 (Key Highlights)
 
-- **Pure Rust 实现**: 内存安全、性能高效、跨平台开箱即用.
-- **LSM 存储引擎**: WAL + SkipMap + Leveled Compaction 分层存储, 结合 Bloom Filter 与 LRU Block Cache 降低读写放大.
-- **存储原语支持事务**: 支持原子批量写 (`WriteBatch`)、MVCC 快照读 (`Snapshot`) 及目录级 Checkpoint.
-- **原生分布式共识**: 基于 OpenRaft 实现 MetaRaft + MultiRaft, 内置 16384 槽路由与在线迁移.
-- **高度模块化设计**: 核心引擎零外部可选依赖; 集群、备份、压缩与监控等能力均通过 Cargo Feature 解耦.
+- **Pure Rust 实现**: 内存安全, 性能高效, 跨平台开箱即用.
+- **高性能写入流水线**: WriteThread Leader-Follower Group Commit 组提交, 64KB 用户态缓冲区合并追加 WAL, 批量原子推进 Sequence 并唤醒等待线程, 消除单核排队锁.
+- **分层 LSM 与两级缓存**: WAL + SkipMap + Leveled Compaction, 配合 32 分片并发 LRU RowCache 与 16 分片 BlockCache, 支持 `PinnableSlice` 零拷贝读取与 Bloom Filter 快速过滤.
+- **纯内存跳表原生有界扫描**: `scan_limited` 在纯内存状态下直调原生跳表迭代器, 绕过 `DBIterator` 归并堆分配.
+- **存储原语支持事务**: 支持原子批量写 (`WriteBatch`), MVCC 快照读 (`Snapshot`) 及目录级 Checkpoint.
+- **原生分布式共识**: 基于 OpenRaft 实现 MetaRaft + MultiRaft, 内置 16384 槽路由与在线迁移; 状态机 Apply 支持 `write_without_wal` 免二次 WAL.
+- **高度模块化设计**: 核心引擎零外部可选依赖; 集群, 备份, 压缩与监控等能力均通过 Cargo Feature 解耦.
 - **云原生可观测性**: 指标由宿主经 OpenTelemetry 导出 (`aidb_*`). span 只允许 `db_flush`, `cmp_run`, `raft_propose`, 采样关闭时不创建.
 
 ## 架构概览 (Architecture at a Glance)
@@ -32,19 +34,21 @@ flowchart TB
     end
 
     subgraph API [公共接口 aidb::*]
-        DB[DB 同步 API]
+        DB[DB 同步 API / PinnableSlice]
         Batch[WriteBatch]
         Snap[Snapshot MVCC]
         Opts[Options]
     end
 
     subgraph Engine [核心 LSM 存储引擎 始终编译]
-        WAL[WAL 预写日志]
+        WT[WriteThread Group Commit]
+        WAL[WAL 预写日志 64KB 缓冲]
         MT[MemTable SkipMap]
+        RC[RowCache 32分片 LRU]
         SST[SSTable 分层存储]
         Comp[Leveled Compaction]
         Filter[Bloom Filter]
-        Cache[LRU BlockCache]
+        Cache[LRU BlockCache 16分片]
     end
 
     subgraph Extensions [可选功能模块 Cargo Features]
@@ -55,11 +59,17 @@ flowchart TB
     end
 
     Consumer --> API
+    API --> WT
+    WT --> WAL
+    WT --> MT
+    API --> RC
+    API --> Snap
     API --> Engine
     WAL --> MT --> SST
     Comp --> SST
     Filter --> SST
     Cache --> SST
+    RC -.-> MT
     Extensions -.-> Engine
 ```
 
@@ -100,8 +110,8 @@ fn main() -> aidb::Result<()> {
 
 | 示例场景 | 源码入口 | 包含能力 | 运行命令 |
 | --- | --- | --- | --- |
-| **基础与进阶操作** | [`examples/basic.rs`](examples/basic.rs) | CRUD、`WriteBatch` 批量写、`scan` 范围扫描、MVCC `Snapshot` 快照 | `cargo run --example basic` |
-| **备份与恢复** | [`examples/backup.rs`](examples/backup.rs) | 目录快照创建、校验和验证与数据恢复 | `cargo run --example backup` |
+| **基础与进阶操作** | [`examples/basic.rs`](examples/basic.rs) | CRUD, `WriteBatch` 批量写, `scan` 范围扫描, MVCC `Snapshot` 快照 | `cargo run --example basic` |
+| **备份与恢复** | [`examples/backup.rs`](examples/backup.rs) | 目录快照创建, 校验和验证与数据恢复 | `cargo run --example backup` |
 | **分布式集群路由** | [`examples/cluster.rs`](examples/cluster.rs) | 16384 Slot 槽位计算与 Hash Tag 路由演示 | `cargo run --features cluster --example cluster` |
 
 详细说明见 [examples/README.md](examples/README.md).
@@ -110,10 +120,10 @@ fn main() -> aidb::Result<()> {
 
 | Feature | 默认状态 | 核心能力 | 依赖与说明 |
 | --- | --- | --- | --- |
-| `default` | 包含 `backup` | LSM 核心存储引擎 (WAL、MemTable、SSTable、Compaction、MVCC 快照) | 零额外外部环境依赖 |
-| `backup` | 默认启用 | 全量数据备份、校验和生成与数据恢复 (`BackupManager` / `RecoveryManager`) | 基于 `ring` / `hex` / `serde_json` |
+| `default` | 包含 `backup` | LSM 核心存储引擎 (WAL, MemTable, SSTable, Compaction, MVCC 快照) | 零额外外部环境依赖 |
+| `backup` | 默认启用 | 全量数据备份, 校验和生成与数据恢复 (`BackupManager` / `RecoveryManager`) | 基于 `ring` / `hex` / `serde_json` |
 | `compression` | 按需开启 | SSTable Data Block 块级压缩 (支持 Snap 与 LZ4) | 启用时 `Options` 默认使用 Snap 压缩 |
-| `cluster` | 按需开启 | MetaRaft 控制面 + MultiRaft 数据面 (16384 Slot 路由、在线迁移、gRPC 分发) | 基于 `openraft` / `tonic`, 构建需 `protoc` |
+| `cluster` | 按需开启 | MetaRaft 控制面 + MultiRaft 数据面 (16384 Slot 路由, 在线迁移, gRPC 分发) | 基于 `openraft` / `tonic`, 构建需 `protoc` |
 | `monitoring` | 按需开启 | OpenTelemetry 指标埋点 (`aidb_*`) 与 Tracing 链路上下文注入 | 宿主应用设置 global `MeterProvider` 后经 OTLP 导出 |
 
 构建与 Feature 详细配置见 [docs/deployment.md](docs/deployment.md).
@@ -154,10 +164,10 @@ cargo bench --bench backup_bench
 
 | 文档分类 | 入口文件 | 适用场景与内容 |
 | --- | --- | --- |
-| **系统架构** | [ARCHITECTURE.md](ARCHITECTURE.md) | LSM 读写分层、Leveled Compaction 机制、MultiRaft 拓扑与数据流 |
+| **系统架构** | [ARCHITECTURE.md](ARCHITECTURE.md) | LSM 读写分层, Leveled Compaction 机制, MultiRaft 拓扑与数据流 |
 | **设计决策** | [docs/design.md](docs/design.md) | 关键技术选型与跨模块架构权衡 (Trade-offs) |
-| **开发与贡献** | [CONTRIBUTING.md](CONTRIBUTING.md) | Git Hooks、CI 门禁、完整测试矩阵、回归测试规范与 PR 流程 |
-| **部署与运维** | [docs/deployment.md](docs/deployment.md) | Feature 组合构建、嵌入指南、数据目录规范与参数调优 |
+| **开发与贡献** | [CONTRIBUTING.md](CONTRIBUTING.md) | Git Hooks, CI 门禁, 完整测试矩阵, 回归测试规范与 PR 流程 |
+| **部署与运维** | [docs/deployment.md](docs/deployment.md) | Feature 组合构建, 嵌入指南, 数据目录规范与参数调优 |
 | **模块详解** | [docs/modules/](docs/modules/) | 各子模块深入实现 (WAL, MemTable, SSTable, Cluster, Backup, Metrics) |
 | **版本记录** | [CHANGELOG.md](CHANGELOG.md) | 历史版本与发布变更记录 |
 

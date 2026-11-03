@@ -13,7 +13,7 @@
 
 - `InternalKeySlice` 零分配跳表定位与 `consume_memtable_group_backward` 链表优先反向回退: 引入 `#[repr(transparent)] InternalKeySlice([u8])` 统一委托 `compare_internal_key`, 消除 `MemTable::search` / `get` / `point_state` / `scan_limited` 的 `Arc<[u8]>` 堆分配; 反向有界扫描在同 key 版本数不超过 8 时直接沿 `prev()` 顺序回退, 超长版本组自动切换 `upper_bound` 跳跃, 并完善 `scan_limited` 的 `sst_overlaps` 区间判定与 `DBIterator::new_unpositioned` 构造.
 - `scan_memtable_limited_backward`: 实现纯内存跳表原生有界反向扫描与快速跳跃, 状态机 `last_sm_user_pair` 接入, 反向遍历耗时由 122µs 降至 3.45µs.
-- `DB::scan_limited` 与 `scan_memtable_limited_forward`: 新增纯内存跳表单向链表遍历原生有界扫描快路径, 消除跳表重复二分查找、堆内存分配与墓碑多版本归并读放大; 集群状态机 `scan_sm_user_pairs_limited` 全面接入该快路径, 使消费队列 `ZRANGEBYSCORE` 单次扫描耗时从 1.78ms 降低至 200µs 以内.
+- `DB::scan_limited` 与 `scan_memtable_limited_forward`: 新增纯内存跳表单向链表遍历原生有界扫描快路径, 消除跳表重复二分查找, 堆内存分配与墓碑多版本归并读放大; 集群状态机 `scan_sm_user_pairs_limited` 全面接入该快路径, 使消费队列 `ZRANGEBYSCORE` 单次扫描耗时从 1.78ms 降低至 200µs 以内.
 
 ### Fixed
 
