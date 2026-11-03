@@ -575,6 +575,24 @@ impl OpenRaftNode {
         self.raft.metrics().borrow_watched().current_leader
     }
 
+    /// 触发将当前 Group 的领导权转移给目标节点 `to`.
+    pub async fn transfer_leader(&self, to: NodeId) -> Result<()> {
+        self.raft
+            .trigger()
+            .transfer_leader(to)
+            .await
+            .map_err(|e| Error::Cluster(ClusterError::Raft(e.to_string())))
+    }
+
+    /// 触发本节点发起选举 (pre_vote: 是否先执行预投票).
+    pub async fn elect(&self, pre_vote: bool) -> Result<()> {
+        self.raft
+            .trigger()
+            .elect(pre_vote)
+            .await
+            .map_err(|e| Error::Cluster(ClusterError::Raft(e.to_string())))
+    }
+
     pub async fn metrics(&self) -> RaftMetrics<TypeConfig> {
         self.raft.metrics().borrow_watched().clone()
     }

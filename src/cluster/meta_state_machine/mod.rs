@@ -181,6 +181,12 @@ impl MetaStateMachine {
         *self.slot_table.write() = table;
     }
 
+    /// Directly set cluster meta (for testing).
+    /// Skips Raft consensus — only use in test scenarios.
+    pub fn set_cluster_meta_for_testing(&self, meta: ClusterMeta) {
+        *self.cluster_meta.write() = meta;
+    }
+
     pub fn validate_meta_request(&self, request: &MetaRequest) -> MetaSmResult<()> {
         let cluster_meta = self.cluster_meta.read();
         let slot_table = self.slot_table.read();

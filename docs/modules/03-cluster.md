@@ -57,8 +57,8 @@ flowchart TB
 | `cluster/meta_types.rs` | `ClusterMeta`, `SlotTable`, `MetaRequest`, `METARAFT_GROUP_ID=0` | `MetaRequest::*`, `SLOT_COUNT=16384` |
 | `cluster/meta_state_machine/` | Meta 状态机: 校验 + Apply → 元数据 KV | `mod.rs::apply_meta_request`, `validate.rs`, `apply.rs` |
 | `cluster/meta_raft_node.rs` | 控制平面 Raft 节点封装 | `new`, `initialize`, `propose`, `start_server_with_dispatcher` |
-| `cluster/node.rs` | 通用 OpenRaft 节点包装 | `new_with_storage`, `propose`, `change_membership`, `get` |
-| `cluster/multi_raft_node/` | 数据面编排总入口 | `lifecycle.rs::start`, `io.rs::propose_key` / `get_local` |
+| `cluster/node.rs` | 通用 OpenRaft 节点包装 | `new_with_storage`, `propose`, `change_membership`, `transfer_leader`, `elect`, `get` |
+| `cluster/multi_raft_node/` | 数据面编排总入口 | `lifecycle.rs::start`, `io.rs::propose_key` / `transfer_group_leader` / `elect_group_leader` |
 | `cluster/router.rs` | 16384 槽路由计算与映射表 | `key_to_slot`, `route_key`, `refresh_from_data`, `group_ops` |
 | `cluster/sharded_storage.rs` | 每 Group 独立 DB 实例管理 | `ShardedStorage::open` |
 | `cluster/storage/mod.rs` | OpenRaftStorage 存储适配层根 | `OpenRaftStorage` |

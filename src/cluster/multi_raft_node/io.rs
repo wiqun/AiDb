@@ -544,6 +544,33 @@ impl MultiRaftNode {
         }
     }
 
+    /// 触发指定数据 Group 将领导权转移给目标节点 `to`.
+    pub async fn transfer_group_leader(&self, group_id: u64, to: NodeId) -> Result<()> {
+        let group = self.groups.read().get(&group_id).cloned();
+        match group {
+            Some(node) => node.transfer_leader(to).await,
+            None => Err(ClusterError::Raft(format!("group {} not found locally", group_id)).into()),
+        }
+    }
+
+    /// 触发指定数据 Group 发起选举 (pre_vote: 是否先执行预投票).
+    pub async fn elect_group_leader(&self, group_id: u64, pre_vote: bool) -> Result<()> {
+        let group = self.groups.read().get(&group_id).cloned();
+        match group {
+            Some(node) => node.elect(pre_vote).await,
+            None => Err(ClusterError::Raft(format!("group {} not found locally", group_id)).into()),
+        }
+    }
+
+    /// 查询本地指定数据 Group 是否当前为 Leader.
+    pub async fn is_group_leader(&self, group_id: u64) -> Result<bool> {
+        let group = self.groups.read().get(&group_id).cloned();
+        match group {
+            Some(node) => Ok(node.is_leader().await),
+            None => Err(ClusterError::Raft(format!("group {} not found locally", group_id)).into()),
+        }
+    }
+
     /// 关闭所有资源.
     pub async fn shutdown(&self) {
         // 发送关闭信号给 lifecycle task
