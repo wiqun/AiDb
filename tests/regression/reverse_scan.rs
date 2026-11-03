@@ -35,6 +35,7 @@ fn keys(list: &[&[u8]]) -> Vec<Vec<u8>> {
 
 /// bug: `DBIterator::seek_to_last` 忽略 `end_key`, 反向范围扫描会从 `end` 之后的 key 开始返回,
 /// 期望: `scan([b, d))` 的 `seek_to_last` 定位到 `c`, 逆序结果为 `[c, b]`, 与内存表或 SST 位置无关.
+/// Issue: #85 (LSM 纯内存跳表原生有界正反向扫描)
 #[test]
 fn reverse_seek_to_last_respects_end_bound_in_memtable() {
     let (_dir, db) = open_db();
@@ -47,6 +48,7 @@ fn reverse_seek_to_last_respects_end_bound_in_memtable() {
 
 /// bug: 同上, 数据位于 SST 时 `seek_to_last` 同样忽略 `end_key`.
 /// 期望: flush 后 `scan([b, d))` 反向结果仍为 `[c, b]`.
+/// Issue: #85 (LSM 纯内存跳表原生有界正反向扫描)
 #[test]
 fn reverse_seek_to_last_respects_end_bound_in_sst() {
     let (_dir, db) = open_db();
@@ -60,6 +62,7 @@ fn reverse_seek_to_last_respects_end_bound_in_sst() {
 
 /// bug: 反向遍历不遵守 `start` 下界, `prev` 会越过 `start` 返回更小的 key.
 /// 期望: `scan([b, e))` 反向只返回 `[d, c, b]`, 不返回 `a`; memtable 与 SST 混合布局下一致.
+/// Issue: #85 (LSM 纯内存跳表原生有界正反向扫描)
 #[test]
 fn reverse_walk_respects_start_bound_across_layers() {
     let (_dir, db) = open_db();

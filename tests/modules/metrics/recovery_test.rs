@@ -1,3 +1,5 @@
+//! @component aidb-metrics
+
 use tempfile::TempDir;
 
 use aidb::config::Options;

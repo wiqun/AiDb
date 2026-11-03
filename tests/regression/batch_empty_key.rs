@@ -13,7 +13,7 @@ use tempfile::tempdir;
 /// 前缀已写入 MemTable 但 `committed_sequence` 不推进, 之后任一写入推进边界都会把前缀暴露出来,
 /// 且重开库后前缀仍可能从 WAL 回放.
 /// 期望: 空 key 批次返回错误, 前缀 key 不可见 (包括 `get`, `scan`, 重开库后), 后续写入不暴露前缀.
-/// Issue: 待补 (未提供编号)
+/// Issue: #28 (WriteBatch 空 key 边界防护)
 #[test]
 fn batch_with_empty_key_leaves_no_prefix_effect() {
     let dir = tempdir().unwrap();

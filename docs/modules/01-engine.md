@@ -1,6 +1,6 @@
 ---
 name: aidb-engine
-description: AiDb 写路径 — WAL、MemTable、DB API、WriteBatch、MVCC 快照、崩溃恢复. 改 src/engine/{wal,memtable,db}、排查 put/get 写路径、WAL 回放、MemTable 冻结或 Snapshot 读时读本文.
+description: AiDb 写路径 — WAL, MemTable, DB API, WriteBatch, MVCC 快照, 崩溃恢复. 改 src/engine/{wal,memtable,db}, 排查 put/get 写路径, WAL 回放, MemTable 冻结或 Snapshot 读时读本文.
 ---
 
 # AiDb Engine (写路径)
@@ -8,7 +8,7 @@ description: AiDb 写路径 — WAL、MemTable、DB API、WriteBatch、MVCC 快�
 ## 何时读本文
 
 - 改 `engine/wal`, `engine/memtable`, `engine/db` 或 `DB::*` 公共 API
-- 排查写路径、WAL 恢复、MemTable freeze、WriteBatch 原子性、Snapshot 读
+- 排查写路径, WAL 恢复, MemTable freeze, WriteBatch 原子性, Snapshot 读
 - **不覆盖**: SSTable 布局 / compaction / Bloom / BlockCache / checkpoint → [engine-storage.md](02-engine-storage.md)
 - **不覆盖**: 分布式共识与 Raft 日志适配 → [cluster.md](03-cluster.md)
 
@@ -52,7 +52,8 @@ description: AiDb 写路径 — WAL、MemTable、DB API、WriteBatch、MVCC 快�
 - **Batch 崩溃原子性**: recover 时 `BatchStart` 标记不完整 batch 整批丢弃; 单条 put/delete 无 BatchStart.
 - **MemTable freeze**: `freeze(self)` 消费可变表; `flush_seq` = 冻结时刻 sequence.
 - **Snapshot 创建**: 在 `write_lock` 下读 sequence 并注册 `SnapshotList` (register 必须发生在释放锁之前); Drop 时 unregister. Compaction 读取 `min_snapshot_sequence()` 时同样短暂持有 `write_lock`, 与 snapshot 创建之间形成 happens-before, 避免读到"seq 已确定但尚未 register"的中间态.
-- **iter/scan 可见边界**: `iter`/`scan` 以创建时刻的 `committed_sequence` 为可见上界, 与 `Snapshot` 一致 (`get` 仍用 `sequence`, 见已知限制); 迭代器惰性持有 MemTable 的 SkipMap 句柄, 迭代期间的新写入 (seq 大于边界) 不可见. 逆序遍历 (`seek_to_last`/`prev`) 以 `end` 为上界、以 `start` 为下界, 且按 user key 取组内最新可见版本再判定删除与 range tombstone.
+- **iter/scan 可见边界**: `iter`/`scan` 以创建时刻的 `committed_sequence` 为可见上界, 与 `Snapshot` 一致 (`get` 仍用 `sequence`, 见已知限制); 迭代器惰性持有 MemTable 的 SkipMap 句柄, 迭代期间的新写入 (seq 大于边界) 不可见. 逆序遍历 (`seek_to_last`/`prev`) 以 `end` 为上界, 以 `start` 为下界, 且按 user key 取组内最新可见版本再判定删除与 range tombstone.
+- **纯内存原生有界扫描 (scan_limited)**: 在 `is_pure_mem` (尚未 Flush 且无 L0 SSTable) 场景下, `scan_limited` 直调底层 `SkipMapRep` 的原生迭代器 (`scan_memtable_limited_forward`/`scan_memtable_limited_backward`), 绕过通用 `DBIterator` 归并堆分配与版本过滤, 支持正逆向快速截断.
 - **delete_range**: O(1) 写入 MemTable RangeTombstone 与 WAL `TypeRangeDelete`, 非扫 key 逐条删除.
 
 ## 数据流
@@ -129,10 +130,12 @@ SSTable / VersionSet 细节见 [engine-storage.md](02-engine-storage.md).
 | `estimate_entry_count() -> u64` | SST `num_entries` 与 MemTable `entry_count` 之和, 含旧版本和墓碑 |
 | `delete(key)` | 单条删; 分配连续 sequence |
 | `get(key)` | 读取最新可见版本 |
+| `get_pinned(key) -> Result<Option<PinnableSlice>>` | 点查零拷贝接口; 命中 RowCache 时直接返回 `PinnableSlice::Shared` |
 | `key_exists(key)` | 完整存在性判定 (mem→imm→SST); 不物化 Value |
 | `delete_range(start, end)` | RangeTombstone O(1) 写入; 记 WAL + memtable `put_range_delete` |
 | `snapshot()` | 创建 MVCC 点快照 |
 | `iter()` / `scan(range)` | 全表或范围迭代 (见 invariant) |
+| `scan_limited(range, limit, reverse)` | 原生有界正反向扫描; `is_pure_mem` 时快速直出 |
 | `flush()` / `close()` | 手动 flush; 优雅关闭 (停线程 → flush → WAL sync) |
 
 ### Snapshot

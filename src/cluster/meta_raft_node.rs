@@ -200,6 +200,11 @@ impl MetaRaftNode {
         self.state_machine.set_slot_table(table);
     }
 
+    /// Directly set cluster meta (for testing).
+    pub fn set_cluster_meta_for_testing(&self, meta: crate::cluster::meta_types::ClusterMeta) {
+        self.state_machine.set_cluster_meta_for_testing(meta);
+    }
+
     pub fn get_migration_state(&self) -> Option<crate::cluster::meta_types::SlotMigrationState> {
         self.state_machine.get_migration_state()
     }

@@ -38,8 +38,8 @@ flowchart TB
     end
 
     subgraph Engine [核心 LSM 存储引擎 始终编译]
-        WP[写路径: WALManager + MemTable SkipMap]
-        PS[持久化: SSTable + Bloom Filter + LRU BlockCache]
+        WP[写路径: WriteThread Group Commit + WALManager + MemTable SkipMap]
+        PS[持久化与缓存: SSTable + Bloom Filter + RowCache + LRU BlockCache]
         CPK[后台整理: Leveled Compaction + VersionSet / MANIFEST]
     end
 
@@ -81,7 +81,7 @@ aidb/src/
 │   ├── sstable/     # SSTable 磁盘布局、Data/Index Block 与读路径
 │   ├── compaction/  # Leveled Compaction 策略与 VersionSet / MANIFEST
 │   ├── filter/      # Bloom Filter 过滤器实现
-│   ├── cache/       # 16 分片 LRU BlockCache
+│   ├── cache/       # 32 分片并发 LRU RowCache (ADR-007) 与 16 分片 LRU BlockCache
 │   └── checkpoint/  # 目录级一致性硬链接快照
 ├── cluster/         # MetaRaft + MultiRaft 分布式共识 (feature = "cluster")
 ├── backup/          # 全量备份与数据恢复 (feature = "backup")
@@ -96,44 +96,50 @@ aidb/src/
 
 ```mermaid
 flowchart LR
-    W[1. Write Stall 检查] --> L[2. 获取写锁与分配 Sequence]
-    L --> WAL[3. WAL 追加 Record 分片]
-    WAL --> MT[4. 写入活跃 MemTable]
-    MT --> F{5. 内存超阈值?}
-    F -->|是| FR[6. Freeze 为 Immutable]
-    FR --> BG[7. 异步 Flush 写入 L0 SST]
-    F -->|否| OK[8. 写入完成]
+    W[1. Write Stall 检查] --> WT[2. 加入 WriteThread 队列组建 Group]
+    WT --> L[3. Leader 统一分配 Sequence 并单次合并追加 WAL]
+    L --> MT[4. 写入活跃 MemTable SkipMap]
+    MT --> CS[5. 原子推进 committed_sequence 并唤醒 Followers]
+    CS --> F{6. 内存超阈值?}
+    F -->|是| FR[7. Freeze 为 Immutable]
+    FR --> BG[8. 异步 Flush 写入 L0 SST]
+    F -->|否| OK[9. 写入完成]
     BG --> OK
 ```
 
 1. **背压检查 (Write Stall)**: 检查当前 L0 SSTable 文件数与积压的 Immutable MemTable 数量, 超过阈值时主动延迟写入以保护系统内存.
-2. **原子分配 (Sequence)**: 获取排他写入锁, 按 batch 操作数原子递增全局 `SequenceNumber`.
-3. **WAL 追加 (WALManager)**: 将 `WriteBatch` 序列化为带 CRC32 校验和的分片 Record, 顺序追加至当前 WAL 文件.
-4. **MemTable 写入**: 将带 Sequence 的 `InternalKey` 写入基于 `crossbeam-skiplist` 的并发 SkipMap.
-5. **冻结与异步 Flush**: 当 MemTable 大小达到 `write_buffer_size` 阈值时, 转为不可变的 Immutable MemTable, 并唤醒后台 Flush 线程将其转化为 L0 SSTable 落盘.
+2. **协作组建 (WriteThread Group Commit)**: 依据 ADR-006 彻底废除写路径前台单核排队锁, 并发写入请求加入 `WriteThread` 无锁队列, 自动产生单个 Leader 聚合 Followers 构成批处理 Group.
+3. **批量分配与 WAL 合并追加**: Leader 一次性分配整个 Group 连续的全局 `SequenceNumber`, 并在 WAL 64KB 用户态缓冲区中单次合并编码与写入 (根据各请求配置决定是否 `sync`), 消除单条 Record 的频繁系统调用与堆分配开销.
+4. **MemTable 写入**: 由 Leader 在内存中统一向基于 `crossbeam-skiplist` 的并发 SkipMap 追加写入, 消除 Followers 多次 futex 挂起唤醒开销与 Leader 自旋空转.
+5. **原子推进与一次性唤醒**: 全部写入完成后, Leader 原子推进 `committed_sequence`, 并一次性唤醒等待的 Followers (`publish_follower_state(w_ptr, STATE_COMPLETED)`).
+6. **冻结与异步 Flush**: 当 MemTable 大小达到 `write_buffer_size` 阈值时, 转为不可变的 Immutable MemTable, 并唤醒后台 Flush 线程将其转化为 L0 SSTable 落盘.
 
 ### 4.2 读取与 MVCC 检索 (Read Pipeline & MVCC)
 
 ```mermaid
 flowchart TD
-    Req[1. 读请求 get / scan] --> Seq[2. 锁定一致性 Snapshot Sequence]
-    Seq --> MT1[3. 检索 Active MemTable]
-    MT1 -->|命中且非删除| Ret[返回 Value]
+    Req[1. 读请求 get / get_pinned / scan] --> Seq[2. 锁定一致性 Snapshot Sequence]
+    Seq --> RC{3. 命中 32 分片并发 LRU RowCache?}
+    RC -->|Cache Hit| RetPinned[零拷贝返回 PinnableSlice / Value]
+    RC -->|Cache Miss| MT1[4. 检索 Active MemTable]
+    MT1 -->|命中且非删除| FillRC[回填 RowCache 并返回]
     MT1 -->|命中 Tombstone| None[返回 None / Key 不存在]
-    MT1 -->|未命中| MT2[4. 依次检索 Immutable MemTables 新到旧]
-    MT2 -->|命中| Ret
-    MT2 -->|未命中| L0[5. 检索 L0 SSTables Bloom Filter 过滤]
-    L0 -->|命中| Ret
-    L0 -->|未命中| L1[6. L1~Ln SSTables 二分定位 SST 文件]
-    L1 --> Cache{7. 查 LRU BlockCache?}
+    MT1 -->|未命中| MT2[5. 依次检索 Immutable MemTables 新到旧]
+    MT2 -->|命中| FillRC
+    MT2 -->|未命中| L0[6. 检索 L0 SSTables Bloom Filter 过滤]
+    L0 -->|命中| FillRC
+    L0 -->|未命中| L1[7. L1~Ln SSTables 二分定位 SST 文件]
+    L1 --> Cache{8. 查 16 分片 LRU BlockCache?}
     Cache -->|Cache Hit| BlockRead[读取 Block 解码]
     Cache -->|Cache Miss| DiskRead[磁盘 IO 读块 + 块压缩解压]
     DiskRead --> BlockRead
-    BlockRead -->|查找到对应 Sequence| Ret
+    BlockRead -->|查找到对应 Sequence| FillRC
     BlockRead -->|遍历完分层仍未命中| None
+    FillRC --> RetPinned
 ```
 
-- **多级短路检索**: 严格遵循从新到旧的内存与分层顺序, 任一层命中且为有效 Value 时立即返回, 命中删除标记 (Tombstone) 时立即短路返回 `None`.
+- **两级缓存体系 (RowCache + BlockCache)**: 点查优先直查 32 分片并发 LRU RowCache (ADR-007), 消除全局锁竞争, 命中时经 `get_pinned` 零拷贝借用 `PinnableSlice::Shared(Bytes)` 纳秒级直出; 穿透至底层 LSM 查出后自动回填 RowCache; 写提交路径与范围删除自动使相关缓存失效.
+- **纯内存跳表原生有界正反向扫描**: 当无 SST 重叠且无 range tombstones 时判定为 `is_pure_mem`, `scan_limited` 直接在 SkipMap 上双向跳转定位 (`scan_memtable_limited_forward` / `scan_memtable_limited_backward`), 消除多版本归并与 DBIterator 堆分配.
 - **读放大控制**: L0 利用 Bloom Filter 快速排除无关文件; L1~Ln 因同层 Key 严格不重叠, 可通过二分查找精准定位单个 SSTable 并结合 16 分片 LRU BlockCache 减少物理 IO.
 
 ### 4.3 后台 Compaction 机制 (Compaction Lifecycle)
@@ -215,7 +221,9 @@ flowchart TB
   - **MetaRaft (gid=0)**: 负责集群元数据共识, 维护节点注册表、Group 分配表、16384 Slot 路由表与在线迁移状态机.
   - **MultiRaft (gid≥1)**: 数据分片按 Group 独立运行 Raft 状态机, 每个 Group 拥有独立的 `ShardedStorage` 与 Group DB 存储目录 (`data/group_{gid}/`).
 - **路由计算**: 内置标准 CRC16 算法 (支持 `{...}` Hash Tag 提取), 将 Key 映射为 `0..16383` Slot 编号, 由 `Router` 定位所属 Group 并发起 Raft 提案.
-- **网络分发**: 统一通过单端口 gRPC 服务暴露, `RaftServiceDispatcher` 依据 RPC 请求内的 `group_id` 精准分发至对应的 MetaRaftNode 或 MultiRaftNode.
+- **LogCommitter 异步批量 I/O 与自适应 Drain**: MultiRaft 数据面引入专职 `LogCommitter` 异步 actor 聚合 Log 追加并保序 flush; 配合 `PendingLogOverlay` 消除磁盘 I/O 乱序并提供未落盘 Log 内存直读; 采用自适应非阻塞 drain 消除组提交锁争抢.
+- **状态机 Apply 消除第 2 个 WAL**: OpenRaft 已提交的 Log Entry 在落入状态机 (SM) 时直接调用 `db.write_without_wal`, 彻底废除底层 LSM 的第 2 个 WAL 写盘, 消除 50% 冗余磁盘 I/O.
+- **网络分发**: 统一通过单端口 gRPC 服务暴露, `RaftServiceDispatcher` 依据 RPC 请求内的 `group_id` 精准分发至对应的 MetaRaftNode 或 MultiRaftNode; 引入 `failpoint` 故障注入框架 (feature `cluster-test-util`) 支持确定性网络故障模拟.
 
 ### 4.6 在线槽位迁移数据流 (Online Slot Migration Pipeline)
 

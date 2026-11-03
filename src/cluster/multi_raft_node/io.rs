@@ -544,6 +544,33 @@ impl MultiRaftNode {
         }
     }
 
+    /// 触发指定数据 Group 将领导权转移给目标节点 `to`.
+    pub async fn transfer_group_leader(&self, group_id: u64, to: NodeId) -> Result<()> {
+        let group = self.groups.read().get(&group_id).cloned();
+        match group {
+            Some(node) => node.transfer_leader(to).await,
+            None => Err(ClusterError::Raft(format!("group {} not found locally", group_id)).into()),
+        }
+    }
+
+    /// 触发指定数据 Group 发起选举 (pre_vote: 是否先执行预投票).
+    pub async fn elect_group_leader(&self, group_id: u64, pre_vote: bool) -> Result<()> {
+        let group = self.groups.read().get(&group_id).cloned();
+        match group {
+            Some(node) => node.elect(pre_vote).await,
+            None => Err(ClusterError::Raft(format!("group {} not found locally", group_id)).into()),
+        }
+    }
+
+    /// 查询本地指定数据 Group 是否当前为 Leader.
+    pub async fn is_group_leader(&self, group_id: u64) -> Result<bool> {
+        let group = self.groups.read().get(&group_id).cloned();
+        match group {
+            Some(node) => Ok(node.is_leader().await),
+            None => Err(ClusterError::Raft(format!("group {} not found locally", group_id)).into()),
+        }
+    }
+
     /// 关闭所有资源.
     pub async fn shutdown(&self) {
         // 发送关闭信号给 lifecycle task
@@ -580,8 +607,8 @@ mod tests {
         let storage = OpenRaftStorage::new(db, DEFAULT_GROUP_ID, None).unwrap();
         let mut batch = ThinWriteBatch::new();
         batch.put(b"key:1".to_vec(), b"a".to_vec());
-        batch.put(b"KvDoc:a".to_vec(), b"b".to_vec());
-        batch.put(b"KvDoc:b".to_vec(), b"c".to_vec());
+        batch.put(b"doc:a".to_vec(), b"b".to_vec());
+        batch.put(b"doc:b".to_vec(), b"c".to_vec());
         batch.put(b"zzz".to_vec(), b"d".to_vec());
         storage.apply_batch_to_sm(&batch).unwrap();
 
@@ -589,22 +616,22 @@ mod tests {
         visit_sm_user_pairs(
             storage.db(),
             DEFAULT_GROUP_ID,
-            b"KvDoc:",
-            Some(b"KvDoc;"),
+            b"doc:",
+            Some(b"doc;"),
             |key, _| {
                 keys.push(key);
                 true
             },
         )
         .unwrap();
-        assert_eq!(keys, vec![b"KvDoc:a".to_vec(), b"KvDoc:b".to_vec()]);
+        assert_eq!(keys, vec![b"doc:a".to_vec(), b"doc:b".to_vec()]);
 
         let mut seen = 0usize;
         visit_sm_user_pairs(
             storage.db(),
             DEFAULT_GROUP_ID,
-            b"KvDoc:",
-            Some(b"KvDoc;"),
+            b"doc:",
+            Some(b"doc;"),
             |_, _| {
                 seen += 1;
                 false

@@ -57,8 +57,8 @@ flowchart TB
 | `cluster/meta_types.rs` | `ClusterMeta`, `SlotTable`, `MetaRequest`, `METARAFT_GROUP_ID=0` | `MetaRequest::*`, `SLOT_COUNT=16384` |
 | `cluster/meta_state_machine/` | Meta 状态机: 校验 + Apply → 元数据 KV | `mod.rs::apply_meta_request`, `validate.rs`, `apply.rs` |
 | `cluster/meta_raft_node.rs` | 控制平面 Raft 节点封装 | `new`, `initialize`, `propose`, `start_server_with_dispatcher` |
-| `cluster/node.rs` | 通用 OpenRaft 节点包装 | `new_with_storage`, `propose`, `change_membership`, `get` |
-| `cluster/multi_raft_node/` | 数据面编排总入口 | `lifecycle.rs::start`, `io.rs::propose_key` / `get_local` |
+| `cluster/node.rs` | 通用 OpenRaft 节点包装 | `new_with_storage`, `propose`, `change_membership`, `transfer_leader`, `elect`, `get` |
+| `cluster/multi_raft_node/` | 数据面编排总入口 | `lifecycle.rs::start`, `io.rs::propose_key` / `transfer_group_leader` / `elect_group_leader` |
 | `cluster/router.rs` | 16384 槽路由计算与映射表 | `key_to_slot`, `route_key`, `refresh_from_data`, `group_ops` |
 | `cluster/sharded_storage.rs` | 每 Group 独立 DB 实例管理 | `ShardedStorage::open` |
 | `cluster/storage/mod.rs` | OpenRaftStorage 存储适配层根 | `OpenRaftStorage` |
@@ -90,11 +90,14 @@ flowchart TB
 
 - 数据 Group 的用户 Key 在 apply 时写入 `sm_key(group_id, user_key)` (`storage/apply.rs`).
 - Meta / Membership / Blank entry 保持独立 WriteBatch 原子写入.
-- **连续的 Normal data entry 合并为单个 WriteBatch, 一次性写入 SM + `last_applied`** (`apply_entries_internal` 批量合并优化).
+- **连续的 Normal data entry 合并为单个 WriteBatch, 通过 `db.write_without_wal` 一次性写入 SM + `last_applied`**, 彻底消除底层 LSM 存储引擎的第 2 个 WAL 写盘开销.
 
 ## 关键 invariant (勿破坏)
 
 - **WAL 强制开启**: Raft 模式要求 `db.use_wal() == true`, 否则报 `ClusterError::InvalidConfig`.
+- **LogCommitter 与 PendingLogOverlay**: MultiRaft 数据面日志写入由 `LogCommitter` 异步批量 I/O actor 调度并自适应非阻塞 drain, 配合 `PendingLogOverlay` 消除磁盘乱序并提供未落盘 Log 内存直读.
+- **状态机 Apply 消除第 2 个 WAL**: OpenRaft 提交日志落盘状态机时调用 `db.write_without_wal`, 杜绝二次 WAL 重复写盘.
+- **FailPoint 故障注入**: feature = `cluster-test-util` 下编译 `cluster/failpoint.rs`, 支持在 RPC 分发, LeaseRead 与日志提交点注入确定性故障.
 - **Group ID 语义**: `0` = MetaRaft 控制面; 数据 Group ≥ `1` (`DEFAULT_GROUP_ID = 1`).
 - **Slot 总数固定**: 严格为 `16384`; `Unallocated` 槽位调用 `route_slot` 返回 `InvalidState`.
 - **Request 序列化**: 避免使用 adjacently tagged serde (受限于 rmp_serde 与 openraft `Entry` 限制).

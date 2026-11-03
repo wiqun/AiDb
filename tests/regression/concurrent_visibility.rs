@@ -136,7 +136,7 @@ fn assert_completed_visible(keys: &BTreeSet<Vec<u8>>, done_s: u64, done_b: u64) 
 /// `committed_sequence`; 此时创建的快照只见批次不见该 `put`, 其后 `put` 插入 (序号低于快照边界) 会使
 /// 同一快照的扫描结果发生变化 (迟到插入).
 /// 期望: 同一快照两次扫描结果一致; 创建快照前已返回的写入全部可见; 批次要么全部可见要么全部不可见.
-/// Issue: 待补 (未提供编号)
+/// Issue: #85 (并发可见性与 Sequence 边界推进)
 #[test]
 fn snapshot_scan_is_stable_under_concurrent_put_and_batch() {
     let (_dir, db) = open_db();
@@ -180,7 +180,7 @@ fn snapshot_scan_is_stable_under_concurrent_put_and_batch() {
 /// bug: `iter` / `scan` 以已分配的 `sequence` 为可见上界, 而 `WriteBatch` 在写锁内逐条插入 MemTable,
 /// 并发迭代器可能只看到批次的一部分; 单 key `put` 未插入时也可能被更高序号的批次边界越过.
 /// 期望: 迭代器输出中每个批次要么完整要么不可见; 创建迭代器前已返回的写入必须可见.
-/// Issue: 待补 (未提供编号)
+/// Issue: #85 (并发可见性与 Sequence 边界推进)
 #[test]
 fn scan_sees_whole_batches_and_completed_writes_under_concurrency() {
     let (_dir, db) = open_db();

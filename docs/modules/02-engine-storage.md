@@ -1,6 +1,6 @@
 ---
 name: aidb-engine-storage
-description: AiDb 持久化层 — SSTable 布局、层级 compaction、布隆过滤器、块缓存、目录 checkpoint. 改 src/engine/{sstable,compaction,filter,cache,checkpoint}、排查 flush/compaction/读放大、MANIFEST/VersionSet 或 Checkpoint::create 时读本文.
+description: AiDb 持久化层 — SSTable 布局, 层级 compaction, 布隆过滤器, 块缓存, 目录 checkpoint. 改 src/engine/{sstable,compaction,filter,cache,checkpoint}, 排查 flush/compaction/读放大, MANIFEST/VersionSet 或 Checkpoint::create 时读本文.
 ---
 
 # AiDb Engine Storage (持久化层)
@@ -8,7 +8,7 @@ description: AiDb 持久化层 — SSTable 布局、层级 compaction、布隆�
 ## 何时读本文
 
 - 改 `engine/sstable`, `compaction`, `filter`, `cache`, `checkpoint`
-- 排查 flush→SST、compaction 调度/卡住、get 读放大、Bloom/BlockCache、MANIFEST、目录 Checkpoint
+- 排查 flush→SST, compaction 调度/卡住, get 读放大, Bloom/BlockCache/RowCache, MANIFEST, 目录 Checkpoint
 - **不覆盖**: WAL / MemTable / 写路径 / `DB::put` → [engine.md](01-engine.md)
 - **衔接**: 全量备份与容灾管理 → [backup.md](04-backup.md)
 
@@ -48,11 +48,12 @@ description: AiDb 持久化层 — SSTable 布局、层级 compaction、布隆�
 - `compaction.rs::run_compaction_once`: pick → claim → trivial/subcompaction → apply
 - `mod.rs::enter_checkpoint` / `leave_checkpoint`: Checkpoint 互斥加锁 + SST pin
 
-公共 re-export (`src/lib.rs`): `BlockCache`, `CacheStats`, `Checkpoint`.
+公共 re-export (`src/lib.rs`): `BlockCache`, `CacheStats`, `Checkpoint`, `PinnableSlice`.
 
 ## 关键 invariant (勿破坏)
 
 - **SST 键序**: 文件内 InternalKey **严格递增**; 非排序 key → `Error::InvalidArgument`; 空 SST `finish` 拒绝; restart point 存完整 key (`shared=0`).
+- **两级缓存协同与失效**: 32 分片并发 LRU `RowCache` 缓存热点行数据 `Bytes`, 点查命中直出 `PinnableSlice::Shared` 零拷贝; 16 分片并发 LRU `BlockCache` 缓存解压后的 Data Block. 任何写操作 (`put`/`delete`/`write`/`delete_range`) 与 Compaction 提交新版本后, 必须精确失效对应 Key 的 `RowCache` 缓存, 保证两级缓存与底层 LSM-Tree 强一致.
 - **L0 overlap**: L0 允许多文件 overlap; 新 flush 的文件插入在 `sstables[0]` **头部** (读时新→旧全扫). **L1+** 同层目标文件 range 绝不重叠.
 - **L1+ 定位**: `find_sstable_for_key` 用 **user_key range**, 线性扫描, 不按 `smallest_key` 二分. picker 用 meta raw range 扩展 overlap.
 - **范围删除覆盖**: `get` 与 `scan` 用打开时装入的范围删除索引调用 `max_covering_range_tombstone_seq`. 索引都空时点查不收集索引. L1+ 点数据仍用 `find_sstable_for_key`, 范围覆盖看每一层每一个文件.
@@ -80,11 +81,15 @@ flowchart LR
     M --> SIG[maybe_trigger_compaction]
 ```
 
-### 点查 (get → SST)
+### 点查 (get / get_pinned → SST)
 
 ```mermaid
 flowchart TD
-    G[get_at_sequence] --> L0[L0 逐文件 新→旧]
+    G[get / get_pinned] --> RC{RowCache 命中?}
+    RC -->|hit| PS[直出 PinnableSlice::Shared 零拷贝]
+    RC -->|miss| MEM{MemTable 查找}
+    MEM -->|hit| RET1[返回最新版本]
+    MEM -->|miss| L0[L0 逐文件 新→旧]
     L0 --> LN[L1+ user_key 范围二分定位]
     LN --> BF{Bloom Filter?}
     BF -->|miss| X[None / 快速跳过]
@@ -93,6 +98,8 @@ flowchart TD
     CD -->|hit| SCAN[Block 内 seq ≤ max_seq 查找]
     CD -->|miss| DISK[read_block_from_file + CRC 校验]
     DISK --> SCAN
+    SCAN --> WB[回填 RowCache]
+    WB --> RET2[返回结果]
 ```
 
 ### Compaction
@@ -235,8 +242,8 @@ cargo test --features compression --test sstable -- --test-threads=1
 
 | 测试集 | 覆盖 |
 | --- | --- |
-| `tests/sstable.rs` | Data Block 编码、前缀压缩、Index/Footer 编解码、CRC32 校验、Bloom 与 Cache 集成 |
-| `tests/compaction.rs` | 选层评分、VersionEdit / MANIFEST 轮转、MergeIterator 多路归并、Tombstone 清理 |
+| `tests/sstable.rs` | Data Block 编码, 前缀压缩, Index/Footer 编解码, CRC32 校验, Bloom 与 Cache 集成 |
+| `tests/compaction.rs` | 选层评分, VersionEdit / MANIFEST 轮转, MergeIterator 多路归并, Tombstone 清理 |
 | `tests/filter.rs` | Bloom Filter 编解码与假阳性率校验 |
 | `tests/cache.rs` | 16 分片 LRU BlockCache 淘汰机制与命中率统计 |
 | `tests/regression.rs` | Bloom 统计回归与空值 Compaction 回归测试 |

@@ -572,3 +572,89 @@ fn test_multi_raft_node_get_groups_and_storages_empty() {
     assert!(node.get_groups().read().is_empty());
     assert!(node.get_storages().read().is_empty());
 }
+
+#[tokio::test]
+async fn test_multi_raft_node_transfer_and_elect_missing_group() {
+    let router = Arc::new(Router::new(
+        default_slot_table(),
+        HashMap::new(),
+        HashMap::new(),
+    ));
+    let dispatcher = Arc::new(RaftServiceDispatcher::new());
+    let node = MultiRaftNode::new(1, router, dispatcher);
+
+    let err = node
+        .transfer_group_leader(1, 2)
+        .await
+        .expect_err("group not found");
+    assert!(err.to_string().contains("group 1 not found locally"));
+
+    let err = node
+        .elect_group_leader(1, false)
+        .await
+        .expect_err("group not found");
+    assert!(err.to_string().contains("group 1 not found locally"));
+
+    let err = node.is_group_leader(1).await.expect_err("group not found");
+    assert!(err.to_string().contains("group 1 not found locally"));
+}
+
+#[tokio::test]
+async fn test_multi_raft_node_elect_and_transfer_leader_success() {
+    use aidb::cluster::network::RaftNetworkClientFactory;
+    use aidb::cluster::node::OpenRaftNode;
+    use aidb::cluster::types::RaftNodeConfig;
+    use aidb::config::Options;
+    use aidb::DB;
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let db = DB::open(dir.path(), Options::for_testing()).unwrap();
+    let factory = RaftNetworkClientFactory::new(1, 1, 500, 65536);
+    let cfg = RaftNodeConfig {
+        node_id: 1,
+        group_id: 1,
+        election_timeout_min: 500,
+        election_timeout_max: 1000,
+        heartbeat_interval: 50,
+        snapshot_logs_since_last: 50,
+        linearizable_read: false,
+        ..Default::default()
+    };
+    let openraft_node = Arc::new(OpenRaftNode::new(cfg, db, factory).await.unwrap());
+
+    // 初始化单节点集群 (node 1 为 voter)
+    openraft_node
+        .initialize(vec![(1, "127.0.0.1:7001".to_string())])
+        .await
+        .unwrap();
+
+    let router = Arc::new(Router::new(
+        default_slot_table(),
+        HashMap::new(),
+        HashMap::new(),
+    ));
+    let dispatcher = Arc::new(RaftServiceDispatcher::new());
+    let multi_raft = MultiRaftNode::new(1, router, dispatcher);
+
+    // 注册 group 1
+    multi_raft.get_groups().write().insert(1, openraft_node);
+
+    // 触发 elect_group_leader
+    let elect_res = multi_raft.elect_group_leader(1, false).await;
+    assert!(
+        elect_res.is_ok(),
+        "elect_group_leader should succeed: {elect_res:?}"
+    );
+
+    // 触发 transfer_group_leader
+    let transfer_res = multi_raft.transfer_group_leader(1, 2).await;
+    assert!(
+        transfer_res.is_ok(),
+        "transfer_group_leader should succeed: {transfer_res:?}"
+    );
+
+    // 查询 is_group_leader
+    let is_leader_res = multi_raft.is_group_leader(1).await;
+    assert!(is_leader_res.is_ok());
+}

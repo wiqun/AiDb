@@ -1,3 +1,5 @@
+//! @component aidb-cluster
+
 //! 集群 Raft 模块无锁原子指标 (Atomic-First Statistics) 集成测试.
 
 use std::collections::HashMap;
