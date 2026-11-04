@@ -16,10 +16,14 @@ fn last_sm_user_pair(
     start_user: &[u8],
     end_user: &[u8],
 ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-    use crate::cluster::storage::keys::{sm_key, user_key_from_sm_key};
+    use crate::cluster::storage::keys::{sm_key, sm_range_end, user_key_from_sm_key};
 
     let start = sm_key(group_id, start_user);
-    let end = sm_key(group_id, end_user);
+    let end = if end_user.is_empty() {
+        sm_range_end(group_id)
+    } else {
+        sm_key(group_id, end_user)
+    };
     let pairs = db.scan_limited(Some(&start), Some(&end), 1, true)?;
     for (k, v) in pairs {
         if let Some(user_key) = user_key_from_sm_key(group_id, &k) {
@@ -39,13 +43,17 @@ pub fn scan_sm_user_pairs_limited(
     limit: usize,
     reverse: bool,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    use crate::cluster::storage::keys::{sm_key, user_key_from_sm_key};
+    use crate::cluster::storage::keys::{sm_key, sm_range_end, user_key_from_sm_key};
 
     if limit == 0 {
         return Ok(Vec::new());
     }
     let start = sm_key(group_id, start_user);
-    let end = sm_key(group_id, end_user);
+    let end = if end_user.is_empty() {
+        sm_range_end(group_id)
+    } else {
+        sm_key(group_id, end_user)
+    };
     let pairs = db.scan_limited(Some(&start), Some(&end), limit, reverse)?;
     let mut out = Vec::with_capacity(pairs.len());
     for (k, v) in pairs {
@@ -593,7 +601,7 @@ impl MultiRaftNode {
 
 #[cfg(test)]
 mod tests {
-    use super::{scan_sm_user_pairs_limited, visit_sm_user_pairs};
+    use super::{last_sm_user_pair, scan_sm_user_pairs_limited, visit_sm_user_pairs};
     use crate::cluster::storage::{OpenRaftStorage, DEFAULT_GROUP_ID};
     use crate::cluster::types::ThinWriteBatch;
     use crate::config::Options;
@@ -686,5 +694,26 @@ mod tests {
         );
         assert_eq!(scan(b"p:", b"p;", 0, false), Vec::<Vec<u8>>::new());
         assert_eq!(scan(b"x:", b"x;", 5, true), Vec::<Vec<u8>>::new());
+
+        // 验证空 end_user 自动兜底至 sm_range_end (不发生区间折叠)
+        assert_eq!(
+            scan(b"", b"", 10, false),
+            vec![
+                b"p:a".to_vec(),
+                b"p:b".to_vec(),
+                b"p:c".to_vec(),
+                b"p:d".to_vec(),
+                b"p:e".to_vec(),
+                b"q:z".to_vec(),
+            ]
+        );
+        assert_eq!(
+            scan(b"", b"", 2, true),
+            vec![b"q:z".to_vec(), b"p:e".to_vec()]
+        );
+        assert_eq!(
+            last_sm_user_pair(storage.db(), DEFAULT_GROUP_ID, b"", b"").unwrap(),
+            Some((b"q:z".to_vec(), b"other".to_vec()))
+        );
     }
 }
