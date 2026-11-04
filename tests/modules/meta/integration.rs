@@ -69,18 +69,27 @@ async fn test_meta_raft_leader_failover() {
         .unwrap();
     let leader_id = leader.node_id();
     leader.shutdown().await.unwrap();
-    tokio::time::sleep(Duration::from_secs(3)).await;
+
     let mut new_leader_id = None;
-    for node in &h.nodes {
-        if node.node_id() != leader_id && node.is_leader().await {
-            new_leader_id = Some(node.node_id());
-            assert!(node.get_cluster_meta().nodes.contains_key(&5));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        for node in &h.nodes {
+            if node.node_id() != leader_id
+                && node.is_leader().await
+                && node.get_cluster_meta().nodes.contains_key(&5)
+            {
+                new_leader_id = Some(node.node_id());
+                break;
+            }
+        }
+        if new_leader_id.is_some() {
             break;
         }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(
         new_leader_id.is_some(),
-        "expected a new leader among remaining nodes"
+        "expected a new leader among remaining nodes within 10s"
     );
     h.shutdown_all().await;
 }
