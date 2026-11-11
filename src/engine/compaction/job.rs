@@ -63,6 +63,10 @@ pub struct CompactionResult {
     pub filter_removed_user_keys: Vec<Vec<u8>>,
 }
 
+/// 切分点候选样本上限. 每个样本约 32 字节, 1024 个约 32KB.
+/// 样本按输出序号均匀分布, 步长在超限时翻倍, 因此粒度变粗但内存有界.
+const SPLIT_SAMPLE_CAP: usize = 1024;
+
 impl CompactionJob {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -158,64 +162,79 @@ impl CompactionJob {
         Ok(count)
     }
 
-    /// 单遍计数 + 分裂点记录. 基于文件大小粗估条目数以确定分裂间隔.
+    /// 单遍计数 + 分裂点记录.
+    ///
+    /// 切分点不能按 "估算条目数 / num_splits" 当间隔放: 条目数只能从 SST 文件
+    /// 大小粗估, 平均记录远大于 200 字节时会高估一个数量级, 间隔永远够不到,
+    /// `splits` 为空 —— `num_splits` 报 2 却只有 1 个输出文件, 切分静默退化成
+    /// 单写手, 还白多一遍计数扫描.
+    ///
+    /// 改成单遍扫描时按输出序号均匀采样, 扫描结束后总数已知, 再在样本里取最接近
+    /// `count * k / num_splits` 的 user key. 步长随样本数翻倍, 内存有界, 且不需要
+    /// 额外一遍扫描.
     fn count_dedup_with_splits(&self, num_splits: usize) -> Result<(usize, Vec<Vec<u8>>)> {
         if num_splits <= 1 {
             let count = self.count_dedup_entries()?;
             return Ok((count, vec![]));
         }
 
-        // 基于文件大小粗估条目数 (~100 bytes/entry 经验值)
-        let estimated_total: usize = self
-            .all_inputs()
-            .iter()
-            .map(|r| r.file_size() as usize / 100)
-            .sum::<usize>()
-            .max(1);
-        let est_per_split = estimated_total / num_splits;
-        let mut next_split_at = est_per_split;
-
         let mut merge_iter = MergeIterator::new(self.all_inputs())?;
         let mut count = 0usize;
         let mut last_user_key: Option<Vec<u8>> = None;
-        let mut splits: Vec<Vec<u8>> = Vec::new();
         let mut tracker = SnapshotDedupTracker::default();
+        let mut samples: Vec<(usize, Vec<u8>)> = Vec::new();
+        let mut stride = 1usize;
 
         while let Some((key, value)) = merge_iter.next_entry()? {
             let user_key = user_key_from_internal(&key)?;
             let seq = extract_sequence(&key)?;
-            if last_user_key.as_deref() == Some(user_key) {
-                if !tracker.already_crossed() {
-                    count += 1;
+            let counted = if last_user_key.as_deref() == Some(user_key) {
+                let counted = !tracker.already_crossed();
+                if counted {
                     tracker.observe(seq, self.min_snapshot_sequence);
-                    if count >= next_split_at && splits.len() < num_splits - 1 {
-                        splits.push(user_key.to_vec());
-                        next_split_at = count + est_per_split;
-                    }
                 }
-                continue;
-            }
-            tracker.start_key();
-            let value_type = extract_value_type(&key)?;
-            if drop_delete_marker(
-                value_type,
-                seq,
-                self.min_snapshot_sequence,
-                user_key,
-                &value,
-                &self.surviving_user_ranges,
-            ) {
+                counted
+            } else {
+                tracker.start_key();
+                let value_type = extract_value_type(&key)?;
+                let dropped = drop_delete_marker(
+                    value_type,
+                    seq,
+                    self.min_snapshot_sequence,
+                    user_key,
+                    &value,
+                    &self.surviving_user_ranges,
+                );
                 last_user_key = Some(user_key.to_vec());
                 tracker.observe(seq, self.min_snapshot_sequence);
+                !dropped
+            };
+            if !counted {
                 continue;
             }
             count += 1;
-            last_user_key = Some(user_key.to_vec());
-            tracker.observe(seq, self.min_snapshot_sequence);
+            if count % stride == 0 {
+                samples.push((count, user_key.to_vec()));
+                if samples.len() > SPLIT_SAMPLE_CAP {
+                    stride *= 2;
+                    samples.retain(|(i, _)| i % stride == 0);
+                }
+            }
+        }
 
-            if count >= next_split_at && splits.len() < num_splits - 1 {
-                splits.push(user_key.to_vec());
-                next_split_at = count + est_per_split;
+        // 总数已知, 按真实的 k/N 分位取最近样本; 粒度受 stride 限制, 但分布均匀.
+        let mut splits: Vec<Vec<u8>> = Vec::with_capacity(num_splits - 1);
+        for k in 1..num_splits {
+            let target = count * k / num_splits;
+            if target == 0 {
+                continue;
+            }
+            let pos = samples.partition_point(|(i, _)| *i < target);
+            let Some(pick) = samples.get(pos).or_else(|| samples.last()) else {
+                break;
+            };
+            if splits.last().map(|prev| prev.as_slice()) != Some(pick.1.as_slice()) {
+                splits.push(pick.1.clone());
             }
         }
 
@@ -1066,6 +1085,129 @@ mod tests {
         assert_eq!(fragmented.max_seq(b"y", 10), Some(5));
         assert_eq!(fragmented.max_seq(b"z", 10), None);
         assert!(saw_new_m, "point newer than the tombstone stays visible");
+    }
+
+    /// 大 value 时切分点必须仍然落在真实条目上.
+    ///
+    /// 条目数只能从 `file_size / 100` 粗估, 平均记录远大于 200 字节时估算值会高估
+    /// 一个数量级以上, 切分间隔永远够不到, `splits` 为空, 切分静默退化成单写手:
+    /// `num_splits` 报 2 却只有一个输出文件, 还白多一遍计数扫描.
+    #[test]
+    fn split_points_survive_large_values() {
+        let dir = tempdir().unwrap();
+        let value = vec![b'v'; 4096];
+        let keys: Vec<Vec<u8>> = (0..400).map(|i| format!("k{i:05}").into_bytes()).collect();
+        let entries: Vec<(&[u8], u64, ValueType, &[u8])> = keys
+            .iter()
+            .map(|k| (k.as_slice(), 1u64, ValueType::TypePut, value.as_slice()))
+            .collect();
+        let input = sst(dir.path(), 1, 0, &entries);
+        // 约 1.6MB / 400 条: file_size / 100 ≈ 16000, 高于真实条数 40 倍
+        let job = CompactionJob::new(
+            vec![input],
+            vec![],
+            1,
+            dir.path().to_path_buf(),
+            4096,
+            16,
+            CompressionType::None,
+            0.0,
+        );
+        let results = job.run(&[100, 101]).unwrap();
+        let non_empty = results.iter().filter(|r| r.entry_count > 0).count();
+        assert_eq!(
+            non_empty, 2,
+            "两条子任务都应产出文件, 实际 {non_empty} 个 (切分点落在了估算条目数之外)"
+        );
+        let total: usize = results.iter().map(|r| r.entry_count).sum();
+        assert_eq!(total, 400, "切分前后条目总数必须一致");
+    }
+
+    /// 切分 + 活跃快照 pin + 跨段范围墓碑: 这个组合此前没有任何测试覆盖
+    /// (`test_subcompaction_split_two_ranges` 有切分无快照, 快照测试又都不切分).
+    ///
+    /// 断言两件事:
+    /// 1. 快照可见的旧版本在两侧子任务里都还在 (pin 住 seq <= min_snapshot_sequence);
+    /// 2. 跨段墓碑被切成首尾相接的片段, 拼回去正好覆盖原始区间, 不留缝隙也不重叠.
+    #[test]
+    fn split_with_snapshot_keeps_pinned_versions_and_stitches_tombstone() {
+        let dir = tempdir().unwrap();
+        // 10 个 key, 每个两条版本 (seq 4 新 / seq 2 旧); 一条 [k00, zz) 的墓碑盖住全部.
+        // 快照 pin 在 seq 3: 每个 key 的 seq 2 版本都是快照唯一可见的版本, 不能丢.
+        let mut rows: Vec<(Vec<u8>, u64, ValueType, Vec<u8>)> = Vec::new();
+        rows.push((
+            b"k00".to_vec(),
+            6,
+            ValueType::TypeRangeDelete,
+            b"zz".to_vec(),
+        ));
+        for i in 0..10 {
+            let key = format!("k{i:02}").into_bytes();
+            rows.push((
+                key.clone(),
+                4,
+                ValueType::TypePut,
+                format!("n{i:02}").into_bytes(),
+            ));
+            rows.push((key, 2, ValueType::TypePut, format!("o{i:02}").into_bytes()));
+        }
+        let entries: Vec<(&[u8], u64, ValueType, &[u8])> = rows
+            .iter()
+            .map(|(k, s, t, v)| (k.as_slice(), *s, *t, v.as_slice()))
+            .collect();
+        let input = sst(dir.path(), 1, 0, &entries);
+
+        let job = CompactionJob::new(
+            vec![input],
+            vec![],
+            1,
+            dir.path().to_path_buf(),
+            512,
+            16,
+            CompressionType::None,
+            0.0,
+        )
+        .with_snapshot_threshold(3);
+        let results = job.run(&[10, 11]).unwrap();
+        let non_empty: Vec<&CompactionResult> =
+            results.iter().filter(|r| r.entry_count > 0).collect();
+        assert_eq!(non_empty.len(), 2, "应切成两段");
+
+        // 1) 快照可见版本必须保留
+        let mut seen = 0;
+        for result in &non_empty {
+            let reader = SSTableReader::open(&result.output_path, None).unwrap();
+            for i in 0..10 {
+                let key = format!("k{i:02}");
+                let seek = encode_internal_key(key.as_bytes(), 3, ValueType::TypePut);
+                if let Some((value, ty)) = reader.get(&seek).unwrap() {
+                    if ty == ValueType::TypePut {
+                        assert_eq!(
+                            value,
+                            format!("o{i:02}").as_bytes(),
+                            "{key} 在 seq 3 快照下应看到 seq 2 的旧值"
+                        );
+                        seen += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(seen, 10, "10 个 key 的快照可见版本都应保留");
+
+        // 2) 墓碑片段首尾相接
+        let mut fragments: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for result in &non_empty {
+            let reader = SSTableReader::open(&result.output_path, None).unwrap();
+            for (start, end, _) in reader.collect_range_tombstones() {
+                fragments.push((start, end));
+            }
+        }
+        fragments.sort();
+        assert_eq!(fragments.first().unwrap().0, b"k00");
+        assert_eq!(fragments.last().unwrap().1, b"zz");
+        for pair in fragments.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0, "切分后的墓碑片段之间不能有缝隙");
+        }
     }
 
     #[test]
