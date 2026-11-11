@@ -497,9 +497,16 @@ async fn flush_batch(
         .pending_entries
         .store(*pending_entries, Ordering::Relaxed);
 
-    // 提取 append entry 数据 (从 overlay drain)
+    // 提取 append entry 数据 (从 overlay 取副本, 落盘成功后才真正移除)
     // 递增 generation 以防止过时 flush 误删新 entry
+    //
+    // 不能在提取时就移除: 从提取到 `db.write` 返回之间, entry 既不在 overlay
+    // 也还没进 DB, 而 `append` 早已把 `last_log_id` 推进到本批末尾. 这段窗口里
+    // `get_log_entries` 读到的是"位点存在但数据不存在"的洞, openraft 会据此
+    // apply 一个残缺区间, 触发
+    // `core/sm/worker.rs: assert_eq!(end - 1, got_last_index)`.
     let flushed_generation: u64;
+    let mut flushed_indices: Vec<u64> = Vec::new();
     let batch_entries: Vec<(u64, Vec<EOf>)> = {
         let mut ov = overlay.lock();
         flushed_generation = ov.current_generation();
@@ -507,22 +514,18 @@ async fn flush_batch(
         let mut result = Vec::with_capacity(appends.len());
         for op in &appends {
             let end = op.first_index + op.count;
-            let entries: Vec<_> = ov
-                .drain_range(op.first_index, end)
+            let entries: Vec<EOf> = ov
+                .get_range(op.first_index, end)
                 .into_iter()
-                .map(|(_, entry)| entry)
+                .cloned()
                 .collect();
+            flushed_indices.extend(entries.iter().map(|e| e.log_id.index));
             if !entries.is_empty() {
                 result.push((op.first_index, entries));
             }
         }
         result
     };
-    // Overlay 清理所需的数据: 每个 append batch 的范围.
-    let overlay_ranges: Vec<(u64, u64)> = batch_entries
-        .iter()
-        .map(|(start, entries)| (*start, entries.len() as u64))
-        .collect();
 
     let total_entries: u64 = batch_entries.iter().map(|(_, e)| e.len() as u64).sum();
     let last_log_id = batch_entries
@@ -566,14 +569,10 @@ async fn flush_batch(
                 metrics.durable_index.store(last.index, Ordering::Relaxed);
             }
 
-            // 从 overlay 移除已 flush 的 entry
+            // 从 overlay 移除已 flush 的 entry (仅移除本轮写成功且 generation 匹配的)
             {
                 let mut ov = overlay.lock();
-                for (start, len) in &overlay_ranges {
-                    let end = start + len;
-                    let indices: Vec<u64> = (*start..end).collect();
-                    ov.mark_durable(&indices, flushed_generation);
-                }
+                ov.mark_durable(&flushed_indices, flushed_generation);
                 for op in &truncates {
                     if let Some(lid) = op.log_id {
                         ov.truncate_after(lid.index);
@@ -747,25 +746,24 @@ fn sync_flush(
     }
 
     // 2. Truncate — 使用 DB 级别的 delete_range
+    //
+    // `truncate_after(last_log_id)` 保留 `last_log_id` 本身, 从它的下一条开始删
+    // (openraft 契约: "Truncate logs after `last_log_id`, exclusive"). 从
+    // `lid.index` 开始删会把这条也删掉, 在日志中间留洞 —— openraft 仍认为该位点
+    // 存在并据此 apply, 实际取到的 entry 少于请求区间.
     for (lid,) in truncate_data {
         if let Some(lid) = lid {
-            let start = keys::log_key(group_id, lid.index);
+            let start = keys::log_key(group_id, lid.index.saturating_add(1));
             let end = keys::log_range_end(group_id);
             db.delete_range(&start, &end)?;
 
-            // 更新 last_log_id
-            if lid.index > 0 {
-                let prev_key = keys::log_key(group_id, lid.index - 1);
-                if let Some(prev_data) = db.get(&prev_key)? {
-                    if let Ok(prev_entry) = rmp_serde::from_slice::<EOf>(&prev_data) {
-                        let lid_data = rmp_serde::to_vec(&prev_entry.log_id)
-                            .map_err(|e| ClusterError::Serialization(e.to_string()))?;
-                        let mut b = WriteBatch::new();
-                        b.put(keys::last_log_id_key(group_id), lid_data);
-                        db.write(&b)?;
-                    }
-                }
-            }
+            // 保留的最后一条就是 `lid.index`, 直接落盘该 log_id. 不回读 DB:
+            // 这条 entry 可能仍在 overlay 未落盘, 回读落空会留下过期的 last_log_id.
+            let lid_data = rmp_serde::to_vec(&lid)
+                .map_err(|e| ClusterError::Serialization(e.to_string()))?;
+            let mut b = WriteBatch::new();
+            b.put(keys::last_log_id_key(group_id), lid_data);
+            db.write(&b)?;
         } else {
             let start = keys::log_prefix(group_id);
             let end = keys::log_range_end(group_id);
@@ -779,7 +777,7 @@ fn sync_flush(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cluster::storage::keys::{last_purged_log_id_key, log_key, vote_key};
+    use crate::cluster::storage::keys::{last_log_id_key, last_purged_log_id_key, log_key, vote_key};
     use crate::cluster::types::Request;
     use crate::config::Options;
     use openraft::vote::leader_id_std::CommittedLeaderId;
@@ -843,6 +841,12 @@ mod tests {
         assert_eq!(loaded.leader_id.term, 1);
     }
 
+    /// `truncate_after(last_log_id)` 语义是"保留 `last_log_id`, 删除它之后的"
+    /// (openraft `RaftLogStorage::truncate_after`: "Truncate logs after `last_log_id`,
+    /// exclusive"). 把 `last_log_id` 自己也删掉会在日志中间留一个洞: openraft 仍认为
+    /// 该位点存在并据此 apply, 取回的 entry 数少于请求区间, 触发它的不变式断言
+    /// (`core/sm/worker.rs: assert_eq!(end - 1, got_last_index)`), 或在不做断言的
+    /// release 构建里把未 apply 的 entry 标记成已 apply.
     #[tokio::test]
     async fn test_truncate_after() {
         let (_dir, db) = setup_db();
@@ -852,8 +856,9 @@ mod tests {
             let mut ov = handle.overlay.lock();
             ov.insert_at(1, mk_entry(1, 1));
             ov.insert_at(2, mk_entry(2, 1));
+            ov.insert_at(3, mk_entry(3, 1));
         }
-        handle.append(1, 2).await.unwrap();
+        handle.append(1, 3).await.unwrap();
 
         handle
             .truncate_after(Some(LogId::new(CommittedLeaderId::new(1), 2)))
@@ -861,7 +866,18 @@ mod tests {
             .unwrap();
 
         assert!(db.get(&log_key(1, 1)).unwrap().is_some(), "entry 1 exists");
-        assert!(db.get(&log_key(1, 2)).unwrap().is_none(), "entry 2 deleted");
+        assert!(
+            db.get(&log_key(1, 2)).unwrap().is_some(),
+            "entry 2 是 last_log_id, 必须保留"
+        );
+        assert!(db.get(&log_key(1, 3)).unwrap().is_none(), "entry 3 deleted");
+        let stored: LIdOf = rmp_serde::from_slice(
+            &db.get(&last_log_id_key(1))
+                .unwrap()
+                .expect("last_log_id must be persisted"),
+        )
+        .unwrap();
+        assert_eq!(stored.index, 2, "last_log_id 应回落到保留的最后一条");
     }
 
     #[tokio::test]
@@ -996,6 +1012,39 @@ mod tests {
         assert!(rx2.await.unwrap().is_ok());
         assert!(db.get(&log_key(1, 1)).unwrap().is_some());
         assert!(db.get(&log_key(1, 2)).unwrap().is_some());
+    }
+
+    /// 回归点: 提取批次时曾用 `drain_range` 立刻移除 overlay 条目. 于是
+    /// "已取出但还没落盘"的窗口里, `get_log_entries` 两边都读不到, 而
+    /// `append` 早已把 `last_log_id` 推到本批末尾 —— openraft 会据此 apply 一个
+    /// 残缺区间, 触发 `core/sm/worker.rs: assert_eq!(end - 1, got_last_index)`
+    /// (debug 构建 panic; release 构建把未落盘的 entry 当成已 apply).
+    ///
+    /// 不受时序影响的检查方式: 落盘失败时条目必然没持久化, 它必须仍留在 overlay.
+    #[tokio::test]
+    async fn failed_flush_keeps_entries_in_overlay() {
+        let (_dir, db) = setup_db();
+        let hook: BeforeWriteHook =
+            Arc::new(|| Err(ClusterError::Internal("injected write failure".into()).into()));
+        let handle = spawn_committer_for_test(1, db.clone(), LogCommitterConfig::default(), hook);
+        {
+            let mut ov = handle.overlay.lock();
+            ov.insert_at(1, mk_entry(1, 1));
+            ov.insert_at(2, mk_entry(2, 1));
+        }
+        let (cb, rx) = signal_callback();
+        handle.submit_append(1, 2, cb).unwrap();
+        assert!(rx.await.unwrap().is_err());
+
+        assert!(db.get(&log_key(1, 1)).unwrap().is_none(), "落盘失败");
+        assert!(
+            handle.overlay.lock().get(1).is_some(),
+            "未落盘的 entry 不能被提前移出 overlay"
+        );
+        assert!(
+            handle.overlay.lock().get(2).is_some(),
+            "未落盘的 entry 不能被提前移出 overlay"
+        );
     }
 
     #[tokio::test]

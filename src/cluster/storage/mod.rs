@@ -323,29 +323,10 @@ impl RaftLogStorage<TypeConfig> for OpenRaftStorage {
             }
             committer.truncate_after(log_id).await?;
 
-            // 更新 in-memory last_log_id: 从 DB 读取将剩下的最后一条 entry 的 log_id
-            let mut state = self.state.write();
-            if let Some(lid) = log_id {
-                if lid.index > 0 {
-                    let prev_key =
-                        crate::cluster::storage::keys::log_key(self.group_id, lid.index - 1);
-                    let prev_entry = self
-                        .db
-                        .get(&prev_key)
-                        .map_err(|e| std::io::Error::other(e.to_string()))?
-                        .and_then(|data| {
-                            rmp_serde::from_slice::<
-                                    <TypeConfig as openraft::RaftTypeConfig>::Entry,
-                                >(&data)
-                                .ok()
-                        });
-                    state.last_log_id = prev_entry.map(|e| e.log_id);
-                } else {
-                    state.last_log_id = None;
-                }
-            } else {
-                state.last_log_id = None;
-            }
+            // 更新 in-memory last_log_id: 该位点就是被保留的最后一条, 直接采用.
+            // 不要回读 DB: 这条 entry 可能还在 overlay 未落盘, 回读落空会把
+            // last_log_id 误降为 None, 后续 append 会从 1 重新编号.
+            self.state.write().last_log_id = log_id;
             Ok(())
         } else {
             let Some(lid) = log_id else {
@@ -353,7 +334,13 @@ impl RaftLogStorage<TypeConfig> for OpenRaftStorage {
             };
             #[cfg(feature = "cluster-test-util")]
             crate::cluster::failpoint::fire(crate::cluster::FailPoint::TruncateBeforePersist);
-            self.delete_logs_from(lid)
+            // `delete_logs_from` 的入参是"第一条要删的 index"; openraft 给的是
+            // "最后一条要保留的 log_id", 所以下一条才是删除起点.
+            let first_to_delete = LIdOf {
+                index: lid.index.saturating_add(1),
+                ..lid
+            };
+            self.delete_logs_from(first_to_delete)
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
             #[cfg(feature = "cluster-test-util")]
             crate::cluster::failpoint::fire(crate::cluster::FailPoint::TruncateAfterPersist);

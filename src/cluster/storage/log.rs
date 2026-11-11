@@ -572,6 +572,33 @@ mod tests {
         );
     }
 
+    /// `RaftLogStorage::truncate_after(last_log_id)` 契约是 "exclusive": `last_log_id`
+    /// 本身必须保留, 且不能留下洞. 这条覆盖不带 committer 的直连存储分支.
+    #[tokio::test]
+    async fn truncate_after_keeps_last_log_id_without_hole() {
+        use openraft::storage::RaftLogStorage;
+
+        let dir = TempDir::new().unwrap();
+        let mut storage = open_storage(&dir);
+        storage
+            .append_log_entries(&[
+                put_entry(1, 1),
+                put_entry(2, 1),
+                put_entry(3, 1),
+                put_entry(4, 1),
+            ])
+            .unwrap();
+
+        let keep = LogId::new(openraft::vote::leader_id_std::CommittedLeaderId::new(1), 2);
+        storage.truncate_after(Some(keep)).await.unwrap();
+
+        let left = storage.get_log_entries(1..=4).unwrap();
+        assert_eq!(left.len(), 2, "只保留 index 1, 2");
+        assert_eq!(left[0].log_id.index, 1);
+        assert_eq!(left[1].log_id.index, 2, "last_log_id 必须保留");
+        assert_eq!(storage.state.read().last_log_id.map(|id| id.index), Some(2));
+    }
+
     #[test]
     fn test_storage_restart_recovery() {
         let dir = TempDir::new().unwrap();
