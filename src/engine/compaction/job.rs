@@ -339,7 +339,9 @@ impl CompactionJob {
                 continue;
             }
 
-            if value_type != ValueType::TypeRangeDelete && range_tracker.covers(user_key, seq) {
+            if value_type != ValueType::TypeRangeDelete
+                && range_tracker.covers(user_key, seq, self.min_snapshot_sequence)
+            {
                 last_user_key = Some(user_key.to_vec());
                 tracker.observe(seq, self.min_snapshot_sequence);
                 continue;
@@ -736,7 +738,9 @@ fn write_sub_compaction(
             continue;
         }
 
-        if value_type != ValueType::TypeRangeDelete && range_tracker.covers(user_key, seq) {
+        if value_type != ValueType::TypeRangeDelete
+            && range_tracker.covers(user_key, seq, min_snap_seq)
+        {
             last_user_key = Some(user_key.to_vec());
             tracker.observe(seq, min_snap_seq);
             continue;
@@ -1208,6 +1212,80 @@ mod tests {
         for pair in fragments.windows(2) {
             assert_eq!(pair[0].1, pair[1].0, "切分后的墓碑片段之间不能有缝隙");
         }
+    }
+
+    /// 墓碑覆盖裁剪必须尊重活跃快照.
+    ///
+    /// `RangeTombstoneTracker::covers` 原先只看 `tombstone.sequence >= point.sequence`,
+    /// 不看 `min_snapshot_sequence`. 墓碑 seq 大于最小快照位点时, 存在看不到这次删除的
+    /// 快照 (seq 在 `[min_snapshot_sequence, tombstone.sequence)` 之间), 它需要被覆盖的
+    /// 最新版本. 一旦被裁掉, 这类快照会读到更旧的版本, 甚至读不到.
+    #[test]
+    fn range_tombstone_must_not_drop_version_needed_by_snapshot() {
+        let dir = tempdir().unwrap();
+        let input = sst(
+            dir.path(),
+            1,
+            0,
+            &[
+                // 墓碑在 seq 6, 盖住 [k00, zz)
+                (b"k00", 6, ValueType::TypeRangeDelete, b"zz"),
+                (b"k01", 4, ValueType::TypePut, b"n01"),
+                (b"k01", 2, ValueType::TypePut, b"o01"),
+                // 落点之外, 保证无快照时仍有输出文件可检查
+                (b"zzz", 3, ValueType::TypePut, b"live"),
+            ],
+        );
+
+        // min_snapshot = 2, 但同时有快照在 seq 4: seq 4 的版本必须留下
+        let job = CompactionJob::new(
+            vec![Arc::clone(&input)],
+            vec![],
+            1,
+            dir.path().to_path_buf(),
+            512,
+            16,
+            CompressionType::None,
+            0.0,
+        )
+        .with_snapshot_threshold(2);
+        let results = job.run(&[10]).unwrap();
+        let reader = SSTableReader::open(&results[0].output_path, None).unwrap();
+        let seek = encode_internal_key(b"k01", 4, ValueType::TypePut);
+        assert_eq!(
+            reader.get(&seek).unwrap().map(|(value, _)| value),
+            Some(b"n01".to_vec()),
+            "墓碑 seq 6 大于 min_snapshot_sequence 2 时不能吞掉 seq 4 的版本"
+        );
+
+        // 无活跃快照时仍要裁掉被覆盖的点, 不能为了修这个把优化整条关掉
+        let job = CompactionJob::new(
+            vec![Arc::clone(&input)],
+            vec![],
+            1,
+            dir.path().to_path_buf(),
+            512,
+            16,
+            CompressionType::None,
+            0.0,
+        );
+        let results = job.run(&[11]).unwrap();
+        let reader = SSTableReader::open(&results[0].output_path, None).unwrap();
+        assert_eq!(
+            reader
+                .get(&encode_internal_key(b"k01", u64::MAX, ValueType::TypePut))
+                .unwrap(),
+            None,
+            "无快照时墓碑覆盖的点应被裁掉"
+        );
+        assert_eq!(
+            reader
+                .get(&encode_internal_key(b"zzz", u64::MAX, ValueType::TypePut))
+                .unwrap()
+                .map(|(value, _)| value),
+            Some(b"live".to_vec()),
+            "墓碑区间之外的 key 应原样保留"
+        );
     }
 
     #[test]

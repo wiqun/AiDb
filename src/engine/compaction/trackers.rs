@@ -66,9 +66,22 @@ impl RangeTombstoneTracker {
         self.items.retain(|item| item.end.as_slice() > user_key);
     }
 
-    pub(super) fn covers(&self, user_key: &[u8], sequence: u64) -> bool {
+    /// 判断 `(user_key, sequence)` 这个点版本是否可以被墓碑裁掉.
+    ///
+    /// 只有**所有活跃快照都能看到**的那条墓碑才允许裁: 快照位点都不小于
+    /// `min_snapshot_sequence`, 所以墓碑 `sequence <= min_snapshot_sequence` 时
+    /// 对每个快照都可见. 反过来, 墓碑比最小快照位点新时, 存在 `[min_snapshot_sequence,
+    /// tombstone.sequence)` 区间的快照看不到这次删除, 它需要被覆盖的最新版本, 此时
+    /// 不能裁 —— 否则那条快照会读到更旧的版本, 或者干脆读不到.
+    pub(super) fn covers(
+        &self,
+        user_key: &[u8],
+        sequence: u64,
+        min_snapshot_sequence: u64,
+    ) -> bool {
         self.items.iter().any(|item| {
-            item.start.as_slice() <= user_key
+            item.sequence <= min_snapshot_sequence
+                && item.start.as_slice() <= user_key
                 && user_key < item.end.as_slice()
                 && item.sequence >= sequence
         })
