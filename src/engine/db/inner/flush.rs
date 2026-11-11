@@ -131,6 +131,7 @@ impl DB {
                 smallest_key: reader.smallest_key().to_vec(),
                 largest_key: reader.largest_key().to_vec(),
             })?;
+            self.publish_sst_range_tombstones(&tables);
         }
         self.update_write_stall_state();
         let pending = self.pending_compaction_bytes();

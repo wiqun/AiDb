@@ -491,7 +491,7 @@ mod tests {
             ),
             payload: EntryPayload::Normal(Request::Put {
                 key: format!("k{index}").into_bytes(),
-                value: format!("v{index}").into_bytes(),
+                value: bytes::Bytes::from(format!("v{index}").into_bytes()),
             }),
         }
     }

@@ -88,7 +88,7 @@ impl MergeIterator {
             if iter.valid() {
                 let key = iter.key().unwrap_or_default().to_vec();
                 if let Some(ref end) = range_end {
-                    if key.as_slice() >= end.as_slice() {
+                    if extract_user_key(&key) >= end.as_slice() {
                         // 首条已越界, 不加入初始堆, 后续条目只会更大
                         iterators.push(iter);
                         continue;
@@ -112,7 +112,7 @@ impl MergeIterator {
     pub fn next_entry(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         while let Some(entry) = self.heap.pop() {
             if let Some(ref end) = self.range_end {
-                if entry.key.as_slice() >= end.as_slice() {
+                if extract_user_key(&entry.key) >= end.as_slice() {
                     // Past range end: skip without advancing this iterator
                     continue;
                 }
@@ -229,6 +229,49 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(extract_user_key(&rows[0].0), b"a");
         assert_eq!(extract_user_key(&rows[1].0), b"b");
+    }
+
+    #[test]
+    fn test_merge_with_range_keeps_prefix_range_tombstone() {
+        let dir = tempdir().unwrap();
+        // 范围墓碑的 user key 是空串, 其内部键只剩取反的 sequence 前缀 (0xff..),
+        // 字节序上大于任何普通 user key. with_range 必须按 user key 比较,
+        // 否则切分后左侧子压缩会漏掉这段墓碑, 被它覆盖的 key 全部复活.
+        let end = [0xffu8; 64];
+        let t = sst(
+            dir.path(),
+            1,
+            0,
+            &[
+                (b"", 100, ValueType::TypeRangeDelete, &end[..]),
+                (b"base:1", 1, ValueType::TypePut, b"v"),
+                (b"base:9", 1, ValueType::TypePut, b"v"),
+            ],
+        );
+        let rows = collect(MergeIterator::with_range(vec![t], Some(b"base:5".to_vec())).unwrap());
+        assert_eq!(rows.len(), 2);
+        assert_eq!(extract_user_key(&rows[0].0), b"");
+        assert_eq!(extract_user_key(&rows[1].0), b"base:1");
+    }
+
+    #[test]
+    fn test_merge_with_range_keeps_tombstone_whose_start_is_prefix_of_end() {
+        let dir = tempdir().unwrap();
+        let end = [0xffu8; 64];
+        let t = sst(
+            dir.path(),
+            1,
+            0,
+            &[
+                (b"base:", 100, ValueType::TypeRangeDelete, &end[..]),
+                (b"base:1", 1, ValueType::TypePut, b"v"),
+                (b"base:9", 1, ValueType::TypePut, b"v"),
+            ],
+        );
+        let rows = collect(MergeIterator::with_range(vec![t], Some(b"base:5".to_vec())).unwrap());
+        assert_eq!(rows.len(), 2);
+        assert_eq!(extract_user_key(&rows[0].0), b"base:");
+        assert_eq!(extract_user_key(&rows[1].0), b"base:1");
     }
 
     #[test]

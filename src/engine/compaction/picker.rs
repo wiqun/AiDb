@@ -97,7 +97,10 @@ impl CompactionPicker {
         }
         let inputs = levels[0].clone();
         let (in_start, in_end) = combined_range(&inputs);
-        let expanded = overlap_in_level(levels, 1, in_start, in_end);
+        let mut expanded = overlap_in_level(levels, 1, in_start, in_end);
+        if levels.len() > 1 {
+            append_tombstone_overlaps(&levels[1], &inputs, &mut expanded);
+        }
         let is_trivial_move = expanded.is_empty() && inputs.len() == 1;
         Some(CompactionTask {
             inputs,
@@ -119,6 +122,7 @@ impl CompactionPicker {
         let seed = pick_seed_level_n(levels, level);
         let mut inputs = vec![seed.clone()];
         let mut expanded = overlap_with_reader(levels, level + 1, &seed);
+        append_tombstone_overlaps(&levels[level + 1], &inputs, &mut expanded);
 
         if expanded.is_empty() {
             // Trivial move: no overlap with target level, promote without rewriting
@@ -144,8 +148,10 @@ impl CompactionPicker {
                 inputs.push(f.clone());
             }
         }
+        append_sources_covered_by_tombstone(&levels[level], &mut inputs, &expanded);
         let (in_start, in_end) = combined_range(&inputs);
         expanded = overlap_in_level(levels, level + 1, in_start, in_end);
+        append_tombstone_overlaps(&levels[level + 1], &inputs, &mut expanded);
 
         Some(CompactionTask {
             inputs,
@@ -185,6 +191,68 @@ fn overlap_in_level(
         .filter(|f| key_ranges_overlap_by_meta_raw(start, end, f.smallest_key(), f.largest_key()))
         .cloned()
         .collect()
+}
+
+fn append_tombstone_overlaps(
+    level: &[Arc<SSTableReader>],
+    against: &[Arc<SSTableReader>],
+    into: &mut Vec<Arc<SSTableReader>>,
+) {
+    for file in level {
+        if into
+            .iter()
+            .any(|kept| kept.file_number() == file.file_number())
+        {
+            continue;
+        }
+        if against
+            .iter()
+            .any(|other| tombstone_cross_overlap(other, file))
+        {
+            into.push(file.clone());
+        }
+    }
+}
+
+fn append_sources_covered_by_tombstone(
+    level: &[Arc<SSTableReader>],
+    inputs: &mut Vec<Arc<SSTableReader>>,
+    expanded: &[Arc<SSTableReader>],
+) {
+    for file in level {
+        if inputs
+            .iter()
+            .any(|kept| kept.file_number() == file.file_number())
+        {
+            continue;
+        }
+        let covered = inputs
+            .iter()
+            .chain(expanded.iter())
+            .any(|other| tombstone_cross_overlap(other, file));
+        if covered {
+            inputs.push(file.clone());
+        }
+    }
+}
+
+/// 点 key 范围不相交时, 任一侧的范围墓碑 `[start, end)` 仍可能盖住另一侧的点.
+fn tombstone_cross_overlap(left: &SSTableReader, right: &SSTableReader) -> bool {
+    tombstone_hits_file(left, right) || tombstone_hits_file(right, left)
+}
+
+fn tombstone_hits_file(source: &SSTableReader, file: &SSTableReader) -> bool {
+    let smallest = file.smallest_key();
+    let largest = file.largest_key();
+    if smallest.len() < 8 || largest.len() < 8 {
+        return true;
+    }
+    let lower = &smallest[..smallest.len() - 8];
+    let upper = &largest[..largest.len() - 8];
+    source
+        .collect_range_tombstones()
+        .iter()
+        .any(|(start, end, _)| start.as_slice() <= upper && lower < end.as_slice())
 }
 
 fn overlap_with_reader(
@@ -534,5 +602,42 @@ mod tests {
         assert_eq!(task.level, 1);
         assert_eq!(task.output_level, 2);
         assert!(task.expanded_inputs.iter().any(|f| f.file_number() == 2));
+    }
+
+    #[test]
+    fn tombstone_span_pulls_target_file_outside_point_range() {
+        let dir = tempdir().unwrap();
+        let mut opts = Options::for_testing();
+        opts.level0_compaction_trigger = 1;
+        let picker = CompactionPicker::from_options(&opts);
+        let mut levels = empty_levels(7);
+        levels[0].push(file_with_wide_tombstone(dir.path(), 1, 0));
+        levels[1].push(file(dir.path(), 2, 1, b"m"));
+        let task = picker.pick_compaction(&levels).expect("l0 compaction");
+        assert!(
+            task.expanded_inputs.iter().any(|f| f.file_number() == 2),
+            "tombstone [a, z) must pull the L1 file at m"
+        );
+    }
+
+    fn file_with_wide_tombstone(
+        dir: &std::path::Path,
+        num: u64,
+        level: usize,
+    ) -> Arc<SSTableReader> {
+        let path = sstable_path(dir, num, level);
+        let mut builder =
+            SSTableBuilder::new(&path, 512, 16, crate::config::CompressionType::None, 0.0).unwrap();
+        builder
+            .add(
+                &encode_internal_key(b"a", 2, ValueType::TypeRangeDelete),
+                b"z",
+            )
+            .unwrap();
+        builder
+            .add(&encode_internal_key(b"a", 1, ValueType::TypePut), b"v")
+            .unwrap();
+        builder.finish().unwrap();
+        Arc::new(SSTableReader::open(&path, None).unwrap())
     }
 }

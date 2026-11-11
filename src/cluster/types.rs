@@ -1,5 +1,6 @@
 //! Raft 类型配置与请求/响应.
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 pub use crate::error::ClusterError;
@@ -24,7 +25,7 @@ pub type LogEntry = <TypeConfig as openraft::RaftTypeConfig>::Entry;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ThinWriteOp {
-    Put { key: Vec<u8>, value: Vec<u8> },
+    Put { key: Vec<u8>, value: Bytes },
     Delete { key: Vec<u8> },
 }
 
@@ -38,8 +39,11 @@ impl ThinWriteBatch {
         Self { ops: Vec::new() }
     }
 
-    pub fn put(&mut self, key: Vec<u8>, value: Vec<u8>) {
-        self.ops.push(ThinWriteOp::Put { key, value });
+    pub fn put(&mut self, key: Vec<u8>, value: impl Into<Bytes>) {
+        self.ops.push(ThinWriteOp::Put {
+            key,
+            value: value.into(),
+        });
     }
 
     pub fn delete(&mut self, key: Vec<u8>) {
@@ -73,7 +77,7 @@ impl ThinWriteBatch {
 pub enum Request {
     Put {
         key: Vec<u8>,
-        value: Vec<u8>,
+        value: Bytes,
     },
     Delete {
         key: Vec<u8>,
@@ -85,7 +89,7 @@ pub enum Request {
     /// `None` 时行为与迁移无关, 完全等同修复前 (向后兼容).
     PutConditional {
         key: Vec<u8>,
-        value: Vec<u8>,
+        value: Bytes,
         migration_epoch: Option<u64>,
     },
     WriteBatch(ThinWriteBatch),
@@ -275,7 +279,7 @@ mod tests {
             log_id: LogId::new(CommittedLeaderId::new(1), 1),
             payload: EntryPayload::Normal(Request::Put {
                 key: b"k".to_vec(),
-                value: b"v".to_vec(),
+                value: bytes::Bytes::from(b"v".to_vec()),
             }),
         };
         let bytes = rmp_serde::to_vec(&entry).unwrap();
@@ -290,7 +294,7 @@ mod tests {
     fn test_request_to_batch_conversion() {
         let batch = Request::Put {
             key: b"a".to_vec(),
-            value: b"b".to_vec(),
+            value: bytes::Bytes::from(b"b".to_vec()),
         }
         .to_batch();
         assert_eq!(batch.len(), 1);

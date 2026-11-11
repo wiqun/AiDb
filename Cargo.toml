@@ -43,7 +43,7 @@ cluster-test-util = ["cluster"]
 
 [dependencies]
 # Core primitives
-bytes = "1"
+bytes = { version = "1", features = ["serde"] }
 thiserror = "2"
 tracing = "0.1"
 crc32fast = "1"

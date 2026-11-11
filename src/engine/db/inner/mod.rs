@@ -65,8 +65,8 @@ pub(super) use crate::engine::compaction::{
     CompactionRemovalListener, CompactionTask, VersionEdit, VersionSet,
 };
 pub(super) use crate::engine::memtable::{
-    encode_internal_key_buffered, extract_sequence, ImmutableMemTable, MemTable, PointState,
-    ValueType, SEQUENCE_LIMIT,
+    encode_internal_key_buffered, extract_sequence, FragmentedRangeTombstones, ImmutableMemTable,
+    MemTable, PointState, RangeTombstoneRecord, ValueType, SEQUENCE_LIMIT,
 };
 pub(super) use crate::engine::sstable::{sstable_path, SSTableBuilder, SSTableReader};
 pub(super) use crate::engine::wal::manager::WALManager;
@@ -125,6 +125,10 @@ pub struct DB {
     /// L0 SSTable count for lock-free stall checks (F-050/051/054).
     /// Maintained atomically inside all `sstables.write()` critical sections.
     l0_sstable_count: AtomicUsize,
+    /// 每一层 SST 的范围墓碑片段. 在持有 `sstables` 写锁时按层整体替换.
+    /// 点查克隆这份 `Arc` 后按层二分, 不随文件数遍历.
+    /// 锁顺序: `sstables` 然后 `sst_range_tombstones`. 读路径先放下这份锁, 再拿 `sstables`.
+    sst_range_tombstones: RwLock<Arc<Vec<FragmentedRangeTombstones>>>,
     /// 全局写停顿状态原子标志: 仅当触发 L0/MemTable/LevelSize stall 时为 true.
     /// 前台写路径通过 Relaxed 检查实现纳秒级短路, 消除正常写入下的全层读锁遍历开销.
     write_stall_active: AtomicBool,
@@ -303,6 +307,7 @@ impl DB {
         }
 
         let l0_sstable_count_init = sstables[0].len();
+        let sst_range_tombstones = Arc::new(collect_level_range_tombstones(&sstables));
 
         let db = Arc::new(DB {
             path,
@@ -333,6 +338,7 @@ impl DB {
             snapshots: SnapshotList::new(),
             group_commit_synced_seq: AtomicU64::new(0),
             l0_sstable_count: AtomicUsize::new(l0_sstable_count_init),
+            sst_range_tombstones: RwLock::new(sst_range_tombstones),
             write_stall_active: AtomicBool::new(false),
             stats: Arc::clone(&stats),
         });
@@ -597,10 +603,38 @@ impl DB {
         Ok(())
     }
 
+    /// 用当前各层 SST 重建范围墓碑索引. 调用方必须正持有 `sstables` 写锁.
+    pub(super) fn publish_sst_range_tombstones(&self, levels: &[Vec<Arc<SSTableReader>>]) {
+        *self.sst_range_tombstones.write() = Arc::new(collect_level_range_tombstones(levels));
+    }
+
     #[cfg(test)]
     pub(super) fn replace_sstables_for_test(&self, levels: Vec<Vec<Arc<SSTableReader>>>) {
-        *self.sstables.write() = levels;
+        let mut guard = self.sstables.write();
+        *guard = levels;
+        self.publish_sst_range_tombstones(&guard);
     }
+}
+
+fn collect_level_range_tombstones(
+    levels: &[Vec<Arc<SSTableReader>>],
+) -> Vec<FragmentedRangeTombstones> {
+    levels
+        .iter()
+        .map(|level| {
+            let records = level.iter().flat_map(|reader| {
+                reader
+                    .collect_range_tombstones()
+                    .into_iter()
+                    .map(|(start, end, sequence)| RangeTombstoneRecord {
+                        start,
+                        end,
+                        sequence,
+                    })
+            });
+            FragmentedRangeTombstones::from_records(records)
+        })
+        .collect()
 }
 
 fn max_sequence_in_memtable(mt: &MemTable) -> u64 {

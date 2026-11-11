@@ -509,7 +509,7 @@ async fn test_multi_raft_node_propose_group_not_found() {
             99,
             Request::Put {
                 key: b"k".to_vec(),
-                value: b"v".to_vec(),
+                value: bytes::Bytes::from(b"v".to_vec()),
             },
         )
         .await;

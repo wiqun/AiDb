@@ -19,7 +19,7 @@ use super::internal_key::{
 };
 use super::iterator::MemTableIterator;
 use super::key_bytes::{InternalKeyBytes, InternalKeySlice};
-use super::range_tombstone::{max_covering_range_tombstone_seq, RangeTombstoneRecord};
+use super::range_tombstone::{FragmentedRangeTombstones, RangeTombstoneRecord};
 use super::rep::MemTableRep;
 use super::skiplist_rep::SkipMapRep;
 use crate::error::Result;
@@ -100,11 +100,17 @@ impl ImmutableMemTable {
     }
 }
 
+struct RangeIndex {
+    records: Vec<RangeTombstoneRecord>,
+    fragments: FragmentedRangeTombstones,
+}
+
 /// 可变 MemTable.
 pub struct MemTable {
     rep: SkipMapRep,
     /// Range tombstone 索引 — 仅含 delete_range 写入, 避免 GET 扫描全表.
-    range_index: RwLock<Vec<RangeTombstoneRecord>>,
+    /// `records` 与 `fragments` 在同一把锁里更新, 点查走二分.
+    range_index: RwLock<RangeIndex>,
     stats: Option<Arc<Statistics>>,
     /// 成功插入的内部记录数, 含覆盖写, 点删除和范围删除. flush 不减少.
     entry_count: AtomicU64,
@@ -124,7 +130,10 @@ impl MemTable {
     pub fn new_with_stats(stats: Option<Arc<Statistics>>) -> Self {
         Self {
             rep: SkipMapRep::new(),
-            range_index: RwLock::new(Vec::new()),
+            range_index: RwLock::new(RangeIndex {
+                records: Vec::new(),
+                fragments: FragmentedRangeTombstones::default(),
+            }),
             stats,
             entry_count: AtomicU64::new(0),
         }
@@ -135,7 +144,7 @@ impl MemTable {
     }
 
     pub fn has_range_tombstones(&self) -> bool {
-        !self.range_index.read().is_empty()
+        !self.range_index.read().records.is_empty()
     }
 
     pub(crate) fn rep(&self) -> &SkipMapRep {
@@ -182,11 +191,13 @@ impl MemTable {
         let val = Arc::from(end);
         self.rep.insert(ik, val);
         self.entry_count.fetch_add(1, Ordering::Relaxed);
-        self.range_index.write().push(RangeTombstoneRecord {
+        let mut index = self.range_index.write();
+        index.records.push(RangeTombstoneRecord {
             start: start.to_vec(),
             end: end.to_vec(),
             sequence,
         });
+        index.fragments = FragmentedRangeTombstones::from_records(index.records.iter().cloned());
         tracing::debug!(target: "mem", "mem.put_range_delete");
         self.sync_active_metric();
         Ok(())
@@ -218,17 +229,14 @@ impl MemTable {
     }
 
     pub fn max_range_tombstone_seq(&self, user_key: &[u8], max_seq: u64) -> Result<Option<u64>> {
-        Ok(max_covering_range_tombstone_seq(
-            &self.range_index.read(),
-            user_key,
-            max_seq,
-        ))
+        Ok(self.range_index.read().fragments.max_seq(user_key, max_seq))
     }
 
     pub(crate) fn collect_range_tombstones(&self) -> Result<Vec<TombstoneRecord>> {
         Ok(self
             .range_index
             .read()
+            .records
             .iter()
             .map(|r| (r.start.clone(), r.end.clone(), r.sequence))
             .collect())

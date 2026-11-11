@@ -16,7 +16,8 @@ pub use internal_key::{
 pub use iterator::MemTableIterator;
 pub(crate) use key_bytes::{InternalKeyBytes, InternalKeySlice};
 pub use range_tombstone::{
-    max_covering_range_tombstone_seq, range_covers, range_overlaps, RangeTombstoneRecord,
+    max_covering_range_tombstone_seq, range_covers, range_overlaps, FragmentedRangeTombstones,
+    RangeTombstoneRecord,
 };
 pub(crate) use skiplist_rep::SharedSkipMap;
 pub use table::{ImmutableMemTable, MemTable, PointState};

@@ -112,6 +112,10 @@ impl OpenRaftStorage {
         &self,
         entries: &[<TypeConfig as openraft::RaftTypeConfig>::Entry],
     ) -> Result<Vec<Response>> {
+        // 与 snapshot 抓取互斥: 保证 snapshot 的 flush 边界与它记录的 `last_applied`
+        // 位点严格对应, 不会被 apply 插入造成位点领先于 bundle 内容.
+        let _capture = self.capture_lock.read();
+
         let mut last_applied = self.read_last_applied_from_db()?;
         let mut responses = Vec::with_capacity(entries.len());
 
@@ -203,9 +207,11 @@ impl OpenRaftStorage {
                         crate::cluster::failpoint::fire(
                             crate::cluster::FailPoint::ApplyBeforePersist,
                         );
+                        let write_started = std::time::Instant::now();
                         self.db
                             .write_without_wal(&batch)
                             .map_err(|e| Error::Cluster(map_db_err(e)))?;
+                        self.phases.add_write(write_started.elapsed());
                         #[cfg(feature = "cluster-test-util")]
                         crate::cluster::failpoint::fire(
                             crate::cluster::FailPoint::ApplyAfterPersist,
@@ -796,7 +802,7 @@ mod tests {
                 &mut batch,
                 &Request::Put {
                     key: b"k".to_vec(),
-                    value: b"v".to_vec(),
+                    value: bytes::Bytes::from(b"v".to_vec()),
                 },
                 &mut overlay,
             )
@@ -816,7 +822,7 @@ mod tests {
             log_id: LogId::new(openraft::vote::leader_id_std::CommittedLeaderId::new(1), 1),
             payload: EntryPayload::Normal(Request::Put {
                 key: b"k".to_vec(),
-                value: b"v".to_vec(),
+                value: bytes::Bytes::from(b"v".to_vec()),
             }),
         };
         storage
@@ -942,7 +948,7 @@ mod tests {
             log_id: LogId::new(openraft::vote::leader_id_std::CommittedLeaderId::new(1), 1),
             payload: EntryPayload::Normal(Request::Put {
                 key: b"k1".to_vec(),
-                value: b"v1".to_vec(),
+                value: bytes::Bytes::from(b"v1".to_vec()),
             }),
         };
         storage
@@ -965,7 +971,7 @@ mod tests {
             log_id: LogId::new(openraft::vote::leader_id_std::CommittedLeaderId::new(1), 2),
             payload: EntryPayload::Normal(Request::PutConditional {
                 key: b"k2".to_vec(),
-                value: b"v2".to_vec(),
+                value: bytes::Bytes::from(b"v2".to_vec()),
                 migration_epoch: None,
             }),
         };

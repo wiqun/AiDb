@@ -32,7 +32,9 @@ use std::fmt::Debug;
 use std::io::Cursor;
 use std::ops::RangeBounds;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use openraft::{
     storage::{LogState, RaftLogStorage, RaftStateMachine},
@@ -70,6 +72,68 @@ pub(crate) struct StorageState {
     snapshot_meta: Option<SMOf>,
 }
 
+/// 与慢日志默认阈值一致. 只在已经慢的阶段打日志.
+const SLOW_PHASE: Duration = Duration::from_millis(100);
+
+/// 同一次 `client_write` 里各阶段最近一次耗时. `OpenRaftStorage` 的克隆共享这一份.
+#[derive(Debug, Default)]
+pub(crate) struct RaftPhaseMarks {
+    append_us: AtomicU64,
+    apply_us: AtomicU64,
+    write_us: AtomicU64,
+}
+
+impl RaftPhaseMarks {
+    pub(crate) fn reset(&self) {
+        self.append_us.store(0, Ordering::Relaxed);
+        self.apply_us.store(0, Ordering::Relaxed);
+        self.write_us.store(0, Ordering::Relaxed);
+    }
+
+    pub(crate) fn snapshot(&self) -> (u64, u64, u64) {
+        (
+            self.append_us.load(Ordering::Relaxed),
+            self.apply_us.load(Ordering::Relaxed),
+            self.write_us.load(Ordering::Relaxed),
+        )
+    }
+
+    fn note(
+        &self,
+        slot: &AtomicU64,
+        elapsed: Duration,
+        entry_count: u64,
+        group_id: u64,
+        phase: &'static str,
+    ) {
+        let us = elapsed.as_micros() as u64;
+        slot.store(us, Ordering::Relaxed);
+        if elapsed < SLOW_PHASE {
+            return;
+        }
+        tracing::warn!(
+            group_id,
+            entry_count,
+            phase_us = us,
+            phase,
+            "raft_phase_slow"
+        );
+    }
+
+    pub(crate) fn note_append(&self, group_id: u64, entry_count: u64, elapsed: Duration) {
+        self.note(&self.append_us, elapsed, entry_count, group_id, "append");
+    }
+
+    pub(crate) fn note_apply(&self, group_id: u64, entry_count: u64, elapsed: Duration) {
+        self.note(&self.apply_us, elapsed, entry_count, group_id, "apply");
+    }
+
+    pub(crate) fn add_write(&self, elapsed: Duration) {
+        self.write_us
+            .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone)]
 pub struct OpenRaftStorage {
     pub(crate) db: Arc<DB>,
@@ -78,6 +142,14 @@ pub struct OpenRaftStorage {
     pub(crate) meta_state: Option<Arc<MetaStateMachine>>,
     pub(crate) snapshot_temp_path: Arc<RwLock<Option<PathBuf>>>,
     pub(crate) committer: Option<LogCommitterHandle>,
+    pub(crate) phases: Arc<RaftPhaseMarks>,
+    /// apply 与 snapshot 抓取的互斥锁.
+    ///
+    /// snapshot bundle 必须对应"某个 last_applied 位点的完整状态". 若 flush 与读取
+    /// `last_applied` 之间有并发 apply, meta 位点会大于 bundle 实际内容, openraft
+    /// 随后按该位点 purge raft 日志, 重启时这段日志既不在 SST 也不在日志里, 造成
+    /// 数据丢失. apply 持读锁, snapshot 抓取持写锁.
+    pub(crate) capture_lock: Arc<RwLock<()>>,
 }
 
 impl OpenRaftStorage {
@@ -124,6 +196,8 @@ impl OpenRaftStorage {
             meta_state,
             snapshot_temp_path: Arc::new(RwLock::new(None)),
             committer,
+            phases: Arc::new(RaftPhaseMarks::default()),
+            capture_lock: Arc::new(RwLock::new(())),
         };
         storage.load_state()?;
         Ok(storage)
@@ -207,22 +281,27 @@ impl RaftLogStorage<TypeConfig> for OpenRaftStorage {
                 }
             }
 
-            // 发送到 committer 并等待 flush.
-            committer.append(first_index, count).await?;
+            // 入队后返回. io_completed 由 LogCommitter 在 db.write 返回后调用.
+            let started = std::time::Instant::now();
+            committer.submit_append(first_index, count, callback)?;
+            self.phases
+                .note_append(self.group_id, count, started.elapsed());
 
-            // 更新 in-memory last_log_id
+            // 更新 in-memory last_log_id. overlay 已可读, 落盘完成前即可被读取.
             if let Some(last) = entries_vec.last() {
                 self.state.write().last_log_id = Some(last.log_id);
             }
 
-            callback.io_completed(Ok(()));
             Ok(())
         } else {
             // 无 committer: 同步写入 (旧路径).
             #[cfg(feature = "cluster-test-util")]
             crate::cluster::failpoint::fire(crate::cluster::FailPoint::AppendBeforeDbWrite);
+            let started = std::time::Instant::now();
             self.append_log_entries(&entries_vec)
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
+            self.phases
+                .note_append(self.group_id, count, started.elapsed());
             callback.io_completed(Ok(()));
             Ok(())
         }
@@ -284,12 +363,21 @@ impl RaftLogStorage<TypeConfig> for OpenRaftStorage {
 
     async fn purge(&mut self, log_id: LIdOf) -> std::result::Result<(), std::io::Error> {
         if let Some(ref committer) = self.committer {
+            let start_index = self
+                .state
+                .read()
+                .last_purged_log_id
+                .map(|id| id.index.saturating_add(1))
+                .unwrap_or(0);
+            if log_id.index < start_index {
+                return Ok(());
+            }
             // Purge overlay immediately.
             {
                 let mut ov = committer.overlay.lock();
                 ov.purge_upto(log_id.index);
             }
-            committer.purge(log_id).await?;
+            committer.purge(start_index, log_id).await?;
 
             // 更新 in-memory last_purged_log_id
             let mut state = self.state.write();
@@ -352,9 +440,12 @@ impl RaftStateMachine<TypeConfig> for OpenRaftStorage {
             return Ok(());
         }
 
+        let started = std::time::Instant::now();
         let responses = self
             .apply_entries_internal(&batch_entries)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
+        self.phases
+            .note_apply(self.group_id, batch_entries.len() as u64, started.elapsed());
 
         for (response, responder_opt) in responses.into_iter().zip(responders) {
             if let Some(responder) = responder_opt {
@@ -366,7 +457,11 @@ impl RaftStateMachine<TypeConfig> for OpenRaftStorage {
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        snapshot::OpenRaftSnapshotBuilder::new(self.db.clone(), self.group_id)
+        snapshot::OpenRaftSnapshotBuilder::new(
+            self.db.clone(),
+            self.group_id,
+            Arc::clone(&self.capture_lock),
+        )
     }
 
     async fn install_snapshot(

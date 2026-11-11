@@ -224,6 +224,7 @@ impl DB {
                 run_start.elapsed().as_micros() as u64,
                 AtomicOrdering::Relaxed,
             );
+            self.publish_sst_range_tombstones(&sst_guard);
         }
         self.update_write_stall_state();
 
@@ -340,6 +341,7 @@ impl DB {
             if task.output_level == 0 {
                 self.l0_sstable_count.fetch_add(1, AtomicOrdering::Relaxed);
             }
+            self.publish_sst_range_tombstones(&sst_guard);
         }
         self.update_write_stall_state();
 

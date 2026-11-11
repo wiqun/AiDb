@@ -109,11 +109,22 @@ pub(crate) fn prepare_snapshot_bundle(db: &DB) -> Result<Vec<u8>> {
 pub struct OpenRaftSnapshotBuilder {
     db: std::sync::Arc<DB>,
     group_id: u64,
+    /// 与 apply 共享的抓取锁: 抓快照期间持有写锁, 保证 flush 到读取 `last_applied`
+    /// 之间没有并发 apply 插入.
+    capture_lock: std::sync::Arc<parking_lot::RwLock<()>>,
 }
 
 impl OpenRaftSnapshotBuilder {
-    pub fn new(db: std::sync::Arc<DB>, group_id: u64) -> Self {
-        Self { db, group_id }
+    pub fn new(
+        db: std::sync::Arc<DB>,
+        group_id: u64,
+        capture_lock: std::sync::Arc<parking_lot::RwLock<()>>,
+    ) -> Self {
+        Self {
+            db,
+            group_id,
+            capture_lock,
+        }
     }
 }
 
@@ -198,6 +209,13 @@ impl openraft::RaftSnapshotBuilder<TypeConfig> for OpenRaftSnapshotBuilder {
         Snapshot<CLId, u64, openraft::BasicNode, Cursor<Vec<u8>>>,
         std::io::Error,
     > {
+        // 抓快照必须与 apply 互斥. 否则 `prepare_snapshot_bundle` 里的 flush 完成后,
+        // 并发 apply 会把新条目写进新的 memtable 并推进 `last_applied`, 随后读到的
+        // 位点会大于 bundle 实际内容. openraft 会按该位点 purge raft 日志, 于是
+        // (bundle 内容, 位点] 这段日志既不在 SST 也不在日志里 —— 重启后出现空洞,
+        // RaftCore 在 apply 时 panic 并且 group 再也无法写.
+        let _capture = self.capture_lock.write();
+
         let data =
             prepare_snapshot_bundle(&self.db).map_err(|e| std::io::Error::other(e.to_string()))?;
 
@@ -389,5 +407,78 @@ mod tests {
             .unwrap()
             .get_migration_state()
             .is_none());
+    }
+
+    /// 回归: snapshot 的 `meta.last_log_id` 必须等于 bundle 内部记录的 `last_applied`.
+    ///
+    /// 修复前 `build_snapshot` 先 flush 再读 `last_applied`, 并发 apply 会在这个窗口
+    /// 推进位点, 使 meta 领先于 bundle 内容. openraft 随后按 meta 位点 purge raft
+    /// 日志, 重启后 (bundle 内容, meta] 既不在 SST 也不在日志里, 直接丢数据.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_snapshot_meta_matches_bundle_content_under_concurrent_apply() {
+        use openraft::RaftSnapshotBuilder;
+
+        let dir = TempDir::new().unwrap();
+        let db = DB::open(dir.path(), Options::for_testing()).unwrap();
+        let storage = Arc::new(OpenRaftStorage::new(db, DEFAULT_GROUP_ID, None).unwrap());
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let storage = Arc::clone(&storage);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut index = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    index += 1;
+                    let mut ops = ThinWriteBatch::new();
+                    ops.put(b"hot".to_vec(), index.to_be_bytes().to_vec());
+                    let entry = crate::cluster::types::LogEntry {
+                        log_id: LogId::new(
+                            openraft::vote::leader_id_std::CommittedLeaderId::new(1),
+                            index,
+                        ),
+                        payload: openraft::EntryPayload::Normal(
+                            crate::cluster::types::Request::WriteBatch(ops),
+                        ),
+                    };
+                    storage.apply_entries_internal(&[entry]).unwrap();
+                }
+            })
+        };
+
+        let mut checked = 0usize;
+        for _ in 0..5 {
+            let mut builder = OpenRaftSnapshotBuilder::new(
+                Arc::clone(&storage.db),
+                storage.group_id,
+                Arc::clone(&storage.capture_lock),
+            );
+            let snapshot = builder.build_snapshot().await.unwrap();
+
+            let bundle: SnapshotBundle = postcard::from_bytes(snapshot.snapshot.get_ref()).unwrap();
+            let dir = TempDir::new().unwrap();
+            for file in &bundle.files {
+                let path = dir.path().join(&file.relative_path);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, &file.data).unwrap();
+            }
+            let bundle_db = DB::open(dir.path(), Options::for_testing()).unwrap();
+            let bundle_last_applied: Option<LIdOf> = bundle_db
+                .get(&crate::cluster::storage::keys::last_applied_key(
+                    DEFAULT_GROUP_ID,
+                ))
+                .unwrap()
+                .and_then(|d| rmp_serde::from_slice(&d).ok());
+
+            assert_eq!(
+                snapshot.meta.last_log_id, bundle_last_applied,
+                "snapshot meta 位点必须等于 bundle 内容位点"
+            );
+            checked += 1;
+        }
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+        assert_eq!(checked, 5);
     }
 }

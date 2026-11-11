@@ -98,7 +98,7 @@ impl SlotMigrationExecutor {
                             migration.target_group,
                             Request::PutConditional {
                                 key: key.clone(),
-                                value: v,
+                                value: bytes::Bytes::from(v),
                                 // FIX-0056-A1: 让 apply 内查 Del tombstone,
                                 // 不复活迁移期已被客户端 DEL 掉的 key.
                                 migration_epoch: Some(migration.migration_id),

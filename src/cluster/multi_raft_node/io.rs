@@ -135,7 +135,10 @@ impl MultiRaftNode {
     pub async fn propose_key(&self, key: Vec<u8>, value: Option<Vec<u8>>) -> Result<Response> {
         let (gid, _status) = self.router.route_key(&key)?;
         let request = match value {
-            Some(v) => Request::Put { key, value: v },
+            Some(v) => Request::Put {
+                key,
+                value: bytes::Bytes::from(v),
+            },
             None => Request::Delete { key },
         };
         self.propose_group(gid, request).await

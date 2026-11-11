@@ -12,7 +12,7 @@
 //!         │  (actor)    │
 //!         └─────┬──────┘
 //!               ├─ spawn_blocking: DB write (WriteBatch)
-//!               └─ 通过 oneshot 通知调用方
+//!               └─ db.write 返回后通知 oneshot 或 IOFlushed
 //! ```
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -53,6 +53,8 @@ pub struct LogCommitterConfig {
     pub delay_us: u64,
 }
 
+pub(crate) type BeforeWriteHook = Arc<dyn Fn() -> CrateResult<()> + Send + Sync>;
+
 impl Default for LogCommitterConfig {
     fn default() -> Self {
         Self {
@@ -89,11 +91,40 @@ pub struct LogCommitterMetrics {
 
 // ── IoCommand ──
 
+pub(crate) struct FlushCallback {
+    inner: Option<openraft::storage::IOFlushed<TypeConfig>>,
+}
+
+impl FlushCallback {
+    fn new(callback: openraft::storage::IOFlushed<TypeConfig>) -> Self {
+        Self {
+            inner: Some(callback),
+        }
+    }
+
+    fn complete(mut self, result: std::io::Result<()>) {
+        if let Some(callback) = self.inner.take() {
+            callback.io_completed(result);
+        }
+    }
+}
+
+impl Drop for FlushCallback {
+    fn drop(&mut self) {
+        if let Some(callback) = self.inner.take() {
+            callback.io_completed(Err(std::io::Error::other(
+                "log flush callback dropped before db.write completed",
+            )));
+        }
+    }
+}
+
 pub(crate) enum IoCommand {
     Append {
         first_index: u64,
         count: u64,
-        done: oneshot::Sender<CrateResult<()>>,
+        done: Option<oneshot::Sender<CrateResult<()>>>,
+        on_flush: Option<FlushCallback>,
     },
     SaveVote {
         vote: VOf,
@@ -104,6 +135,7 @@ pub(crate) enum IoCommand {
         done: oneshot::Sender<CrateResult<()>>,
     },
     Purge {
+        start_index: u64,
         log_id: LIdOf,
         done: oneshot::Sender<CrateResult<()>>,
     },
@@ -152,12 +184,29 @@ impl LogCommitterHandle {
         self.send(IoCommand::Append {
             first_index,
             count,
-            done: tx,
+            done: Some(tx),
+            on_flush: None,
         })
         .map_err(|e| std::io::Error::other(e.to_string()))?;
         rx.await
             .map_err(|_| std::io::Error::other("committer channel closed"))?
             .map_err(|e| std::io::Error::other(e.to_string()))
+    }
+
+    /// 入队后立即返回. `callback` 在该批 `db.write` 返回后触发.
+    pub fn submit_append(
+        &self,
+        first_index: u64,
+        count: u64,
+        callback: openraft::storage::IOFlushed<TypeConfig>,
+    ) -> std::io::Result<()> {
+        self.send(IoCommand::Append {
+            first_index,
+            count,
+            done: None,
+            on_flush: Some(FlushCallback::new(callback)),
+        })
+        .map_err(|e| std::io::Error::other(e.to_string()))
     }
 
     /// 发送 SaveVote 命令, 等待完成.
@@ -181,10 +230,15 @@ impl LogCommitterHandle {
     }
 
     /// 发送 Purge 命令, 等待完成.
-    pub async fn purge(&self, log_id: LIdOf) -> std::io::Result<()> {
+    /// `start_index` 是上次 purge 的下一条, 删除区间为 `[start_index, log_id.index]`.
+    pub async fn purge(&self, start_index: u64, log_id: LIdOf) -> std::io::Result<()> {
         let (tx, rx) = oneshot::channel();
-        self.send(IoCommand::Purge { log_id, done: tx })
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        self.send(IoCommand::Purge {
+            start_index,
+            log_id,
+            done: tx,
+        })
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
         rx.await
             .map_err(|_| std::io::Error::other("committer channel closed"))?
             .map_err(|e| std::io::Error::other(e.to_string()))
@@ -204,7 +258,8 @@ impl LogCommitterHandle {
 struct AppendOp {
     first_index: u64,
     count: u64,
-    done: oneshot::Sender<CrateResult<()>>,
+    done: Option<oneshot::Sender<CrateResult<()>>>,
+    on_flush: Option<FlushCallback>,
 }
 
 struct TruncateOp {
@@ -213,6 +268,7 @@ struct TruncateOp {
 }
 
 struct PurgeOp {
+    start_index: u64,
     log_id: LIdOf,
     done: oneshot::Sender<CrateResult<()>>,
 }
@@ -224,6 +280,25 @@ pub(crate) fn spawn_committer(
     group_id: u64,
     db: Arc<DB>,
     cfg: LogCommitterConfig,
+) -> LogCommitterHandle {
+    spawn_committer_inner(group_id, db, cfg, None)
+}
+
+#[cfg(test)]
+pub(crate) fn spawn_committer_for_test(
+    group_id: u64,
+    db: Arc<DB>,
+    cfg: LogCommitterConfig,
+    before_write: BeforeWriteHook,
+) -> LogCommitterHandle {
+    spawn_committer_inner(group_id, db, cfg, Some(before_write))
+}
+
+fn spawn_committer_inner(
+    group_id: u64,
+    db: Arc<DB>,
+    cfg: LogCommitterConfig,
+    before_write: Option<BeforeWriteHook>,
 ) -> LogCommitterHandle {
     let (tx, rx) = mpsc::unbounded_channel();
     let metrics = Arc::new(LogCommitterMetrics::default());
@@ -239,7 +314,14 @@ pub(crate) fn spawn_committer(
     };
 
     let join = tokio::spawn(run_committer(
-        group_id, db, rx, cfg, metrics, fatal, overlay,
+        group_id,
+        db,
+        rx,
+        cfg,
+        metrics,
+        fatal,
+        overlay,
+        before_write,
     ));
 
     handle.join.lock().replace(join);
@@ -255,6 +337,7 @@ async fn run_committer(
     metrics: Arc<LogCommitterMetrics>,
     _fatal: Arc<AtomicBool>,
     overlay: Arc<Mutex<PendingLogOverlay<EOf>>>,
+    before_write: Option<BeforeWriteHook>,
 ) {
     let mut pending_commands: u64 = 0;
     let mut pending_entries: u64 = 0;
@@ -278,6 +361,7 @@ async fn run_committer(
             &metrics,
             &mut pending_commands,
             &mut pending_entries,
+            before_write.clone(),
         )
         .await;
 
@@ -352,6 +436,7 @@ async fn flush_batch(
     metrics: &Arc<LogCommitterMetrics>,
     pending_commands: &mut u64,
     pending_entries: &mut u64,
+    before_write: Option<BeforeWriteHook>,
 ) {
     let t0 = Instant::now();
 
@@ -369,11 +454,13 @@ async fn flush_batch(
                 first_index,
                 count,
                 done,
+                on_flush,
             } => {
                 appends.push(AppendOp {
                     first_index,
                     count,
                     done,
+                    on_flush,
                 });
                 *pending_commands = pending_commands.saturating_sub(1);
                 *pending_entries = pending_entries.saturating_sub(count);
@@ -385,8 +472,16 @@ async fn flush_batch(
             IoCommand::TruncateAfter { log_id, done } => {
                 truncates.push(TruncateOp { log_id, done });
             }
-            IoCommand::Purge { log_id, done } => {
-                purges.push(PurgeOp { log_id, done });
+            IoCommand::Purge {
+                start_index,
+                log_id,
+                done,
+            } => {
+                purges.push(PurgeOp {
+                    start_index,
+                    log_id,
+                    done,
+                });
             }
             IoCommand::FlushAndSync { done } => {
                 sync_dones.push(done);
@@ -430,10 +525,10 @@ async fn flush_batch(
         .collect();
 
     let total_entries: u64 = batch_entries.iter().map(|(_, e)| e.len() as u64).sum();
-    let last_entry = batch_entries
+    let last_log_id = batch_entries
         .last()
         .and_then(|(_, entries)| entries.last())
-        .cloned();
+        .map(|entry| entry.log_id.clone());
     let total_cmds_val =
         (appends.len() + truncates.len() + purges.len() + usize::from(vote_to_save.is_some()))
             as u64;
@@ -441,7 +536,7 @@ async fn flush_batch(
     let db_clone = Arc::clone(db);
     let gid = group_id;
     let truncate_data: Vec<(Option<LIdOf>,)> = truncates.iter().map(|t| (t.log_id,)).collect();
-    let purge_data: Vec<(LIdOf,)> = purges.iter().map(|p| (p.log_id,)).collect();
+    let purge_data: Vec<(u64, LIdOf)> = purges.iter().map(|p| (p.start_index, p.log_id)).collect();
     let vote = vote_to_save;
 
     let result = tokio::task::spawn_blocking(move || {
@@ -452,6 +547,7 @@ async fn flush_batch(
             vote,
             &truncate_data,
             &purge_data,
+            before_write,
         )
     })
     .await;
@@ -466,10 +562,8 @@ async fn flush_batch(
                 .total_commands_flushed
                 .fetch_add(total_cmds_val, Ordering::Relaxed);
 
-            if let Some(ref last) = last_entry {
-                metrics
-                    .durable_index
-                    .store(last.log_id.index, Ordering::Relaxed);
+            if let Some(last) = last_log_id {
+                metrics.durable_index.store(last.index, Ordering::Relaxed);
             }
 
             // 从 overlay 移除已 flush 的 entry
@@ -492,10 +586,8 @@ async fn flush_batch(
                 }
             }
 
-            // 通知所有调用方: success
-            for op in appends {
-                let _ = op.done.send(Ok(()));
-            }
+            // 通知所有调用方: success. 回调与 oneshot 同在 db.write 返回之后.
+            notify_appends(appends, Ok(()));
             if let Some(done) = vote_done {
                 let _ = done.send(Ok(()));
             }
@@ -537,13 +629,7 @@ fn send_all_errors(
     vote_done: Option<oneshot::Sender<CrateResult<()>>>,
     err_msg: &str,
 ) {
-    for op in appends {
-        let _ = op
-            .done
-            .send(Err(crate::error::Error::Cluster(ClusterError::Internal(
-                err_msg.to_string(),
-            ))));
-    }
+    notify_appends(appends, Err(std::io::Error::other(err_msg)));
     if let Some(done) = vote_done {
         let _ = done.send(Err(crate::error::Error::Cluster(ClusterError::Internal(
             err_msg.to_string(),
@@ -565,16 +651,71 @@ fn send_all_errors(
     }
 }
 
-/// 同步执行 DB 写入 (在 spawn_blocking 中运行).
+fn notify_appends(appends: Vec<AppendOp>, result: std::io::Result<()>) {
+    for op in appends {
+        let io_result = match &result {
+            Ok(()) => Ok(()),
+            Err(err) => Err(std::io::Error::other(err.to_string())),
+        };
+        if let Some(done) = op.done {
+            let crate_result = match &result {
+                Ok(()) => Ok(()),
+                Err(err) => Err(crate::error::Error::Cluster(ClusterError::Internal(
+                    err.to_string(),
+                ))),
+            };
+            let _ = done.send(crate_result);
+        }
+        if let Some(callback) = op.on_flush {
+            callback.complete(io_result);
+        }
+    }
+}
+
+/// 把 `[start_index, log_id.index]` 收成一条范围删除, 并在同一批写下 `last_purged`.
+fn queue_log_purge(
+    batch: &mut WriteBatch,
+    group_id: u64,
+    purge_data: &[(u64, LIdOf)],
+) -> CrateResult<()> {
+    use crate::cluster::storage::keys::{last_purged_log_id_key, log_key};
+
+    let mut purged_to: Option<&LIdOf> = None;
+    for (start_index, lid) in purge_data {
+        if lid.index < *start_index {
+            continue;
+        }
+        batch.delete_range(
+            log_key(group_id, *start_index),
+            log_key(group_id, lid.index.saturating_add(1)),
+        );
+        purged_to = Some(match purged_to {
+            Some(prev) if prev.index >= lid.index => prev,
+            _ => lid,
+        });
+    }
+    if let Some(lid) = purged_to {
+        let data =
+            rmp_serde::to_vec(lid).map_err(|e| ClusterError::Serialization(e.to_string()))?;
+        batch.put(last_purged_log_id_key(group_id), data);
+    }
+    Ok(())
+}
+
 fn sync_flush(
     db: &Arc<DB>,
     group_id: u64,
     append_batches: &[(u64, Vec<EOf>)],
     vote: Option<VOf>,
     truncate_data: &[(Option<LIdOf>,)],
-    purge_data: &[(LIdOf,)],
+    purge_data: &[(u64, LIdOf)],
+    before_write: Option<BeforeWriteHook>,
 ) -> CrateResult<()> {
     use crate::cluster::storage::keys;
+
+    if let Some(hook) = before_write {
+        hook()?;
+    }
 
     // 1. 先执行批量写入 (PUT ops in WriteBatch)
     {
@@ -600,16 +741,7 @@ fn sync_flush(
             batch.put(keys::vote_key(group_id), data);
         }
 
-        // Purge: 扫描 range 内每一条 key, 加入 batch delete
-        for (lid,) in purge_data {
-            let start = keys::log_key(group_id, 0);
-            let end = keys::log_key(group_id, lid.index.saturating_add(1));
-            if let Ok(iter) = db.scan(Some(&start), Some(&end)) {
-                for (key, _) in iter.flatten() {
-                    batch.delete(key);
-                }
-            }
-        }
+        queue_log_purge(&mut batch, group_id, purge_data)?;
 
         db.write(&batch)?;
     }
@@ -647,7 +779,7 @@ fn sync_flush(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cluster::storage::keys::{log_key, vote_key};
+    use crate::cluster::storage::keys::{last_purged_log_id_key, log_key, vote_key};
     use crate::cluster::types::Request;
     use crate::config::Options;
     use openraft::vote::leader_id_std::CommittedLeaderId;
@@ -666,7 +798,7 @@ mod tests {
             log_id: LogId::new(CommittedLeaderId::new(term), index),
             payload: EntryPayload::Normal(Request::Put {
                 key: format!("k{index}").into_bytes(),
-                value: format!("v{index}").into_bytes(),
+                value: bytes::Bytes::from(format!("v{index}").into_bytes()),
             }),
         }
     }
@@ -746,10 +878,139 @@ mod tests {
         handle.append(1, 3).await.unwrap();
 
         handle
-            .purge(LogId::new(CommittedLeaderId::new(1), 2))
+            .purge(0, LogId::new(CommittedLeaderId::new(1), 2))
             .await
             .unwrap();
 
+        assert!(db.get(&log_key(1, 1)).unwrap().is_none(), "entry 1 purged");
+        assert!(db.get(&log_key(1, 2)).unwrap().is_none(), "entry 2 purged");
         assert!(db.get(&log_key(1, 3)).unwrap().is_some(), "entry 3 exists");
+        let stored: LIdOf = rmp_serde::from_slice(
+            &db.get(&last_purged_log_id_key(1))
+                .unwrap()
+                .expect("last_purged"),
+        )
+        .unwrap();
+        assert_eq!(stored.index, 2);
+
+        handle
+            .purge(3, LogId::new(CommittedLeaderId::new(1), 3))
+            .await
+            .unwrap();
+        assert!(
+            db.get(&log_key(1, 1)).unwrap().is_none(),
+            "entry 1 stays purged"
+        );
+        assert!(db.get(&log_key(1, 3)).unwrap().is_none(), "entry 3 purged");
+    }
+
+    #[test]
+    fn purge_range_drops_inclusive_index_and_keeps_newer_append() {
+        let (_dir, db) = setup_db();
+        let purge_to = LogId::new(CommittedLeaderId::new(1), 2);
+        sync_flush(
+            &db,
+            1,
+            &[(1, vec![mk_entry(1, 1), mk_entry(2, 1), mk_entry(3, 1)])],
+            None,
+            &[],
+            &[(0, purge_to)],
+            None,
+        )
+        .unwrap();
+        assert!(db.get(&log_key(1, 1)).unwrap().is_none());
+        assert!(db.get(&log_key(1, 2)).unwrap().is_none());
+        assert!(db.get(&log_key(1, 3)).unwrap().is_some());
+
+        sync_flush(
+            &db,
+            1,
+            &[(4, vec![mk_entry(4, 1)])],
+            None,
+            &[],
+            &[(3, LogId::new(CommittedLeaderId::new(1), 3))],
+            None,
+        )
+        .unwrap();
+        assert!(db.get(&log_key(1, 1)).unwrap().is_none());
+        assert!(db.get(&log_key(1, 3)).unwrap().is_none());
+        assert!(db.get(&log_key(1, 4)).unwrap().is_some());
+    }
+
+    fn signal_callback() -> (
+        openraft::storage::IOFlushed<TypeConfig>,
+        tokio::sync::oneshot::Receiver<std::io::Result<()>>,
+    ) {
+        use openraft::type_config::TypeConfigExt;
+        let (tx, rx) = TypeConfig::oneshot();
+        (openraft::storage::IOFlushed::signal(tx), rx)
+    }
+
+    #[tokio::test]
+    async fn dropped_flush_callback_is_error() {
+        let (cb, rx) = signal_callback();
+        drop(FlushCallback::new(cb));
+        let result = rx.await.unwrap();
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn submit_append_returns_before_db_write() {
+        let (_dir, db) = setup_db();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<CrateResult<()>>();
+        let release_rx = Mutex::new(release_rx);
+        let first_flush = AtomicBool::new(true);
+        let hook: BeforeWriteHook = Arc::new(move || {
+            if !first_flush.swap(false, Ordering::SeqCst) {
+                return Ok(());
+            }
+            entered_tx
+                .send(())
+                .map_err(|_| ClusterError::Internal("flush gate closed".into()))?;
+            release_rx
+                .lock()
+                .recv()
+                .map_err(|_| ClusterError::Internal("flush gate dropped".into()))?
+        });
+        let handle = spawn_committer_for_test(1, db.clone(), LogCommitterConfig::default(), hook);
+        {
+            let mut ov = handle.overlay.lock();
+            ov.insert_at(1, mk_entry(1, 1));
+            ov.insert_at(2, mk_entry(2, 1));
+        }
+        let (cb1, rx1) = signal_callback();
+        let (cb2, mut rx2) = signal_callback();
+        handle.submit_append(1, 1, cb1).unwrap();
+        tokio::task::spawn_blocking(move || {
+            entered_rx.recv_timeout(std::time::Duration::from_secs(2))
+        })
+        .await
+        .unwrap()
+        .expect("flush reached db.write");
+        handle.submit_append(2, 1, cb2).unwrap();
+        assert!(rx2.try_recv().is_err());
+        assert!(db.get(&log_key(1, 1)).unwrap().is_none());
+        release_tx.send(Ok(())).unwrap();
+        assert!(rx1.await.unwrap().is_ok());
+        assert!(rx2.await.unwrap().is_ok());
+        assert!(db.get(&log_key(1, 1)).unwrap().is_some());
+        assert!(db.get(&log_key(1, 2)).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn submit_append_callback_is_err_when_write_fails() {
+        let (_dir, db) = setup_db();
+        let hook: BeforeWriteHook =
+            Arc::new(|| Err(ClusterError::Internal("injected write failure".into()).into()));
+        let handle = spawn_committer_for_test(1, db.clone(), LogCommitterConfig::default(), hook);
+        {
+            let mut ov = handle.overlay.lock();
+            ov.insert_at(1, mk_entry(1, 1));
+        }
+        let (cb, rx) = signal_callback();
+        handle.submit_append(1, 1, cb).unwrap();
+        assert!(rx.await.unwrap().is_err());
+        assert!(db.get(&log_key(1, 1)).unwrap().is_none());
     }
 }
