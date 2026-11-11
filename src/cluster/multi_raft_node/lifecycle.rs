@@ -308,11 +308,10 @@ impl MultiRaftNode {
         if let Some(factory) = &cfg.compaction_removal_listener_factory {
             storage.set_compaction_removal_listener(Some(factory(storage.db().clone())));
         }
-        let db = storage.db().clone();
         let mut config = cfg.raft_node_config.clone();
         config.group_id = group_id;
         let factory = net_factory.read().clone().with_group_id(group_id);
-        let node = OpenRaftNode::new(config, db, factory).await?;
+        let node = OpenRaftNode::new_with_db_slot(config, storage.db_slot(), factory).await?;
         Ok((node, storage))
     }
 

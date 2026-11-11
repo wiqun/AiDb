@@ -625,7 +625,7 @@ mod tests {
 
         let mut keys = Vec::new();
         visit_sm_user_pairs(
-            storage.db(),
+            storage.db().as_ref(),
             DEFAULT_GROUP_ID,
             b"doc:",
             Some(b"doc;"),
@@ -639,7 +639,7 @@ mod tests {
 
         let mut seen = 0usize;
         visit_sm_user_pairs(
-            storage.db(),
+            storage.db().as_ref(),
             DEFAULT_GROUP_ID,
             b"doc:",
             Some(b"doc;"),
@@ -668,7 +668,7 @@ mod tests {
         let scan = |start: &[u8], end: &[u8], limit: usize, reverse: bool| {
             keys(
                 scan_sm_user_pairs_limited(
-                    storage.db(),
+                    storage.db().as_ref(),
                     DEFAULT_GROUP_ID,
                     start,
                     end,
@@ -715,7 +715,7 @@ mod tests {
             vec![b"q:z".to_vec(), b"p:e".to_vec()]
         );
         assert_eq!(
-            last_sm_user_pair(storage.db(), DEFAULT_GROUP_ID, b"", b"").unwrap(),
+            last_sm_user_pair(storage.db().as_ref(), DEFAULT_GROUP_ID, b"", b"").unwrap(),
             Some((b"q:z".to_vec(), b"other".to_vec()))
         );
     }

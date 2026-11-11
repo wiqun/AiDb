@@ -125,23 +125,31 @@ impl OpenRaftNode {
         db: Arc<DB>,
         network_factory: RaftNetworkClientFactory,
     ) -> Result<Self> {
+        Self::new_with_db_slot(config, Arc::new(RwLock::new(db)), network_factory).await
+    }
+
+    pub async fn new_with_db_slot(
+        config: RaftNodeConfig,
+        db_slot: crate::cluster::log_committer::DbSlot,
+        network_factory: RaftNetworkClientFactory,
+    ) -> Result<Self> {
         config.validate()?;
 
-        if !db.use_wal() {
+        if !db_slot.read().use_wal() {
             return Err(Error::Cluster(ClusterError::InvalidConfig(
                 "raft mode requires use_wal=true".into(),
             )));
         }
 
-        // 可选: 创建 LogCommitter.
-        let committer = config
-            .log_committer_config
-            .as_ref()
-            .map(|cfg| spawn_committer(config.group_id, db.clone(), cfg.clone()));
+        // 可选: 创建 LogCommitter. 和状态机共用一个槽, 安装快照换库时两边一起换.
+        let committer = config.log_committer_config.as_ref().map(|cfg| {
+            spawn_committer(config.group_id, Arc::clone(&db_slot), cfg.clone())
+        });
 
+        let opened = db_slot.read().clone();
         let storage =
-            OpenRaftStorage::new_with_committer(db.clone(), config.group_id, None, committer)?;
-        Self::new_with_storage(config, db, storage, network_factory).await
+            OpenRaftStorage::new_with_committer(db_slot, config.group_id, None, committer)?;
+        Self::new_with_storage(config, opened, storage, network_factory).await
     }
 
     pub async fn new_with_storage(

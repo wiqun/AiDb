@@ -3,6 +3,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use parking_lot::RwLock;
+
+use crate::cluster::log_committer::DbSlot;
 use crate::config::Options;
 use crate::engine::compaction::{CompactionFilter, CompactionRemovalListener};
 use crate::error::Result;
@@ -31,7 +34,7 @@ pub struct AggregateStats {
 /// 分片存储: 每个 Group 独立的 DB 引擎实例
 #[derive(Clone)]
 pub struct ShardedStorage {
-    db: Arc<DB>,
+    db: DbSlot,
     group_id: u64,
     path: PathBuf,
 }
@@ -41,7 +44,7 @@ impl ShardedStorage {
     pub fn open(data_dir: &Path, group_id: u64, options: Options) -> Result<Self> {
         let group_path = data_dir.join(format!("group_{}", group_id));
         std::fs::create_dir_all(&group_path)?;
-        let db = DB::open(&group_path, options)?;
+        let db = Arc::new(RwLock::new(DB::open(&group_path, options)?));
         Ok(Self {
             db,
             group_id,
@@ -52,12 +55,16 @@ impl ShardedStorage {
     /// 关闭存储 (Arc<DB> drop 自动关闭引擎).
     /// 显式 close 确保 compaction/flush 线程安全终止且所有数据刷盘.
     pub fn close(self) -> Result<()> {
-        self.db.close()?;
+        self.db.read().close()?;
         Ok(())
     }
 
-    pub fn db(&self) -> &Arc<DB> {
-        &self.db
+    pub fn db(&self) -> parking_lot::RwLockReadGuard<'_, Arc<DB>> {
+        self.db.read()
+    }
+
+    pub fn db_slot(&self) -> DbSlot {
+        Arc::clone(&self.db)
     }
 
     pub fn group_id(&self) -> u64 {
@@ -70,7 +77,7 @@ impl ShardedStorage {
 
     /// 设置 compaction 过滤器, 在下次 compaction 时生效.
     pub fn set_compaction_filter(&self, filter: Option<Arc<dyn CompactionFilter>>) {
-        self.db.set_compaction_filter(filter);
+        self.db.read().set_compaction_filter(filter);
     }
 
     /// 设置 filter Remove (最新 Put) 监听器.
@@ -78,6 +85,6 @@ impl ShardedStorage {
         &self,
         listener: Option<Arc<dyn CompactionRemovalListener>>,
     ) {
-        self.db.set_compaction_removal_listener(listener);
+        self.db.read().set_compaction_removal_listener(listener);
     }
 }

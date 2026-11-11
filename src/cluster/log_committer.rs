@@ -32,6 +32,9 @@ use crate::DB;
 
 // ── Type aliases ──
 
+/// 安装快照时换掉里面的 `Arc<DB>`. 日志提交和状态机都读这个槽, 避免关掉对方正在用的库.
+pub(crate) type DbSlot = Arc<parking_lot::RwLock<Arc<DB>>>;
+
 pub(crate) type EOf = <TypeConfig as openraft::RaftTypeConfig>::Entry;
 pub(crate) type CLId = CommittedLeaderId<u64>;
 pub(crate) type LIdOf = LogId<CLId>;
@@ -278,7 +281,7 @@ struct PurgeOp {
 /// 启动 LogCommitter actor, 返回 handle.
 pub(crate) fn spawn_committer(
     group_id: u64,
-    db: Arc<DB>,
+    db: DbSlot,
     cfg: LogCommitterConfig,
 ) -> LogCommitterHandle {
     spawn_committer_inner(group_id, db, cfg, None)
@@ -287,7 +290,7 @@ pub(crate) fn spawn_committer(
 #[cfg(test)]
 pub(crate) fn spawn_committer_for_test(
     group_id: u64,
-    db: Arc<DB>,
+    db: DbSlot,
     cfg: LogCommitterConfig,
     before_write: BeforeWriteHook,
 ) -> LogCommitterHandle {
@@ -296,7 +299,7 @@ pub(crate) fn spawn_committer_for_test(
 
 fn spawn_committer_inner(
     group_id: u64,
-    db: Arc<DB>,
+    db: DbSlot,
     cfg: LogCommitterConfig,
     before_write: Option<BeforeWriteHook>,
 ) -> LogCommitterHandle {
@@ -331,7 +334,7 @@ fn spawn_committer_inner(
 
 async fn run_committer(
     group_id: u64,
-    db: Arc<DB>,
+    db: DbSlot,
     mut rx: mpsc::UnboundedReceiver<IoCommand>,
     cfg: LogCommitterConfig,
     metrics: Arc<LogCommitterMetrics>,
@@ -430,7 +433,7 @@ impl BatchState {
 
 async fn flush_batch(
     group_id: u64,
-    db: &Arc<DB>,
+    db: &DbSlot,
     batch: Vec<IoCommand>,
     overlay: &Arc<Mutex<PendingLogOverlay<EOf>>>,
     metrics: &Arc<LogCommitterMetrics>,
@@ -536,15 +539,18 @@ async fn flush_batch(
         (appends.len() + truncates.len() + purges.len() + usize::from(vote_to_save.is_some()))
             as u64;
 
-    let db_clone = Arc::clone(db);
+    // 读锁在阻塞线程里盖住这次写, 不能跨 await (parking_lot 的守卫不是 Send).
+    // 安装快照拿同一把写锁, 所以关库会等这次写结束.
+    let db_slot = Arc::clone(db);
     let gid = group_id;
     let truncate_data: Vec<(Option<LIdOf>,)> = truncates.iter().map(|t| (t.log_id,)).collect();
     let purge_data: Vec<(u64, LIdOf)> = purges.iter().map(|p| (p.start_index, p.log_id)).collect();
     let vote = vote_to_save;
 
     let result = tokio::task::spawn_blocking(move || {
+        let db_guard = db_slot.read();
         sync_flush(
-            &db_clone,
+            &db_guard,
             gid,
             &batch_entries,
             vote,
@@ -804,7 +810,7 @@ mod tests {
     #[tokio::test]
     async fn test_append_and_flush() {
         let (_dir, db) = setup_db();
-        let handle = spawn_committer(1, db.clone(), LogCommitterConfig::default());
+        let handle = spawn_committer(1, Arc::new(parking_lot::RwLock::new(db.clone())), LogCommitterConfig::default());
 
         {
             let mut ov = handle.overlay.lock();
@@ -825,7 +831,7 @@ mod tests {
     #[tokio::test]
     async fn test_save_vote() {
         let (_dir, db) = setup_db();
-        let handle = spawn_committer(1, db.clone(), LogCommitterConfig::default());
+        let handle = spawn_committer(1, Arc::new(parking_lot::RwLock::new(db.clone())), LogCommitterConfig::default());
 
         let vote = VOf {
             leader_id: LeaderId {
@@ -850,7 +856,7 @@ mod tests {
     #[tokio::test]
     async fn test_truncate_after() {
         let (_dir, db) = setup_db();
-        let handle = spawn_committer(1, db.clone(), LogCommitterConfig::default());
+        let handle = spawn_committer(1, Arc::new(parking_lot::RwLock::new(db.clone())), LogCommitterConfig::default());
 
         {
             let mut ov = handle.overlay.lock();
@@ -883,7 +889,7 @@ mod tests {
     #[tokio::test]
     async fn test_purge_upto() {
         let (_dir, db) = setup_db();
-        let handle = spawn_committer(1, db.clone(), LogCommitterConfig::default());
+        let handle = spawn_committer(1, Arc::new(parking_lot::RwLock::new(db.clone())), LogCommitterConfig::default());
 
         {
             let mut ov = handle.overlay.lock();
@@ -989,7 +995,7 @@ mod tests {
                 .recv()
                 .map_err(|_| ClusterError::Internal("flush gate dropped".into()))?
         });
-        let handle = spawn_committer_for_test(1, db.clone(), LogCommitterConfig::default(), hook);
+        let handle = spawn_committer_for_test(1, Arc::new(parking_lot::RwLock::new(db.clone())), LogCommitterConfig::default(), hook);
         {
             let mut ov = handle.overlay.lock();
             ov.insert_at(1, mk_entry(1, 1));
@@ -1026,7 +1032,7 @@ mod tests {
         let (_dir, db) = setup_db();
         let hook: BeforeWriteHook =
             Arc::new(|| Err(ClusterError::Internal("injected write failure".into()).into()));
-        let handle = spawn_committer_for_test(1, db.clone(), LogCommitterConfig::default(), hook);
+        let handle = spawn_committer_for_test(1, Arc::new(parking_lot::RwLock::new(db.clone())), LogCommitterConfig::default(), hook);
         {
             let mut ov = handle.overlay.lock();
             ov.insert_at(1, mk_entry(1, 1));
@@ -1052,7 +1058,7 @@ mod tests {
         let (_dir, db) = setup_db();
         let hook: BeforeWriteHook =
             Arc::new(|| Err(ClusterError::Internal("injected write failure".into()).into()));
-        let handle = spawn_committer_for_test(1, db.clone(), LogCommitterConfig::default(), hook);
+        let handle = spawn_committer_for_test(1, Arc::new(parking_lot::RwLock::new(db.clone())), LogCommitterConfig::default(), hook);
         {
             let mut ov = handle.overlay.lock();
             ov.insert_at(1, mk_entry(1, 1));

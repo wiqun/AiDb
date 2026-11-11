@@ -59,7 +59,7 @@ impl OpenRaftStorage {
         if db_batch.is_empty() {
             return Ok(());
         }
-        self.db
+        self.db.read()
             .write(&db_batch)
             .map_err(|e| Error::Cluster(map_db_err(e)))?;
         Ok(())
@@ -77,7 +77,7 @@ impl OpenRaftStorage {
         if db_batch.is_empty() {
             return Ok(());
         }
-        self.db
+        self.db.read()
             .write(&db_batch)
             .map_err(|e| Error::Cluster(map_db_err(e)))?;
         Ok(())
@@ -102,7 +102,7 @@ impl OpenRaftStorage {
         if batch.is_empty() {
             return Ok(());
         }
-        self.db
+        self.db.read()
             .write(&batch)
             .map_err(|e| Error::Cluster(map_db_err(e)))?;
         Ok(())
@@ -160,7 +160,7 @@ impl OpenRaftStorage {
                     // 将连续的 data entry 批量合并到一个 WriteBatch.
                     //
                     // append_request_to_batch 目前唯一可能返回 Err 的路径是
-                    // PutConditional 内部 self.db.get() 的磁盘 I/O 读取失败 —
+                    // PutConditional 内部 self.db.read().get() 的磁盘 I/O 读取失败 —
                     // 这是基础设施故障, 不是业务结果 (Put/Delete/WriteBatch 三个
                     // 分支永远不失败; PutConditional "条件不满足" 本身走的是
                     // Ok(()) 分支, 不是 Err). 因此这里的错误必须和本文件里其它
@@ -208,7 +208,7 @@ impl OpenRaftStorage {
                             crate::cluster::FailPoint::ApplyBeforePersist,
                         );
                         let write_started = std::time::Instant::now();
-                        self.db
+                        self.db.read()
                             .write_without_wal(&batch)
                             .map_err(|e| Error::Cluster(map_db_err(e)))?;
                         self.phases.add_write(write_started.elapsed());
@@ -304,13 +304,13 @@ impl OpenRaftStorage {
         // propose 前查完就假定结论一直有效.
         if let Some(epoch) = migration_epoch {
             let ts_key = mig_tombstone_key(self.group_id, epoch, key);
-            if let Some((MigOp::Del, _)) = self.db.get(&ts_key)?.and_then(|v| decode_tombstone(&v))
+            if let Some((MigOp::Del, _)) = self.db.read().get(&ts_key)?.and_then(|v| decode_tombstone(&v))
             {
                 return Ok(());
             }
         }
         let sm = sm_key(self.group_id, key);
-        if Self::overlay_key_exists(overlay, &self.db, &sm)? {
+        if Self::overlay_key_exists(overlay, &self.db.read(), &sm)? {
             return Ok(());
         }
         batch.put(sm.clone(), value.to_vec());
@@ -333,7 +333,7 @@ impl OpenRaftStorage {
         }
         let tip_key = mig_tip_key(self.group_id, epoch);
         let tip_before = self
-            .db
+            .db.read()
             .get(&tip_key)?
             .and_then(|v| decode_tip(&v))
             .unwrap_or(0);
@@ -369,7 +369,7 @@ impl OpenRaftStorage {
     fn append_migration_gc_to_batch(&self, batch: &mut WriteBatch, epoch: u64) -> Result<()> {
         let start = mig_range_start(self.group_id, epoch);
         let end = mig_range_end(self.group_id, epoch);
-        for item in self.db.scan(Some(&start), Some(&end))? {
+        for item in self.db.read().scan(Some(&start), Some(&end))? {
             let (key, _) = item?;
             batch.delete(key);
         }
@@ -432,7 +432,7 @@ impl OpenRaftStorage {
             last_applied_key(self.group_id),
             Self::serialize_last_applied(log_id)?,
         );
-        self.db
+        self.db.read()
             .write(&batch)
             .map_err(|e| Error::Cluster(map_db_err(e)))?;
         self.state.write().last_applied = Some(*log_id);
@@ -453,7 +453,7 @@ impl OpenRaftStorage {
             last_applied_key(self.group_id),
             Self::serialize_last_applied(log_id)?,
         );
-        self.db
+        self.db.read()
             .write(&batch)
             .map_err(|e| Error::Cluster(map_db_err(e)))?;
         self.state.write().last_applied = Some(*log_id);
@@ -476,7 +476,7 @@ impl OpenRaftStorage {
             last_applied_key(self.group_id),
             Self::serialize_last_applied(log_id)?,
         );
-        self.db
+        self.db.read()
             .write(&batch)
             .map_err(|e| Error::Cluster(map_db_err(e)))?;
         self.state.write().last_applied = Some(*log_id);
@@ -484,15 +484,15 @@ impl OpenRaftStorage {
     }
 
     pub fn get_state_machine_value(&self, user_key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.db
+        self.db.read()
             .get(&sm_key(self.group_id, user_key))
             .map_err(|e| Error::Cluster(map_db_err(e)))
     }
 
     pub fn get_state_machine_bytes(&self, user_key: &[u8]) -> Result<Option<bytes::Bytes>> {
         let key = sm_key(self.group_id, user_key);
-        let pinned = self
-            .db
+        let db = self.db.read();
+        let pinned = db
             .get_pinned(&key)
             .map_err(|e| Error::Cluster(map_db_err(e)))?;
         Ok(pinned.map(|p| p.into_bytes()))
@@ -502,7 +502,7 @@ impl OpenRaftStorage {
     pub fn get_migration_tip(&self, epoch: u64) -> Result<u64> {
         let key = mig_tip_key(self.group_id, epoch);
         Ok(self
-            .db
+            .db.read()
             .get(&key)
             .map_err(|e| Error::Cluster(map_db_err(e)))?
             .and_then(|v| decode_tip(&v))
@@ -515,7 +515,7 @@ impl OpenRaftStorage {
     pub fn get_migration_tombstone(&self, epoch: u64, user_key: &[u8]) -> Result<Option<MigOp>> {
         let key = mig_tombstone_key(self.group_id, epoch, user_key);
         Ok(self
-            .db
+            .db.read()
             .get(&key)
             .map_err(|e| Error::Cluster(map_db_err(e)))?
             .and_then(|v| decode_tombstone(&v))
@@ -609,7 +609,7 @@ mod tests {
             Some(b"v1".to_vec())
         );
         assert_eq!(
-            storage.db.get(&sm_key(DEFAULT_GROUP_ID, b"k")).unwrap(),
+            storage.db.read().get(&sm_key(DEFAULT_GROUP_ID, b"k")).unwrap(),
             Some(b"v1".to_vec())
         );
     }
@@ -643,13 +643,13 @@ mod tests {
         );
 
         let ts1 = storage
-            .db
+            .db.read()
             .get(&mig_tombstone_key(DEFAULT_GROUP_ID, 7, b"k1"))
             .unwrap()
             .expect("Put op 必须同 entry 写入 tombstone");
         assert_eq!(decode_tombstone(&ts1), Some((MigOp::Put, 1)));
         let ts2 = storage
-            .db
+            .db.read()
             .get(&mig_tombstone_key(DEFAULT_GROUP_ID, 7, b"k2"))
             .unwrap()
             .expect("Delete op 必须同 entry 写入 tombstone");
@@ -774,7 +774,7 @@ mod tests {
         );
         assert!(
             storage
-                .db
+                .db.read()
                 .get(&mig_tombstone_key(DEFAULT_GROUP_ID, 1, b"k1"))
                 .unwrap()
                 .is_none(),
@@ -858,7 +858,7 @@ mod tests {
             })),
         };
         storage.apply_entries_internal(&[entry]).unwrap();
-        assert!(storage.db.get(&meta_cluster_meta_key()).unwrap().is_some());
+        assert!(storage.db.read().get(&meta_cluster_meta_key()).unwrap().is_some());
         assert_eq!(
             storage
                 .read_last_applied_from_db()
@@ -923,7 +923,7 @@ mod tests {
         assert_eq!(epoch_before, meta_state.get_cluster_meta().version);
 
         // 模拟重启: 对同一底层 db 重新构造 MetaStateMachine (走 reload_from_db).
-        let restarted = MetaStateMachine::new(storage.db.clone()).unwrap();
+        let restarted = MetaStateMachine::new(storage.db.read().clone()).unwrap();
         assert_eq!(
             restarted.get_migration_epoch(),
             Some(epoch_before),

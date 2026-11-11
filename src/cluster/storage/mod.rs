@@ -44,7 +44,7 @@ use parking_lot::RwLock;
 
 pub use keys::DEFAULT_GROUP_ID;
 
-use crate::cluster::log_committer::{LogCommitterHandle, LogCommitterMetrics};
+use crate::cluster::log_committer::{DbSlot, LogCommitterHandle, LogCommitterMetrics};
 use crate::cluster::meta_state_machine::MetaStateMachine;
 use crate::cluster::storage::log::db_to_storage_err;
 use crate::cluster::types::TypeConfig;
@@ -135,7 +135,7 @@ impl RaftPhaseMarks {
 
 #[derive(Clone)]
 pub struct OpenRaftStorage {
-    pub(crate) db: Arc<DB>,
+    pub(crate) db: DbSlot,
     pub(crate) state: Arc<RwLock<StorageState>>,
     pub(crate) group_id: u64,
     pub(crate) meta_state: Option<Arc<MetaStateMachine>>,
@@ -182,11 +182,11 @@ impl OpenRaftStorage {
         group_id: u64,
         meta_state: Option<Arc<MetaStateMachine>>,
     ) -> Result<Self> {
-        Self::new_with_committer(db, group_id, meta_state, None)
+        Self::new_with_committer(Arc::new(RwLock::new(db)), group_id, meta_state, None)
     }
 
     pub fn new_with_committer(
-        db: Arc<DB>,
+        db: DbSlot,
         group_id: u64,
         meta_state: Option<Arc<MetaStateMachine>>,
         committer: Option<LogCommitterHandle>,
@@ -206,8 +206,8 @@ impl OpenRaftStorage {
         Ok(storage)
     }
 
-    pub fn db(&self) -> &Arc<DB> {
-        &self.db
+    pub fn db(&self) -> parking_lot::RwLockReadGuard<'_, Arc<DB>> {
+        self.db.read()
     }
 
     pub fn group_id(&self) -> u64 {
@@ -465,7 +465,7 @@ impl RaftStateMachine<TypeConfig> for OpenRaftStorage {
 
         // 初始化临时文件路径 (openraft >= alpha.33 不再调用 begin_receiving_snapshot,
         // 接收/安装流程统一在 install_snapshot 内完成临时文件初始化).
-        let db_path = self.db.path().to_path_buf();
+        let db_path = self.db.read().path().to_path_buf();
         let temp_path = db_path.join(format!(".snapshot_temp_{}", self.group_id));
         let _ = std::fs::remove_file(&temp_path);
         *self.snapshot_temp_path.write() = Some(temp_path);

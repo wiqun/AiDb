@@ -107,7 +107,7 @@ pub(crate) fn prepare_snapshot_bundle(db: &DB) -> Result<Vec<u8>> {
 }
 
 pub struct OpenRaftSnapshotBuilder {
-    db: std::sync::Arc<DB>,
+    db: super::DbSlot,
     group_id: u64,
     state: std::sync::Arc<parking_lot::RwLock<super::StorageState>>,
     /// 与 `OpenRaftStorage::get_current_snapshot` 共享. 复制落后副本时从这里取回
@@ -120,7 +120,7 @@ pub struct OpenRaftSnapshotBuilder {
 
 impl OpenRaftSnapshotBuilder {
     pub fn new(
-        db: std::sync::Arc<DB>,
+        db: super::DbSlot,
         group_id: u64,
         state: std::sync::Arc<parking_lot::RwLock<super::StorageState>>,
         built_snapshot: std::sync::Arc<parking_lot::RwLock<Option<(SMOf, Vec<u8>)>>>,
@@ -135,11 +135,10 @@ impl OpenRaftSnapshotBuilder {
         }
     }
 
-    fn remember(&self, meta: &SMOf, bytes: &[u8]) -> std::io::Result<()> {
+    fn remember(&self, db: &DB, meta: &SMOf, bytes: &[u8]) -> std::io::Result<()> {
         let meta_bytes = postcard::to_allocvec(meta)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        self.db
-            .put(&snapshot_meta_key(self.group_id), &meta_bytes)
+        db.put(&snapshot_meta_key(self.group_id), &meta_bytes)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         self.state.write().snapshot_meta = Some(meta.clone());
         *self.built_snapshot.write() = Some((meta.clone(), bytes.to_vec()));
@@ -153,11 +152,13 @@ impl OpenRaftStorage {
         let bundle: SnapshotBundle = postcard::from_bytes(data)
             .map_err(|e| Error::Cluster(ClusterError::Serialization(e.to_string())))?;
 
-        // 关闭旧 DB, 终止后台线程 (flush/compaction).
-        self.db.close()?;
+        // 写锁盖住整个换库. 日志线程要读锁才能碰到 DB, 所以 close 不会打到正在 purge 的那次调用.
+        let mut slot = self.db.write();
+        let old = Arc::clone(&slot);
+        old.close()?;
 
-        let db_path = self.db.path().to_path_buf();
-        let options = Arc::clone(self.db.options());
+        let db_path = old.path().to_path_buf();
+        let options = Arc::clone(old.options());
 
         // 清空 DB 目录, 保留目录本身.
         if db_path.exists() {
@@ -186,27 +187,25 @@ impl OpenRaftStorage {
 
         // 重新打开 DB: CURRENT + MANIFEST + SST 文件已在目录中.
         let new_db = DB::open(&db_path, (*options).clone())?;
-        self.db = new_db;
 
         // 写入 snapshot meta 等元数据 (与原逻辑相同).
         let meta_bytes = postcard::to_allocvec(meta)
             .map_err(|e| Error::Cluster(ClusterError::Serialization(e.to_string())))?;
-        self.db
-            .put(&snapshot_meta_key(self.group_id), &meta_bytes)?;
+        new_db.put(&snapshot_meta_key(self.group_id), &meta_bytes)?;
         if let Some(log_id) = meta.last_log_id {
             let la = rmp_serde::to_vec(&log_id)
                 .map_err(|e| Error::Cluster(ClusterError::Serialization(e.to_string())))?;
-            self.db
-                .put(&super::keys::last_applied_key(self.group_id), &la)?;
+            new_db.put(&super::keys::last_applied_key(self.group_id), &la)?;
         }
 
         // 重建 MetaStateMachine (旧实例持有已关闭的 DB 引用).
         if self.meta_state.is_some() {
             let new_meta = std::sync::Arc::new(
-                crate::cluster::meta_state_machine::MetaStateMachine::new(Arc::clone(&self.db))?,
+                crate::cluster::meta_state_machine::MetaStateMachine::new(Arc::clone(&new_db))?,
             );
             self.meta_state = Some(new_meta);
         }
+        *slot = new_db;
 
         let mut state = self.state.write();
         state.snapshot_meta = Some(meta.clone());
@@ -235,18 +234,17 @@ impl openraft::RaftSnapshotBuilder<TypeConfig> for OpenRaftSnapshotBuilder {
         // RaftCore 在 apply 时 panic 并且 group 再也无法写.
         let _capture = self.capture_lock.write();
 
+        let db = self.db.read();
         let data =
-            prepare_snapshot_bundle(&self.db).map_err(|e| std::io::Error::other(e.to_string()))?;
+            prepare_snapshot_bundle(&db).map_err(|e| std::io::Error::other(e.to_string()))?;
 
-        let membership: MOf = self
-            .db
+        let membership: MOf = db
             .get(&super::keys::membership_key(self.group_id))
             .map_err(|e| std::io::Error::other(e.to_string()))?
             .map(|d| postcard::from_bytes(&d).unwrap_or_default())
             .unwrap_or_default();
 
-        let last_applied: Option<LIdOf> = self
-            .db
+        let last_applied: Option<LIdOf> = db
             .get(&super::keys::last_applied_key(self.group_id))
             .map_err(|e| std::io::Error::other(e.to_string()))?
             .and_then(|d| rmp_serde::from_slice(&d).ok());
@@ -255,7 +253,7 @@ impl openraft::RaftSnapshotBuilder<TypeConfig> for OpenRaftSnapshotBuilder {
             last_log_id: last_applied,
             last_membership: membership,
         };
-        self.remember(&meta, &data)?;
+        self.remember(&db, &meta, &data)?;
 
         Ok(Snapshot {
             meta,
@@ -290,7 +288,7 @@ mod tests {
         storage.apply_batch_to_sm(&batch).unwrap();
 
         // 构建 snapshot bundle (模拟 SNAPSHOT 构建端).
-        let bundle_data = prepare_snapshot_bundle(&storage.db).unwrap();
+        let bundle_data = prepare_snapshot_bundle(&storage.db.read()).unwrap();
 
         let log_id = LogId::new(openraft::vote::leader_id_std::CommittedLeaderId::new(5), 5);
         let meta = SnapshotMeta {
@@ -328,7 +326,8 @@ mod tests {
             b.put(b"key_a".to_vec(), b"val_a".to_vec());
             b.put(b"key_b".to_vec(), b"val_b".to_vec());
             storage.apply_batch_to_sm(&b).unwrap();
-            prepare_snapshot_bundle(&storage.db).unwrap()
+            let db = storage.db.read();
+            prepare_snapshot_bundle(&db).unwrap()
         };
 
         // 安装端: 安装到全新 DB 目录.
@@ -502,6 +501,51 @@ mod tests {
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         writer.join().unwrap();
         assert_eq!(checked, 5);
+    }
+
+    /// 回归: 安装快照会关掉旧 DB 再打开新的. 日志存储是另一份克隆, 必须看到新 DB.
+    ///
+    /// 修复前 `close()` 打在共享的 `Arc<DB>` 上, 新 DB 只换进状态机那一份克隆.
+    /// openraft 紧接着在日志那份上 `purge`, 得到 `database is closed`, group 进入 fatal
+    /// 并被卸掉, 复制端就看到 `group not found` 然后重试.
+    #[tokio::test]
+    async fn log_store_can_purge_after_snapshot_install() {
+        use crate::cluster::log_committer::{spawn_committer, LogCommitterConfig};
+
+        let dir = TempDir::new().unwrap();
+        let db = DB::open(dir.path(), Options::for_testing()).unwrap();
+        let slot = Arc::new(parking_lot::RwLock::new(db));
+        let committer = spawn_committer(
+            DEFAULT_GROUP_ID,
+            Arc::clone(&slot),
+            LogCommitterConfig::default(),
+        );
+        let mut storage =
+            OpenRaftStorage::new_with_committer(slot, DEFAULT_GROUP_ID, None, Some(committer))
+                .unwrap();
+        let log_store = storage.clone();
+
+        let bundle = prepare_snapshot_bundle(&storage.db.read()).unwrap();
+        let log_id = LogId::new(openraft::vote::leader_id_std::CommittedLeaderId::new(1), 3);
+        let meta = SnapshotMeta {
+            last_log_id: Some(log_id),
+            last_membership: StoredMembership::default(),
+        };
+        storage.install_snapshot_atomic(&meta, &bundle).unwrap();
+
+        log_store
+            .committer
+            .as_ref()
+            .unwrap()
+            .purge(0, log_id)
+            .await
+            .expect("安装完成后日志库必须还能 purge");
+        log_store
+            .db()
+            .get(&crate::cluster::storage::keys::snapshot_meta_key(
+                DEFAULT_GROUP_ID,
+            ))
+            .expect("日志库看到的必须是安装后的新 DB");
     }
 
     /// 回归: 本机 `build_snapshot` 之后, `get_current_snapshot` 必须能把同一份快照交出去.
