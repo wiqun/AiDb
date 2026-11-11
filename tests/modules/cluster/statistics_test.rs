@@ -161,6 +161,8 @@ async fn test_service_dispatcher_and_server_atomic_stats() {
             snapshot_id: "snap-1".into(),
         }),
         snapshot_data: vec![],
+        snapshot_offset: 0,
+        snapshot_total: 0,
     });
     let _ = service.install_snapshot(snap_req).await;
     assert_eq!(

@@ -69,6 +69,10 @@ message InstallSnapshotRequest {
   bool vote_committed = 4;
   SnapshotMeta meta = 5;
   bytes snapshot_data = 6;
+  // 本片在整包中的起点. snapshot_total 为 0 时忽略, snapshot_data 就是完整快照.
+  uint64 snapshot_offset = 7;
+  // 整包长度. 0 表示旧客户端一次送完.
+  uint64 snapshot_total = 8;
 }
 
 message SnapshotMeta {

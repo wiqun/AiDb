@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use openraft::{
     storage::{LogState, RaftLogStorage, RaftStateMachine},
-    LogId, RaftLogReader, Snapshot, SnapshotMeta, StoredMembership, Vote,
+    LogId, RaftLogReader, RaftSnapshotBuilder, Snapshot, SnapshotMeta, StoredMembership, Vote,
 };
 use parking_lot::RwLock;
 
@@ -47,7 +47,6 @@ pub use keys::DEFAULT_GROUP_ID;
 use crate::cluster::log_committer::{LogCommitterHandle, LogCommitterMetrics};
 use crate::cluster::meta_state_machine::MetaStateMachine;
 use crate::cluster::storage::log::db_to_storage_err;
-use crate::cluster::storage::snapshot::prepare_snapshot_bundle;
 use crate::cluster::types::TypeConfig;
 use crate::error::Result;
 use crate::DB;
@@ -143,6 +142,9 @@ pub struct OpenRaftStorage {
     pub(crate) snapshot_temp_path: Arc<RwLock<Option<PathBuf>>>,
     pub(crate) committer: Option<LogCommitterHandle>,
     pub(crate) phases: Arc<RaftPhaseMarks>,
+    /// 本机最近一次 `build_snapshot` 的元数据和字节.
+    /// 复制给落后副本时 `get_current_snapshot` 必须返回这一份, 不能返回 None.
+    pub(crate) built_snapshot: Arc<RwLock<Option<(SMOf, Vec<u8>)>>>,
     /// apply 与 snapshot 抓取的互斥锁.
     ///
     /// snapshot bundle 必须对应"某个 last_applied 位点的完整状态". 若 flush 与读取
@@ -197,6 +199,7 @@ impl OpenRaftStorage {
             snapshot_temp_path: Arc::new(RwLock::new(None)),
             committer,
             phases: Arc::new(RaftPhaseMarks::default()),
+            built_snapshot: Arc::new(RwLock::new(None)),
             capture_lock: Arc::new(RwLock::new(())),
         };
         storage.load_state()?;
@@ -447,6 +450,8 @@ impl RaftStateMachine<TypeConfig> for OpenRaftStorage {
         snapshot::OpenRaftSnapshotBuilder::new(
             self.db.clone(),
             self.group_id,
+            Arc::clone(&self.state),
+            Arc::clone(&self.built_snapshot),
             Arc::clone(&self.capture_lock),
         )
     }
@@ -518,17 +523,24 @@ impl RaftStateMachine<TypeConfig> for OpenRaftStorage {
         Option<Snapshot<CLId, u64, openraft::BasicNode, Cursor<Vec<u8>>>>,
         std::io::Error,
     > {
-        let state = self.state.read();
-        let Some(meta) = state.snapshot_meta.clone() else {
+        if let Some((meta, bytes)) = self.built_snapshot.read().clone() {
+            return Ok(Some(Snapshot {
+                meta,
+                snapshot: Cursor::new(bytes),
+            }));
+        }
+        // 重启后只有落盘的 snapshot_meta, 内存字节已丢. 按当前状态机重做一份,
+        // 保证返回的 meta 和字节是同一次抓取.
+        if self.state.read().snapshot_meta.is_none() {
             return Ok(None);
-        };
-        drop(state);
-
-        let data =
-            prepare_snapshot_bundle(&self.db).map_err(|e| std::io::Error::other(e.to_string()))?;
-        Ok(Some(Snapshot {
-            meta,
-            snapshot: Cursor::new(data),
-        }))
+        }
+        let mut builder = snapshot::OpenRaftSnapshotBuilder::new(
+            self.db.clone(),
+            self.group_id,
+            Arc::clone(&self.state),
+            Arc::clone(&self.built_snapshot),
+            Arc::clone(&self.capture_lock),
+        );
+        Ok(Some(builder.build_snapshot().await?))
     }
 }

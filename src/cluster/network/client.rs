@@ -22,6 +22,11 @@ pub struct RaftNetworkClient {
     stats: Option<Arc<Statistics>>,
 }
 
+/// 单片上限, 留在 gRPC 默认 64MB 消息限制之内.
+const SNAPSHOT_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+/// 安装要把整包写回磁盘, 比心跳用的 rpc 超时长. 只包住快照 RPC.
+const SNAPSHOT_RPC_TIMEOUT: Duration = Duration::from_secs(120);
+
 impl RaftNetworkClient {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -279,6 +284,49 @@ impl RaftNetworkClient {
         }
         Ok(self.client.as_mut().unwrap())
     }
+
+    async fn install_snapshot_rpc(
+        &mut self,
+        request: raft_rpc::InstallSnapshotRequest,
+    ) -> std::result::Result<
+        raft_rpc::InstallSnapshotResponse,
+        openraft::error::StreamingError<TypeConfig>,
+    > {
+        let client = match self.get_client().await {
+            Ok(c) => c,
+            Err(e) => {
+                self.invalidate_channel();
+                return Err(openraft::error::StreamingError::Network(e));
+            }
+        };
+        let rpc_future = client.install_snapshot(TonicRequest::new(request));
+        match timeout(SNAPSHOT_RPC_TIMEOUT, rpc_future).await {
+            Ok(Ok(response)) => Ok(response.into_inner()),
+            Ok(Err(e)) => {
+                self.invalidate_on_unavailable(&e);
+                if e.code() == tonic::Code::Unavailable {
+                    return Err(openraft::error::StreamingError::Unreachable(
+                        Unreachable::<TypeConfig>::new(&e),
+                    ));
+                }
+                Err(openraft::error::StreamingError::Network(
+                    NetworkError::<TypeConfig>::new(&e),
+                ))
+            }
+            Err(_) => {
+                let io_err = std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "InstallSnapshot timeout after {}ms",
+                        SNAPSHOT_RPC_TIMEOUT.as_millis()
+                    ),
+                );
+                Err(openraft::error::StreamingError::Unreachable(
+                    Unreachable::<TypeConfig>::new(&io_err),
+                ))
+            }
+        }
+    }
 }
 
 impl RaftNetworkV2<TypeConfig> for RaftNetworkClient {
@@ -407,16 +455,7 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkClient {
             )));
         }
         drop(cancel); // Not using cancellation in this implementation
-        let req_timeout = self.request_timeout;
         let group_id = self.group_id;
-        let client = match self.get_client().await {
-            Ok(c) => c,
-            Err(e) => {
-                self.invalidate_channel();
-                return Err(openraft::error::StreamingError::Network(e));
-            }
-        };
-
         let meta = raft_rpc::SnapshotMeta {
             last_log_index: snapshot.meta.last_log_id.map(|id| id.index),
             last_log_term: snapshot.meta.last_log_id.map(|id| id.leader_id.term),
@@ -436,50 +475,28 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkClient {
         };
 
         let data = snapshot.snapshot.into_inner();
-        let request = raft_rpc::InstallSnapshotRequest {
-            group_id,
-            vote_term: vote.leader_id.term,
-            vote_node_id: vote.leader_id.voted_for,
-            vote_committed: vote.committed,
-            meta: Some(meta),
-            snapshot_data: data,
-        };
-
-        let rpc_future = client.install_snapshot(TonicRequest::new(request));
-        let response = match timeout(req_timeout, rpc_future).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                self.invalidate_on_unavailable(&e);
-                if e.code() == tonic::Code::Unavailable {
-                    return Err(openraft::error::StreamingError::Unreachable(Unreachable::<
-                        TypeConfig,
-                    >::new(
-                        &e
-                    )));
-                }
-                return Err(openraft::error::StreamingError::Network(NetworkError::<
-                    TypeConfig,
-                >::new(
-                    &e
-                )));
+        let total = data.len() as u64;
+        let mut offset = 0usize;
+        let mut resp = None;
+        loop {
+            let end = (offset + SNAPSHOT_CHUNK_BYTES).min(data.len());
+            let request = raft_rpc::InstallSnapshotRequest {
+                group_id,
+                vote_term: vote.leader_id.term,
+                vote_node_id: vote.leader_id.voted_for,
+                vote_committed: vote.committed,
+                meta: Some(meta.clone()),
+                snapshot_data: data[offset..end].to_vec(),
+                snapshot_offset: offset as u64,
+                snapshot_total: total,
+            };
+            resp = Some(self.install_snapshot_rpc(request).await?);
+            if end == data.len() {
+                break;
             }
-            Err(_) => {
-                let io_err = std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!(
-                        "InstallSnapshot timeout after {}ms",
-                        req_timeout.as_millis()
-                    ),
-                );
-                return Err(openraft::error::StreamingError::Unreachable(Unreachable::<
-                    TypeConfig,
-                >::new(
-                    &io_err
-                )));
-            }
-        };
-
-        let resp = response.into_inner();
+            offset = end;
+        }
+        let resp = resp.expect("至少发送一片");
         Ok(SnapshotResponse {
             vote: vote_from_wire(resp.vote_term, resp.vote_node_id, resp.vote_committed),
         })

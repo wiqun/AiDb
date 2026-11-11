@@ -109,6 +109,10 @@ pub(crate) fn prepare_snapshot_bundle(db: &DB) -> Result<Vec<u8>> {
 pub struct OpenRaftSnapshotBuilder {
     db: std::sync::Arc<DB>,
     group_id: u64,
+    state: std::sync::Arc<parking_lot::RwLock<super::StorageState>>,
+    /// 与 `OpenRaftStorage::get_current_snapshot` 共享. 复制落后副本时从这里取回
+    /// 刚构建的那一份, 而不是回答「没有快照」.
+    built_snapshot: std::sync::Arc<parking_lot::RwLock<Option<(SMOf, Vec<u8>)>>>,
     /// 与 apply 共享的抓取锁: 抓快照期间持有写锁, 保证 flush 到读取 `last_applied`
     /// 之间没有并发 apply 插入.
     capture_lock: std::sync::Arc<parking_lot::RwLock<()>>,
@@ -118,13 +122,28 @@ impl OpenRaftSnapshotBuilder {
     pub fn new(
         db: std::sync::Arc<DB>,
         group_id: u64,
+        state: std::sync::Arc<parking_lot::RwLock<super::StorageState>>,
+        built_snapshot: std::sync::Arc<parking_lot::RwLock<Option<(SMOf, Vec<u8>)>>>,
         capture_lock: std::sync::Arc<parking_lot::RwLock<()>>,
     ) -> Self {
         Self {
             db,
             group_id,
+            state,
+            built_snapshot,
             capture_lock,
         }
+    }
+
+    fn remember(&self, meta: &SMOf, bytes: &[u8]) -> std::io::Result<()> {
+        let meta_bytes = postcard::to_allocvec(meta)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        self.db
+            .put(&snapshot_meta_key(self.group_id), &meta_bytes)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        self.state.write().snapshot_meta = Some(meta.clone());
+        *self.built_snapshot.write() = Some((meta.clone(), bytes.to_vec()));
+        Ok(())
     }
 }
 
@@ -236,6 +255,7 @@ impl openraft::RaftSnapshotBuilder<TypeConfig> for OpenRaftSnapshotBuilder {
             last_log_id: last_applied,
             last_membership: membership,
         };
+        self.remember(&meta, &data)?;
 
         Ok(Snapshot {
             meta,
@@ -451,6 +471,8 @@ mod tests {
             let mut builder = OpenRaftSnapshotBuilder::new(
                 Arc::clone(&storage.db),
                 storage.group_id,
+                Arc::clone(&storage.state),
+                Arc::clone(&storage.built_snapshot),
                 Arc::clone(&storage.capture_lock),
             );
             let snapshot = builder.build_snapshot().await.unwrap();
@@ -480,5 +502,39 @@ mod tests {
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         writer.join().unwrap();
         assert_eq!(checked, 5);
+    }
+
+    /// 回归: 本机 `build_snapshot` 之后, `get_current_snapshot` 必须能把同一份快照交出去.
+    ///
+    /// 修复前 meta 和字节都没留下, 这里返回 None. 日志一旦 purge, 新副本只能靠这份
+    /// 快照追平, openraft 读到 None 就报 `snapshot not found` 并把 group 打成 fatal.
+    #[tokio::test]
+    async fn built_snapshot_can_be_sent_to_a_follower() {
+        use openraft::storage::RaftStateMachine;
+        use openraft::RaftSnapshotBuilder;
+
+        let dir = TempDir::new().unwrap();
+        let db = DB::open(dir.path(), Options::for_testing()).unwrap();
+        let mut storage = OpenRaftStorage::new(db, DEFAULT_GROUP_ID, None).unwrap();
+
+        let mut ops = ThinWriteBatch::new();
+        ops.put(b"k".to_vec(), b"v".to_vec());
+        let entry = crate::cluster::types::LogEntry {
+            log_id: LogId::new(openraft::vote::leader_id_std::CommittedLeaderId::new(1), 7),
+            payload: openraft::EntryPayload::Normal(crate::cluster::types::Request::WriteBatch(
+                ops,
+            )),
+        };
+        storage.apply_entries_internal(&[entry]).unwrap();
+
+        let built = storage.get_snapshot_builder().await.build_snapshot().await.unwrap();
+        let sent = storage
+            .get_current_snapshot()
+            .await
+            .unwrap()
+            .expect("构建后的快照必须还能读到");
+        assert_eq!(sent.meta.last_log_id, built.meta.last_log_id);
+        assert_eq!(sent.meta.last_log_id.map(|id| id.index), Some(7));
+        assert_eq!(sent.snapshot.into_inner(), built.snapshot.into_inner());
     }
 }

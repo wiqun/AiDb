@@ -86,12 +86,67 @@ impl Default for RaftServiceDispatcher {
 
 pub struct RaftServiceImpl {
     dispatcher: Arc<RaftServiceDispatcher>,
+    /// group_id -> 尚未拼完的快照片. 分片按顺序到达, 拼满后才交给 raft.
+    inflight: Arc<std::sync::Mutex<HashMap<u64, Option<SnapshotAssembly>>>>,
 }
 
 impl RaftServiceImpl {
     pub fn new(dispatcher: Arc<RaftServiceDispatcher>) -> Self {
-        Self { dispatcher }
+        Self {
+            dispatcher,
+            inflight: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
     }
+}
+
+pub(crate) struct SnapshotAssembly {
+    snapshot_id: String,
+    total: usize,
+    buf: Vec<u8>,
+}
+
+/// 把一片快照拼进 `slot`. 返回 `Some` 表示整包已经齐, 可以安装.
+pub(crate) fn push_snapshot_chunk(
+    slot: &mut Option<SnapshotAssembly>,
+    snapshot_id: &str,
+    total: u64,
+    offset: u64,
+    data: Vec<u8>,
+) -> std::result::Result<Option<Vec<u8>>, String> {
+    if total == 0 {
+        return Ok(Some(data));
+    }
+    let total = usize::try_from(total).map_err(|_| "snapshot total overflow".to_string())?;
+    let offset = usize::try_from(offset).map_err(|_| "snapshot offset overflow".to_string())?;
+    if offset > total || data.len() > total - offset {
+        return Err(format!(
+            "snapshot chunk out of range offset={offset} len={} total={total}",
+            data.len()
+        ));
+    }
+    if offset == 0 && data.len() == total {
+        *slot = None;
+        return Ok(Some(data));
+    }
+    if offset == 0 {
+        *slot = Some(SnapshotAssembly {
+            snapshot_id: snapshot_id.to_string(),
+            total,
+            buf: data,
+        });
+        return Ok(None);
+    }
+    let Some(cur) = slot.as_mut() else {
+        return Err("snapshot chunk without a start".to_string());
+    };
+    if cur.snapshot_id != snapshot_id || cur.total != total || cur.buf.len() != offset {
+        return Err("snapshot chunk does not continue the in-flight snapshot".to_string());
+    }
+    cur.buf.extend_from_slice(&data);
+    if cur.buf.len() == cur.total {
+        return Ok(Some(slot.take().expect("slot 刚确认存在").buf));
+    }
+    Ok(None)
 }
 
 #[tonic::async_trait]
@@ -288,9 +343,44 @@ impl RaftService for RaftServiceImpl {
         };
 
         let vote = vote_from_wire(req.vote_term, req.vote_node_id, req.vote_committed);
+        let snapshot_data = {
+            let mut guard = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+            let outcome = {
+                let slot = guard.entry(req.group_id).or_default();
+                push_snapshot_chunk(
+                    slot,
+                    &meta.snapshot_id,
+                    req.snapshot_total,
+                    req.snapshot_offset,
+                    req.snapshot_data,
+                )
+            };
+            match outcome {
+                Ok(Some(bytes)) => {
+                    guard.remove(&req.group_id);
+                    Ok(Some(bytes))
+                }
+                Ok(None) => Ok(None),
+                Err(e) => {
+                    guard.remove(&req.group_id);
+                    Err(e)
+                }
+            }
+        };
+        let snapshot_data = match snapshot_data {
+            Ok(bytes) => bytes,
+            Err(e) => return Err(tonic::Status::invalid_argument(e)),
+        };
+        let Some(snapshot_data) = snapshot_data else {
+            return Ok(tonic::Response::new(raft_rpc::InstallSnapshotResponse {
+                vote_term: req.vote_term,
+                vote_node_id: req.vote_node_id,
+                vote_committed: req.vote_committed,
+            }));
+        };
         let snapshot = openraft::Snapshot {
             meta: snapshot_meta,
-            snapshot: std::io::Cursor::new(req.snapshot_data),
+            snapshot: std::io::Cursor::new(snapshot_data),
         };
 
         let raft = self
@@ -394,6 +484,36 @@ impl RaftService for RaftServiceImpl {
             }
             Err(e) => Err(map_node_error_to_status(e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::push_snapshot_chunk;
+
+    #[test]
+    fn snapshot_chunks_reassemble_in_order() {
+        let mut slot = None;
+        let first = push_snapshot_chunk(&mut slot, "snap-1", 5, 0, b"ab".to_vec()).unwrap();
+        assert!(first.is_none());
+        let second = push_snapshot_chunk(&mut slot, "snap-1", 5, 2, b"cde".to_vec()).unwrap();
+        assert_eq!(second.unwrap(), b"abcde");
+        assert!(slot.is_none());
+    }
+
+    #[test]
+    fn snapshot_chunk_gap_discards_partial() {
+        let mut slot = None;
+        push_snapshot_chunk(&mut slot, "snap-1", 5, 0, b"ab".to_vec()).unwrap();
+        let err = push_snapshot_chunk(&mut slot, "snap-1", 5, 3, b"de".to_vec()).unwrap_err();
+        assert!(err.contains("does not continue"));
+    }
+
+    #[test]
+    fn whole_snapshot_does_not_need_assembly() {
+        let mut slot = None;
+        let got = push_snapshot_chunk(&mut slot, "snap-1", 0, 0, b"whole".to_vec()).unwrap();
+        assert_eq!(got.unwrap(), b"whole");
     }
 }
 
