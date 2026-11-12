@@ -340,3 +340,53 @@ fn estimate_reopen_is_not_zero_before_new_writes() {
     let db = DB::open(dir.path(), small_opts()).unwrap();
     assert_eq!(db.estimate_entry_count(), 1);
 }
+
+/// 验证 MemTable 在大量同 Key 历史版本覆盖下 (超出原 32-window 边界), 游标正向与反向遍历均能正确且高效输出最新可见版本.
+#[test]
+fn test_db_iterator_heavy_multi_version_scan() {
+    let dir = tempdir().unwrap();
+    let db = DB::open(dir.path(), small_opts()).unwrap();
+    // 写入 3 个 key，每个 key 覆写 60 次（在纯 MemTable 内存中积攒大量历史版本）
+    for i in 0..60 {
+        db.put(b"k1", format!("val1_{i:03}").as_bytes()).unwrap();
+        db.put(b"k2", format!("val2_{i:03}").as_bytes()).unwrap();
+        db.put(b"k3", format!("val3_{i:03}").as_bytes()).unwrap();
+    }
+
+    // 1. 正向迭代验证
+    let mut it = db.iter().unwrap();
+    let mut forward_items = Vec::new();
+    while let Some(Ok((k, v))) = it.next() {
+        forward_items.push((k, v));
+    }
+    assert_eq!(
+        forward_items,
+        vec![
+            (b"k1".to_vec(), b"val1_059".to_vec()),
+            (b"k2".to_vec(), b"val2_059".to_vec()),
+            (b"k3".to_vec(), b"val3_059".to_vec()),
+        ]
+    );
+
+    // 2. 反向迭代验证 (seek_to_last + prev)
+    let mut it_rev = db.iter().unwrap();
+    it_rev.seek_to_last();
+    let mut backward_items = Vec::new();
+    while it_rev.valid() {
+        let k = it_rev.key().unwrap().to_vec();
+        let v = it_rev.value().unwrap().to_vec();
+        backward_items.push((k, v));
+        if !it_rev.prev() {
+            break;
+        }
+    }
+    assert_eq!(
+        backward_items,
+        vec![
+            (b"k3".to_vec(), b"val3_059".to_vec()),
+            (b"k2".to_vec(), b"val2_059".to_vec()),
+            (b"k1".to_vec(), b"val1_059".to_vec()),
+        ]
+    );
+    db.close().unwrap();
+}
