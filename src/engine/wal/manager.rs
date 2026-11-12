@@ -344,16 +344,18 @@ impl WALManager {
         Ok(())
     }
 
-    /// 计算可清理的 WAL 文件 (max_seq < watermark), 删除并返回删除列表
-    pub fn cleanup(&mut self, watermark: u64) -> Result<Vec<u64>> {
+    /// 收集可清理的 WAL 文件 (max_seq < watermark), 从元数据中移除并返回待删除的文件路径.
+    ///
+    /// 纯内存操作, 不做物理文件删除. 调用方可在释放写锁后在后台异步执行删除,
+    /// 避免在持锁期间因文件系统 I/O 阻塞写入并发.
+    pub fn collect_cleanable_files(&mut self, watermark: u64) -> (Vec<u64>, Vec<PathBuf>) {
         let mut removed = Vec::new();
+        let mut paths = Vec::new();
         let mut remaining = Vec::new();
 
         for wal in std::mem::take(&mut self.wals) {
             if wal.max_seq != u64::MAX && wal.max_seq < watermark {
-                // 可安全删除
-                let path = wal_path(&self.path, wal.file_number);
-                let _ = std::fs::remove_file(&path);
+                paths.push(wal_path(&self.path, wal.file_number));
                 removed.push(wal.file_number);
             } else {
                 remaining.push(wal);
@@ -363,10 +365,19 @@ impl WALManager {
 
         tracing::debug!(
           target: "wal",
-          "wal.cleanup: removed_files={:?}",
+          "wal.collect_cleanable_files: removed_files={:?}",
           removed,
         );
 
+        (removed, paths)
+    }
+
+    /// 计算可清理的 WAL 文件 (max_seq < watermark), 删除并返回删除列表.
+    pub fn cleanup(&mut self, watermark: u64) -> Result<Vec<u64>> {
+        let (removed, paths) = self.collect_cleanable_files(watermark);
+        for path in paths {
+            let _ = std::fs::remove_file(&path);
+        }
         Ok(removed)
     }
 
@@ -706,6 +717,23 @@ mod tests {
         mgr.close().unwrap();
         let removed = mgr.cleanup(u64::MAX).unwrap();
         assert!(removed.is_empty() || removed.len() <= 1);
+    }
+
+    #[test]
+    fn test_collect_cleanable_files_defers_deletion() {
+        let dir = tempdir().unwrap();
+        let mut mgr = WALManager::open(dir.path(), 1, 100, test_options()).unwrap();
+        mgr.rotate(200).unwrap();
+        // wal 1 的 max_seq 是 200，当 watermark 为 250 时可被清理
+        let (removed, paths) = mgr.collect_cleanable_files(250);
+        assert_eq!(removed, vec![1]);
+        assert_eq!(paths.len(), 1);
+        // 收集后物理文件仍然存在 (锁内未删除)
+        assert!(paths[0].exists());
+        // 锁外手动删除后才消失
+        std::fs::remove_file(&paths[0]).unwrap();
+        assert!(!paths[0].exists());
+        mgr.close().unwrap();
     }
 
     #[test]

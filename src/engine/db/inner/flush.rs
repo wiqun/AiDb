@@ -172,8 +172,35 @@ impl DB {
 
     pub(super) fn try_cleanup_wals(&self) -> Result<()> {
         let watermark = self.wal_gc_watermark();
-        let _ = self.wal.write().cleanup(watermark)?;
+        let paths = {
+            let mut wal = self.wal.write();
+            let (_removed, paths) = wal.collect_cleanable_files(watermark);
+            paths
+        };
+
+        if !paths.is_empty() {
+            Self::schedule_wal_files_removal(paths);
+        }
         Ok(())
+    }
+
+    fn schedule_wal_files_removal(paths: Vec<std::path::PathBuf>) {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn_blocking(move || {
+                for path in paths {
+                    let _ = std::fs::remove_file(&path);
+                }
+            });
+        } else {
+            std::thread::Builder::new()
+                .name("aidb-wal-gc".into())
+                .spawn(move || {
+                    for path in paths {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                })
+                .ok();
+        }
     }
 
     fn wal_gc_watermark(&self) -> u64 {

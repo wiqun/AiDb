@@ -17,6 +17,7 @@
 
 ### Performance
 
+- WAL 清理物理文件删除移出写锁: `WALManager::collect_cleanable_files` 在 `self.wal.write()` 写锁内仅执行元数据判定和文件路径收集 (微秒级内存操作), 物理 `std::fs::remove_file` 移至锁外异步执行 (通过 tokio `spawn_blocking` 或专用后台线程). 彻底消除了高并发极限写入打流在 WAL 轮转清理时由于文件系统 IO 导致的 100~170ms 写锁排队延迟.
 - Raft 快照不再让写路径卡顿 2~4 秒: `build_snapshot` 只返回位点 (openraft 日常清理只取 meta, 数据直接丢弃), `capture_lock` 写锁内只冻结 memtable 并读 `last_applied`, 落盘 (`DB::flush_frozen`) 放到锁外, 落盘完成后才发布 `snapshot_meta`; 整库 bundle 改由 `get_current_snapshot` 在副本需要时按需生成 (`build_full_snapshot`), 不再每次清理都读文件、序列化并留一份整库内存副本. bundle 不再带历史 WAL (`collect_checkpoint_file_paths(include_wal)`), CURRENT / MANIFEST 在锁内读成字节, SST 在锁外读取; 构建整体放进 `spawn_blocking`. 新增日志 `raft snapshot built` (`full` / `wait_ms` / `locked_ms` / `total_ms` / `bytes`).
 - `InternalKeySlice` 零分配跳表定位与 `consume_memtable_group_backward` 链表优先反向回退: 引入 `#[repr(transparent)] InternalKeySlice([u8])` 统一委托 `compare_internal_key`, 消除 `MemTable::search` / `get` / `point_state` / `scan_limited` 的 `Arc<[u8]>` 堆分配; 反向有界扫描在同 key 版本数不超过 8 时直接沿 `prev()` 顺序回退, 超长版本组自动切换 `upper_bound` 跳跃, 并完善 `scan_limited` 的 `sst_overlaps` 区间判定与 `DBIterator::new_unpositioned` 构造.
 - `scan_memtable_limited_backward`: 实现纯内存跳表原生有界反向扫描与快速跳跃, 状态机 `last_sm_user_pair` 接入, 反向遍历耗时由 122µs 降至 3.45µs.
