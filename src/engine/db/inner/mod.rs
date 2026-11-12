@@ -428,7 +428,8 @@ impl DB {
         self.sstables.read().iter().cloned().collect()
     }
 
-    pub(crate) fn collect_checkpoint_file_paths(&self) -> Result<Vec<PathBuf>> {
+    /// `include_wal=false` 用于 raft 快照: 调用方已 flush, 全部数据都在 SST 里, 无需搬运历史 WAL.
+    pub(crate) fn collect_checkpoint_file_paths(&self, include_wal: bool) -> Result<Vec<PathBuf>> {
         use crate::engine::compaction::current_exists;
         use crate::engine::wal::manager::WALManager;
 
@@ -445,7 +446,9 @@ impl DB {
             paths.push(manifest);
         }
 
-        paths.extend(WALManager::scan_wal_file_paths(db_path));
+        if include_wal {
+            paths.extend(WALManager::scan_wal_file_paths(db_path));
+        }
 
         let version = self.version_set.read().current().clone();
         for (level, files) in version.levels.iter().enumerate() {

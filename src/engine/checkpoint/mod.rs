@@ -62,7 +62,7 @@ impl Checkpoint {
             }
         };
 
-        let files = db.collect_checkpoint_file_paths()?;
+        let files = db.collect_checkpoint_file_paths(true)?;
         let file_count = files.len();
         for src in &files {
             let rel = src

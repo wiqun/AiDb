@@ -15,6 +15,24 @@ impl DB {
         self.do_flush_with_span()
     }
 
+    /// 冻结当前 active memtable (O(1)), 之后的写入进入新 memtable.
+    /// 与 `flush_frozen` 配合, 让调用方只在冻结瞬间持锁, 慢的落盘放到锁外.
+    pub(crate) fn freeze_active(&self) -> Result<()> {
+        self.check_not_closed()?;
+        self.freeze_active_if_nonempty()
+    }
+
+    /// 只把已冻结的 memtable 落盘, 不再冻结 active; 返回后冻结时刻之前的数据都在 SST.
+    pub(crate) fn flush_frozen(&self) -> Result<()> {
+        self.check_not_closed()?;
+        let _flush_guard = self.flush_lock.lock();
+        self.flush_immutable_memtables()?;
+        self.rotate_wal()?;
+        self.try_cleanup_wals()?;
+        self.maybe_trigger_compaction();
+        Ok(())
+    }
+
     fn do_flush_with_span(&self) -> Result<()> {
         let span = crate::observability::optional_span("db_flush");
         let _enter = span.enter();

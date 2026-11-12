@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use openraft::{
     storage::{LogState, RaftLogStorage, RaftStateMachine},
-    LogId, RaftLogReader, RaftSnapshotBuilder, Snapshot, SnapshotMeta, StoredMembership, Vote,
+    LogId, RaftLogReader, Snapshot, SnapshotMeta, StoredMembership, Vote,
 };
 use parking_lot::RwLock;
 
@@ -523,24 +523,27 @@ impl RaftStateMachine<TypeConfig> for OpenRaftStorage {
         Option<Snapshot<CLId, u64, openraft::BasicNode, Cursor<Vec<u8>>>>,
         std::io::Error,
     > {
-        if let Some((meta, bytes)) = self.built_snapshot.read().clone() {
-            return Ok(Some(Snapshot {
-                meta,
-                snapshot: Cursor::new(bytes),
-            }));
-        }
-        // 重启后只有落盘的 snapshot_meta, 内存字节已丢. 按当前状态机重做一份,
-        // 保证返回的 meta 和字节是同一次抓取.
-        if self.state.read().snapshot_meta.is_none() {
+        // 日常清理只记位点 (`snapshot_meta`), 整库 bundle 在这里才按需生成.
+        let Some(purge_point) = self.state.read().snapshot_meta.clone() else {
             return Ok(None);
+        };
+        // 缓存的 bundle 位点不低于 purge 位点即可复用: 落后副本只需要 purge 位点之后的日志.
+        let purge_index = purge_point.last_log_id.map(|id| id.index);
+        if let Some((meta, bytes)) = self.built_snapshot.read().clone() {
+            if meta.last_log_id.map(|id| id.index) >= purge_index {
+                return Ok(Some(Snapshot {
+                    meta,
+                    snapshot: Cursor::new(bytes),
+                }));
+            }
         }
-        let mut builder = snapshot::OpenRaftSnapshotBuilder::new(
+        let builder = snapshot::OpenRaftSnapshotBuilder::new(
             self.db.clone(),
             self.group_id,
             Arc::clone(&self.state),
             Arc::clone(&self.built_snapshot),
             Arc::clone(&self.capture_lock),
         );
-        Ok(Some(builder.build_snapshot().await?))
+        Ok(Some(builder.build_full_snapshot().await?))
     }
 }

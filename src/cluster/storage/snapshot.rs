@@ -54,58 +54,89 @@ pub(crate) struct SnapshotFile {
     pub(crate) data: Vec<u8>,
 }
 
-impl SnapshotBundle {
-    fn from_files(db: &DB) -> Result<Self> {
-        let _pinned = db.pin_sstables();
-        let file_paths = db.collect_checkpoint_file_paths()?;
+/// 在 `capture_lock` 写锁内抓到的快照"定格"状态.
+///
+/// 非 SST 文件 (CURRENT / MANIFEST) 会被后续 flush 追加或改写, 必须在锁内读成字节;
+/// SST 不可变, 只记路径, 由 `guard` 阻止 compaction 删除, 锁外再慢慢读.
+struct CapturedSnapshot {
+    inline_files: Vec<SnapshotFile>,
+    sst_paths: Vec<(String, std::path::PathBuf)>,
+    _guard: SnapshotCheckpointGuard,
+}
+
+impl CapturedSnapshot {
+    /// 调用方须已 `flush`. 这里只做 O(文件数) 的元数据收集和两个小文件读取.
+    fn capture(db: &Arc<DB>) -> Result<Self> {
+        let guard = SnapshotCheckpointGuard::new(Arc::clone(db));
+        let file_paths = db.collect_checkpoint_file_paths(false)?;
         let db_path = db.path();
 
-        let mut files = Vec::with_capacity(file_paths.len());
-        for src_path in &file_paths {
+        let mut inline_files = Vec::new();
+        let mut sst_paths = Vec::with_capacity(file_paths.len());
+        for src_path in file_paths {
             let relative = src_path
                 .strip_prefix(db_path)
                 .map_err(|_| Error::InvalidArgument("checkpoint file outside db dir".into()))?
                 .to_string_lossy()
                 .to_string();
-            let data = std::fs::read(src_path)?;
+            if src_path.extension().is_some_and(|e| e == "sst") {
+                sst_paths.push((relative, src_path));
+            } else {
+                let data = std::fs::read(&src_path)?;
+                inline_files.push(SnapshotFile {
+                    relative_path: relative,
+                    data,
+                });
+            }
+        }
+        Ok(Self {
+            inline_files,
+            sst_paths,
+            _guard: guard,
+        })
+    }
+
+    /// 锁外读取 SST 并序列化.
+    fn into_bundle_bytes(self) -> Result<Vec<u8>> {
+        let mut files = self.inline_files;
+        files.reserve(self.sst_paths.len());
+        for (relative_path, path) in &self.sst_paths {
             files.push(SnapshotFile {
-                relative_path: relative,
-                data,
+                relative_path: relative_path.clone(),
+                data: std::fs::read(path)?,
             });
         }
-        Ok(SnapshotBundle { files })
+        postcard::to_allocvec(&SnapshotBundle { files })
+            .map_err(|e| Error::Cluster(ClusterError::Serialization(e.to_string())))
     }
 }
 
-struct SnapshotCheckpointGuard<'a> {
-    db: &'a DB,
+struct SnapshotCheckpointGuard {
+    db: Arc<DB>,
 }
 
-impl<'a> SnapshotCheckpointGuard<'a> {
-    fn new(db: &'a DB) -> Self {
+impl SnapshotCheckpointGuard {
+    fn new(db: Arc<DB>) -> Self {
         db.enter_checkpoint();
         Self { db }
     }
 }
 
-impl Drop for SnapshotCheckpointGuard<'_> {
+impl Drop for SnapshotCheckpointGuard {
     fn drop(&mut self) {
         self.db.leave_checkpoint();
     }
 }
 
-/// 构建文件级 snapshot bundle.
+/// 构建文件级 snapshot bundle (不要求与 apply 互斥, 仅测试用).
 /// 先 flush 确保所有数据在 SST 文件中, 再用 checkpoint 协议读文件内容.
-pub(crate) fn prepare_snapshot_bundle(db: &DB) -> Result<Vec<u8>> {
+#[cfg(test)]
+pub(crate) fn prepare_snapshot_bundle(db: &Arc<DB>) -> Result<Vec<u8>> {
     db.flush()?;
-
-    let _guard = SnapshotCheckpointGuard::new(db);
-    let bundle = SnapshotBundle::from_files(db)?;
-
-    postcard::to_allocvec(&bundle)
-        .map_err(|e| Error::Cluster(ClusterError::Serialization(e.to_string())))
+    CapturedSnapshot::capture(db)?.into_bundle_bytes()
 }
 
+#[derive(Clone)]
 pub struct OpenRaftSnapshotBuilder {
     db: super::DbSlot,
     group_id: u64,
@@ -135,12 +166,19 @@ impl OpenRaftSnapshotBuilder {
         }
     }
 
-    fn remember(&self, db: &DB, meta: &SMOf, bytes: &[u8]) -> std::io::Result<()> {
+    /// 持久化快照位点并更新内存态. openraft 据此位点 purge raft 日志.
+    fn persist_meta(&self, db: &DB, meta: &SMOf) -> std::io::Result<()> {
         let meta_bytes = postcard::to_allocvec(meta)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         db.put(&snapshot_meta_key(self.group_id), &meta_bytes)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         self.state.write().snapshot_meta = Some(meta.clone());
+        Ok(())
+    }
+
+    /// 留一份完整 bundle, 复制给落后副本时由 `get_current_snapshot` 取回.
+    fn remember(&self, db: &DB, meta: &SMOf, bytes: &[u8]) -> std::io::Result<()> {
+        self.persist_meta(db, meta)?;
         *self.built_snapshot.write() = Some((meta.clone(), bytes.to_vec()));
         Ok(())
     }
@@ -221,39 +259,109 @@ impl OpenRaftStorage {
 impl openraft::RaftSnapshotBuilder<TypeConfig> for OpenRaftSnapshotBuilder {
     type SnapshotData = std::io::Cursor<Vec<u8>>;
 
+    /// openraft 每次日志清理都会调用, 且只取返回值里的 meta, 数据直接丢弃.
+    /// 因此这里只 flush 并记位点, 不打包整库; 整库 bundle 见 `build_full_snapshot`.
     async fn build_snapshot(
         &mut self,
     ) -> std::result::Result<
         Snapshot<CLId, u64, openraft::BasicNode, Cursor<Vec<u8>>>,
         std::io::Error,
     > {
-        // 抓快照必须与 apply 互斥. 否则 `prepare_snapshot_bundle` 里的 flush 完成后,
-        // 并发 apply 会把新条目写进新的 memtable 并推进 `last_applied`, 随后读到的
-        // 位点会大于 bundle 实际内容. openraft 会按该位点 purge raft 日志, 于是
-        // (bundle 内容, 位点] 这段日志既不在 SST 也不在日志里 —— 重启后出现空洞,
-        // RaftCore 在 apply 时 panic 并且 group 再也无法写.
-        let _capture = self.capture_lock.write();
+        self.run_blocking(false).await
+    }
+}
 
-        let db = self.db.read();
-        let data =
-            prepare_snapshot_bundle(&db).map_err(|e| std::io::Error::other(e.to_string()))?;
+impl OpenRaftSnapshotBuilder {
+    /// 复制给落后副本时才需要: 完整 bundle, meta 与内容来自同一次抓取.
+    pub(crate) async fn build_full_snapshot(
+        &self,
+    ) -> std::io::Result<Snapshot<CLId, u64, openraft::BasicNode, Cursor<Vec<u8>>>> {
+        self.run_blocking(true).await
+    }
 
-        let membership: MOf = db
-            .get(&super::keys::membership_key(self.group_id))
+    // flush / 读文件 / 序列化都是同步 IO, 不能占用 tokio worker.
+    async fn run_blocking(
+        &self,
+        full: bool,
+    ) -> std::io::Result<Snapshot<CLId, u64, openraft::BasicNode, Cursor<Vec<u8>>>> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || this.build_blocking(full))
+            .await
             .map_err(|e| std::io::Error::other(e.to_string()))?
-            .map(|d| postcard::from_bytes(&d).unwrap_or_default())
-            .unwrap_or_default();
+    }
 
-        let last_applied: Option<LIdOf> = db
-            .get(&super::keys::last_applied_key(self.group_id))
-            .map_err(|e| std::io::Error::other(e.to_string()))?
-            .and_then(|d| rmp_serde::from_slice(&d).ok());
+    fn build_blocking(
+        &self,
+        full: bool,
+    ) -> std::io::Result<Snapshot<CLId, u64, openraft::BasicNode, Cursor<Vec<u8>>>> {
+        let io_err = |e: &dyn std::fmt::Display| std::io::Error::other(e.to_string());
+        let started = std::time::Instant::now();
+        let db = Arc::clone(&self.db.read());
 
-        let meta = SnapshotMeta {
-            last_log_id: last_applied,
-            last_membership: membership,
+        // 抓快照必须与 apply 互斥. 否则并发 apply 会把新条目写进 memtable 并推进
+        // `last_applied`, 随后读到的位点会大于已落盘内容. openraft 会按该位点 purge
+        // raft 日志, 于是 (内容, 位点] 这段日志既不在 SST 也不在日志里 —— 重启后出现
+        // 空洞, RaftCore 在 apply 时 panic 并且 group 再也无法写.
+        //
+        // 日常清理 (`full=false`): 锁内只冻结 memtable + 读位点 (微秒级), 落盘放到锁外,
+        // 落盘完成后才发布位点, 所以位点之前的数据一定已在 SST. 实测同步 flush 要 2~3 秒.
+        // 完整 bundle (`full=true`): 文件清单必须与位点同一时刻, 仍在锁内 flush.
+        let lock_started = std::time::Instant::now();
+        let (captured, meta, wait_ms) = {
+            let _capture = self.capture_lock.write();
+            let wait_ms = lock_started.elapsed().as_millis() as u64;
+            let captured = if full {
+                db.flush().map_err(|e| io_err(&e))?;
+                Some(CapturedSnapshot::capture(&db).map_err(|e| io_err(&e))?)
+            } else {
+                db.freeze_active().map_err(|e| io_err(&e))?;
+                None
+            };
+
+            let membership: MOf = db
+                .get(&super::keys::membership_key(self.group_id))
+                .map_err(|e| io_err(&e))?
+                .map(|d| postcard::from_bytes(&d).unwrap_or_default())
+                .unwrap_or_default();
+            let last_applied: Option<LIdOf> = db
+                .get(&super::keys::last_applied_key(self.group_id))
+                .map_err(|e| io_err(&e))?
+                .and_then(|d| rmp_serde::from_slice(&d).ok());
+            (
+                captured,
+                SnapshotMeta {
+                    last_log_id: last_applied,
+                    last_membership: membership,
+                },
+                wait_ms,
+            )
         };
-        self.remember(&db, &meta, &data)?;
+        let locked_ms = started.elapsed().as_millis() as u64;
+
+        if !full {
+            db.flush_frozen().map_err(|e| io_err(&e))?;
+        }
+
+        let data = match captured {
+            Some(c) => {
+                let data = c.into_bundle_bytes().map_err(|e| io_err(&e))?;
+                self.remember(&db, &meta, &data)?;
+                data
+            }
+            None => {
+                self.persist_meta(&db, &meta)?;
+                Vec::new()
+            }
+        };
+        tracing::info!(
+            group_id = self.group_id,
+            full,
+            wait_ms,
+            locked_ms,
+            total_ms = started.elapsed().as_millis() as u64,
+            bytes = data.len(),
+            "raft snapshot built"
+        );
 
         Ok(Snapshot {
             meta,
@@ -435,8 +543,6 @@ mod tests {
     /// 日志, 重启后 (bundle 内容, meta] 既不在 SST 也不在日志里, 直接丢数据.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_snapshot_meta_matches_bundle_content_under_concurrent_apply() {
-        use openraft::RaftSnapshotBuilder;
-
         let dir = TempDir::new().unwrap();
         let db = DB::open(dir.path(), Options::for_testing()).unwrap();
         let storage = Arc::new(OpenRaftStorage::new(db, DEFAULT_GROUP_ID, None).unwrap());
@@ -467,14 +573,14 @@ mod tests {
 
         let mut checked = 0usize;
         for _ in 0..5 {
-            let mut builder = OpenRaftSnapshotBuilder::new(
+            let builder = OpenRaftSnapshotBuilder::new(
                 Arc::clone(&storage.db),
                 storage.group_id,
                 Arc::clone(&storage.state),
                 Arc::clone(&storage.built_snapshot),
                 Arc::clone(&storage.capture_lock),
             );
-            let snapshot = builder.build_snapshot().await.unwrap();
+            let snapshot = builder.build_full_snapshot().await.unwrap();
 
             let bundle: SnapshotBundle = postcard::from_bytes(snapshot.snapshot.get_ref()).unwrap();
             let dir = TempDir::new().unwrap();
@@ -501,6 +607,22 @@ mod tests {
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         writer.join().unwrap();
         assert_eq!(checked, 5);
+    }
+
+    /// raft 快照 flush 之后数据全在 SST, bundle 不应再搬运历史 WAL.
+    #[test]
+    fn snapshot_bundle_excludes_wal_files() {
+        let dir = TempDir::new().unwrap();
+        let db = DB::open(dir.path(), Options::for_testing()).unwrap();
+        db.put(b"k", b"v").unwrap();
+
+        let bundle: SnapshotBundle =
+            postcard::from_bytes(&prepare_snapshot_bundle(&db).unwrap()).unwrap();
+        assert!(!bundle.files.is_empty());
+        assert!(bundle
+            .files
+            .iter()
+            .all(|f| !f.relative_path.contains("wal")));
     }
 
     /// 回归: 安装快照会关掉旧 DB 再打开新的. 日志存储是另一份克隆, 必须看到新 DB.
@@ -579,6 +701,65 @@ mod tests {
             .expect("构建后的快照必须还能读到");
         assert_eq!(sent.meta.last_log_id, built.meta.last_log_id);
         assert_eq!(sent.meta.last_log_id.map(|id| id.index), Some(7));
-        assert_eq!(sent.snapshot.into_inner(), built.snapshot.into_inner());
+        // openraft 丢弃 `build_snapshot` 的数据只取 meta, 所以日常清理不打包整库;
+        // 真正要发给副本时 `get_current_snapshot` 才现做完整 bundle.
+        assert!(built.snapshot.into_inner().is_empty());
+        let bundle: SnapshotBundle = postcard::from_bytes(&sent.snapshot.into_inner()).unwrap();
+        assert!(bundle.files.iter().any(|f| f.relative_path.ends_with(".sst")));
+    }
+
+    /// 日常快照在发布位点前必须把冻结的数据落盘, 否则 purge 之后重启会丢这段状态.
+    #[tokio::test]
+    async fn build_snapshot_flushes_frozen_data_before_publishing_meta() {
+        use openraft::storage::RaftStateMachine;
+        use openraft::RaftSnapshotBuilder;
+
+        let dir = TempDir::new().unwrap();
+        let db = DB::open(dir.path(), Options::for_testing()).unwrap();
+        let mut storage = OpenRaftStorage::new(Arc::clone(&db), DEFAULT_GROUP_ID, None).unwrap();
+
+        let mut ops = ThinWriteBatch::new();
+        ops.put(b"k".to_vec(), b"v".to_vec());
+        let entry = crate::cluster::types::LogEntry {
+            log_id: LogId::new(openraft::vote::leader_id_std::CommittedLeaderId::new(1), 9),
+            payload: openraft::EntryPayload::Normal(crate::cluster::types::Request::WriteBatch(
+                ops,
+            )),
+        };
+        storage.apply_entries_internal(&[entry]).unwrap();
+        assert_eq!(db.level0_sstable_count(), 0);
+
+        storage.get_snapshot_builder().await.build_snapshot().await.unwrap();
+        assert!(db.level0_sstable_count() >= 1, "位点发布前数据必须已在 SST");
+    }
+
+    /// 日常 `build_snapshot` 只 flush 并记位点, 不读 SST, 也不留整库内存副本.
+    #[tokio::test]
+    async fn build_snapshot_is_meta_only_and_does_not_cache_bundle() {
+        use openraft::storage::RaftStateMachine;
+        use openraft::RaftSnapshotBuilder;
+
+        let dir = TempDir::new().unwrap();
+        let db = DB::open(dir.path(), Options::for_testing()).unwrap();
+        let mut storage = OpenRaftStorage::new(db, DEFAULT_GROUP_ID, None).unwrap();
+
+        let mut ops = ThinWriteBatch::new();
+        ops.put(b"k".to_vec(), b"v".to_vec());
+        let entry = crate::cluster::types::LogEntry {
+            log_id: LogId::new(openraft::vote::leader_id_std::CommittedLeaderId::new(1), 3),
+            payload: openraft::EntryPayload::Normal(crate::cluster::types::Request::WriteBatch(
+                ops,
+            )),
+        };
+        storage.apply_entries_internal(&[entry]).unwrap();
+
+        let built = storage.get_snapshot_builder().await.build_snapshot().await.unwrap();
+        assert_eq!(built.meta.last_log_id.map(|id| id.index), Some(3));
+        assert!(built.snapshot.into_inner().is_empty());
+        assert!(storage.built_snapshot.read().is_none());
+        assert_eq!(
+            storage.state.read().snapshot_meta.as_ref().and_then(|m| m.last_log_id).map(|id| id.index),
+            Some(3)
+        );
     }
 }
