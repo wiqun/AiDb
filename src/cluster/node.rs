@@ -60,6 +60,73 @@ const CATCH_UP_THRESHOLD: u64 = 5;
 const REPLICATION_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 const REPLICATION_POLL: Duration = Duration::from_millis(50);
 const REPLICATION_HEARTBEAT_MULTIPLIER: u32 = 3;
+/// 与 aikv 慢日志默认阈值一致, 方便把一次慢提交和 SLOWLOG 对上.
+const SLOW_PROPOSE_THRESHOLD: Duration = Duration::from_millis(100);
+
+fn propose_is_slow(elapsed: Duration) -> bool {
+    elapsed >= SLOW_PROPOSE_THRESHOLD
+}
+
+fn phase_gap_us(client_write_us: u64, append_us: u64, apply_us: u64) -> u64 {
+    client_write_us.saturating_sub(append_us.saturating_add(apply_us))
+}
+
+fn build_openraft_config(config: &RaftNodeConfig) -> Result<Config> {
+    let tick_interval = config.heartbeat_interval * 13 / 64;
+    let max_min = config.election_timeout_min.saturating_sub(
+        config
+            .heartbeat_interval
+            .saturating_add(tick_interval)
+            .saturating_add(1),
+    );
+    let min_interval = config.heartbeat_interval.min(max_min);
+
+    Config {
+        cluster_name: format!("aidb-raft-{}", config.group_id),
+        election_timeout_min: config.election_timeout_min,
+        election_timeout_max: config.election_timeout_max,
+        heartbeat_interval: config.heartbeat_interval,
+        heartbeat_min_interval: (min_interval > 0).then_some(min_interval),
+        max_payload_entries: config.max_payload_entries,
+        snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(config.snapshot_logs_since_last),
+        ..Default::default()
+    }
+    .validate()
+    .map_err(|e| Error::Cluster(ClusterError::InvalidConfig(e.to_string())))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn note_slow_propose(
+    group_id: u64,
+    request: &Request,
+    estimated_bytes: u64,
+    total: Duration,
+    client_write: Duration,
+    attempt: u32,
+    append_us: u64,
+    apply_us: u64,
+    write_us: u64,
+    error: Option<&str>,
+) {
+    if !propose_is_slow(client_write) && !propose_is_slow(total) {
+        return;
+    }
+    let client_write_us = client_write.as_micros() as u64;
+    tracing::warn!(
+        group_id,
+        estimated_bytes,
+        total_us = total.as_micros() as u64,
+        client_write_us,
+        append_us,
+        apply_us,
+        write_us,
+        gap_us = phase_gap_us(client_write_us, append_us, apply_us),
+        attempt,
+        request = %request,
+        error = error.unwrap_or(""),
+        "raft_propose_slow"
+    );
+}
 
 pub struct OpenRaftNode {
     node_id: NodeId,
@@ -83,23 +150,32 @@ impl OpenRaftNode {
         db: Arc<DB>,
         network_factory: RaftNetworkClientFactory,
     ) -> Result<Self> {
+        Self::new_with_db_slot(config, Arc::new(RwLock::new(db)), network_factory).await
+    }
+
+    pub async fn new_with_db_slot(
+        config: RaftNodeConfig,
+        db_slot: crate::cluster::log_committer::DbSlot,
+        network_factory: RaftNetworkClientFactory,
+    ) -> Result<Self> {
         config.validate()?;
 
-        if !db.use_wal() {
+        if !db_slot.read().use_wal() {
             return Err(Error::Cluster(ClusterError::InvalidConfig(
                 "raft mode requires use_wal=true".into(),
             )));
         }
 
-        // 可选: 创建 LogCommitter.
+        // 可选: 创建 LogCommitter. 和状态机共用一个槽, 安装快照换库时两边一起换.
         let committer = config
             .log_committer_config
             .as_ref()
-            .map(|cfg| spawn_committer(config.group_id, db.clone(), cfg.clone()));
+            .map(|cfg| spawn_committer(config.group_id, Arc::clone(&db_slot), cfg.clone()));
 
+        let opened = db_slot.read().clone();
         let storage =
-            OpenRaftStorage::new_with_committer(db.clone(), config.group_id, None, committer)?;
-        Self::new_with_storage(config, db, storage, network_factory).await
+            OpenRaftStorage::new_with_committer(db_slot, config.group_id, None, committer)?;
+        Self::new_with_storage(config, opened, storage, network_factory).await
     }
 
     pub async fn new_with_storage(
@@ -117,19 +193,7 @@ impl OpenRaftNode {
             )));
         }
 
-        let raft_config = Config {
-            cluster_name: format!("aidb-raft-{}", config.group_id),
-            election_timeout_min: config.election_timeout_min,
-            election_timeout_max: config.election_timeout_max,
-            heartbeat_interval: config.heartbeat_interval,
-            max_payload_entries: config.max_payload_entries,
-            snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(
-                config.snapshot_logs_since_last,
-            ),
-            ..Default::default()
-        }
-        .validate()
-        .map_err(|e| Error::Cluster(ClusterError::InvalidConfig(e.to_string())))?;
+        let raft_config = build_openraft_config(&config)?;
 
         let network_factory_arc = Arc::new(RwLock::new(network_factory));
         let network_for_raft = network_factory_arc.read().clone();
@@ -368,7 +432,7 @@ impl OpenRaftNode {
             .unwrap_or(false)
     }
 
-    fn check_entry_size(&self, request: &Request) -> Result<()> {
+    fn check_entry_size(&self, request: &Request) -> Result<u64> {
         let size = request.estimated_serialized_size() as u64;
         if size > self.max_entry_size {
             return Err(Error::Cluster(ClusterError::InvalidConfig(format!(
@@ -376,7 +440,7 @@ impl OpenRaftNode {
                 self.max_entry_size
             ))));
         }
-        Ok(())
+        Ok(size)
     }
 
     pub async fn propose(&self, request: Request) -> Result<Response> {
@@ -386,21 +450,35 @@ impl OpenRaftNode {
 
     async fn propose_inner(&self, request: Request) -> Result<Response> {
         let t0 = std::time::Instant::now();
-        self.check_entry_size(&request)?;
-        let estimated_size = request.estimated_serialized_size() as u64;
+        let estimated_size = self.check_entry_size(&request)?;
         // Retry on ForwardToLeader — during leader re-election, the first
         // forward target may itself be in transition.  Up to 3 retries with
         // 200ms backoff.
         for attempt in 0u32..3 {
             let t1 = std::time::Instant::now();
+            self.storage.phases.reset();
             match self.raft.client_write(request.clone()).await {
                 Ok(response) => {
-                    let elapsed = t0.elapsed();
+                    let client_write = t1.elapsed();
+                    let total = t0.elapsed();
+                    let (append_us, apply_us, write_us) = self.storage.phases.snapshot();
+                    note_slow_propose(
+                        self.group_id,
+                        &request,
+                        estimated_size,
+                        total,
+                        client_write,
+                        attempt,
+                        append_us,
+                        apply_us,
+                        write_us,
+                        None,
+                    );
                     tracing::debug!(
                         target: "perf",
                         group_id = self.group_id,
-                        total_us = elapsed.as_micros(),
-                        client_write_us = t1.elapsed().as_micros(),
+                        total_us = total.as_micros(),
+                        client_write_us = client_write.as_micros(),
                         attempt,
                         "raft_propose_ok"
                     );
@@ -409,6 +487,24 @@ impl OpenRaftNode {
                     return Ok(response.data);
                 }
                 Err(e) => {
+                    let client_write = t1.elapsed();
+                    let total = t0.elapsed();
+                    if propose_is_slow(client_write) || propose_is_slow(total) {
+                        let error = e.to_string();
+                        let (append_us, apply_us, write_us) = self.storage.phases.snapshot();
+                        note_slow_propose(
+                            self.group_id,
+                            &request,
+                            estimated_size,
+                            total,
+                            client_write,
+                            attempt,
+                            append_us,
+                            apply_us,
+                            write_us,
+                            Some(&error),
+                        );
+                    }
                     if let Some(ftl) = e.forward_to_leader() {
                         let leader_addr = ftl.leader_node.as_ref().map(|n| n.addr.clone());
                         // Register the leader address so the network factory can reach it.
@@ -813,6 +909,41 @@ mod tests {
     use crate::cluster::storage::DEFAULT_GROUP_ID;
     use crate::config::Options;
     use tempfile::TempDir;
+
+    #[test]
+    fn slow_propose_threshold_matches_slowlog() {
+        assert!(!propose_is_slow(Duration::from_millis(99)));
+        assert!(propose_is_slow(Duration::from_millis(100)));
+        assert!(propose_is_slow(Duration::from_millis(800)));
+    }
+
+    #[test]
+    fn phase_gap_is_client_write_minus_append_and_apply() {
+        assert_eq!(phase_gap_us(961_405, 1_000, 2_000), 958_405);
+        assert_eq!(phase_gap_us(100, 80, 50), 0);
+    }
+
+    #[test]
+    fn test_build_openraft_config_sets_heartbeat_min_interval() {
+        let cfg = RaftNodeConfig {
+            heartbeat_interval: 100,
+            election_timeout_min: 500,
+            election_timeout_max: 800,
+            ..Default::default()
+        };
+        let built = build_openraft_config(&cfg).expect("valid openraft config");
+        assert_eq!(built.heartbeat_min_interval, Some(100));
+
+        let tight = RaftNodeConfig {
+            heartbeat_interval: 100,
+            election_timeout_min: 130,
+            election_timeout_max: 200,
+            ..Default::default()
+        };
+        let built_tight = build_openraft_config(&tight).expect("clamped config valid");
+        assert!(built_tight.heartbeat_min_interval.is_some());
+        assert!(built_tight.heartbeat_min_interval.unwrap() < 100);
+    }
 
     #[tokio::test]
     async fn test_raft_node_creation() {

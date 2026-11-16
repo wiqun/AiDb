@@ -30,7 +30,7 @@
 //!   seq/tip 只在 apply 内单调分配.
 //! - `MigrationGc` 只删 `\x02mig/{gid}/{epoch}/*`, 不动用户 `sm_key`.
 
-use openraft::{EntryPayload, MessageSummary};
+use openraft::EntryPayload;
 use std::collections::HashMap;
 
 use crate::cluster::meta_types::{MetaRequest, METARAFT_GROUP_ID};
@@ -55,11 +55,12 @@ impl OpenRaftStorage {
     pub(crate) fn apply_batch_to_sm(&self, batch: &ThinWriteBatch) -> Result<()> {
         let mut db_batch = WriteBatch::new();
         let mut overlay = HashMap::new();
-        self.append_thin_batch_to_db_batch(&mut db_batch, batch, &mut overlay)?;
+        self.append_thin_batch_to_db_batch(&mut db_batch, batch, Some(&mut overlay))?;
         if db_batch.is_empty() {
             return Ok(());
         }
         self.db
+            .read()
             .write(&db_batch)
             .map_err(|e| Error::Cluster(map_db_err(e)))?;
         Ok(())
@@ -73,11 +74,12 @@ impl OpenRaftStorage {
     ) -> Result<()> {
         let mut db_batch = WriteBatch::new();
         let mut overlay = HashMap::new();
-        self.append_migration_write_to_batch(&mut db_batch, epoch, ops, &mut overlay)?;
+        self.append_migration_write_to_batch(&mut db_batch, epoch, ops, Some(&mut overlay))?;
         if db_batch.is_empty() {
             return Ok(());
         }
         self.db
+            .read()
             .write(&db_batch)
             .map_err(|e| Error::Cluster(map_db_err(e)))?;
         Ok(())
@@ -103,6 +105,7 @@ impl OpenRaftStorage {
             return Ok(());
         }
         self.db
+            .read()
             .write(&batch)
             .map_err(|e| Error::Cluster(map_db_err(e)))?;
         Ok(())
@@ -112,7 +115,11 @@ impl OpenRaftStorage {
         &self,
         entries: &[<TypeConfig as openraft::RaftTypeConfig>::Entry],
     ) -> Result<Vec<Response>> {
-        let mut last_applied = self.read_last_applied_from_db()?;
+        // 与 snapshot 抓取互斥: 保证 snapshot 的 flush 边界与它记录的 `last_applied`
+        // 位点严格对应, 不会被 apply 插入造成位点领先于 bundle 内容.
+        let _capture = self.capture_lock.read();
+
+        let mut last_applied = self.state.read().last_applied;
         let mut responses = Vec::with_capacity(entries.len());
 
         tracing::debug!(
@@ -136,13 +143,6 @@ impl OpenRaftStorage {
                 }
             }
 
-            tracing::debug!(
-              index = entry.log_id.index,
-              term = entry.log_id.leader_id.term,
-              payload = %entry.payload.summary(),
-              "applying entry",
-            );
-
             match &entry.payload {
                 EntryPayload::Normal(Request::Meta(meta_req))
                     if self.group_id == METARAFT_GROUP_ID && self.meta_state.is_some() =>
@@ -156,7 +156,7 @@ impl OpenRaftStorage {
                     // 将连续的 data entry 批量合并到一个 WriteBatch.
                     //
                     // append_request_to_batch 目前唯一可能返回 Err 的路径是
-                    // PutConditional 内部 self.db.get() 的磁盘 I/O 读取失败 —
+                    // PutConditional 内部 self.db.read().get() 的磁盘 I/O 读取失败 —
                     // 这是基础设施故障, 不是业务结果 (Put/Delete/WriteBatch 三个
                     // 分支永远不失败; PutConditional "条件不满足" 本身走的是
                     // Ok(()) 分支, 不是 Err). 因此这里的错误必须和本文件里其它
@@ -168,7 +168,16 @@ impl OpenRaftStorage {
                     // 不同副本可能因为存储故障的偶然性而分叉.
                     let t0 = std::time::Instant::now();
                     let mut batch = WriteBatch::new();
-                    let mut overlay = HashMap::new();
+                    // 仅当后续存在 PutConditional 时才维护批内 overlay, 正常业务写零克隆零分配.
+                    let mut overlay = entries[i..]
+                        .iter()
+                        .any(|e| {
+                            matches!(
+                                e.payload,
+                                EntryPayload::Normal(Request::PutConditional { .. })
+                            )
+                        })
+                        .then(HashMap::new);
                     let mut batched_responses: Vec<Response> = Vec::new();
                     let batch_start = i;
                     let mut last_log_id = entry.log_id;
@@ -185,8 +194,11 @@ impl OpenRaftStorage {
                             EntryPayload::Membership(_) => break,
                             EntryPayload::Blank => break,
                             EntryPayload::Normal(req) => {
-                                let response =
-                                    self.append_request_to_batch(&mut batch, req, &mut overlay)?;
+                                let response = self.append_request_to_batch(
+                                    &mut batch,
+                                    req,
+                                    overlay.as_mut(),
+                                )?;
                                 batched_responses.push(response);
                                 last_log_id = e.log_id;
                                 i += 1;
@@ -203,9 +215,12 @@ impl OpenRaftStorage {
                         crate::cluster::failpoint::fire(
                             crate::cluster::FailPoint::ApplyBeforePersist,
                         );
+                        let write_started = std::time::Instant::now();
                         self.db
+                            .read()
                             .write_without_wal(&batch)
                             .map_err(|e| Error::Cluster(map_db_err(e)))?;
+                        self.phases.add_write(write_started.elapsed());
                         #[cfg(feature = "cluster-test-util")]
                         crate::cluster::failpoint::fire(
                             crate::cluster::FailPoint::ApplyAfterPersist,
@@ -266,18 +281,22 @@ impl OpenRaftStorage {
         &self,
         batch: &mut WriteBatch,
         thin: &ThinWriteBatch,
-        overlay: &mut HashMap<Vec<u8>, bool>,
+        mut overlay: Option<&mut HashMap<Vec<u8>, bool>>,
     ) -> Result<()> {
         for op in &thin.ops {
             match op {
                 ThinWriteOp::Put { key, value } => {
                     let sk = sm_key(self.group_id, key);
-                    overlay.insert(sk.clone(), true);
+                    if let Some(ov) = overlay.as_deref_mut() {
+                        ov.insert(sk.clone(), true);
+                    }
                     batch.put(sk, value.clone());
                 }
                 ThinWriteOp::Delete { key } => {
                     let sk = sm_key(self.group_id, key);
-                    overlay.insert(sk.clone(), false);
+                    if let Some(ov) = overlay.as_deref_mut() {
+                        ov.insert(sk.clone(), false);
+                    }
                     batch.delete(sk);
                 }
             }
@@ -298,13 +317,17 @@ impl OpenRaftStorage {
         // propose 前查完就假定结论一直有效.
         if let Some(epoch) = migration_epoch {
             let ts_key = mig_tombstone_key(self.group_id, epoch, key);
-            if let Some((MigOp::Del, _)) = self.db.get(&ts_key)?.and_then(|v| decode_tombstone(&v))
+            if let Some((MigOp::Del, _)) = self
+                .db
+                .read()
+                .get(&ts_key)?
+                .and_then(|v| decode_tombstone(&v))
             {
                 return Ok(());
             }
         }
         let sm = sm_key(self.group_id, key);
-        if Self::overlay_key_exists(overlay, &self.db, &sm)? {
+        if Self::overlay_key_exists(overlay, &self.db.read(), &sm)? {
             return Ok(());
         }
         batch.put(sm.clone(), value.to_vec());
@@ -320,7 +343,7 @@ impl OpenRaftStorage {
         batch: &mut WriteBatch,
         epoch: u64,
         ops: &ThinWriteBatch,
-        overlay: &mut HashMap<Vec<u8>, bool>,
+        mut overlay: Option<&mut HashMap<Vec<u8>, bool>>,
     ) -> Result<()> {
         if ops.is_empty() {
             return Ok(());
@@ -328,6 +351,7 @@ impl OpenRaftStorage {
         let tip_key = mig_tip_key(self.group_id, epoch);
         let tip_before = self
             .db
+            .read()
             .get(&tip_key)?
             .and_then(|v| decode_tip(&v))
             .unwrap_or(0);
@@ -336,7 +360,9 @@ impl OpenRaftStorage {
             match op {
                 ThinWriteOp::Put { key, value } => {
                     let sk = sm_key(self.group_id, key);
-                    overlay.insert(sk.clone(), true);
+                    if let Some(ov) = overlay.as_deref_mut() {
+                        ov.insert(sk.clone(), true);
+                    }
                     batch.put(sk, value.clone());
                     batch.put(
                         mig_tombstone_key(self.group_id, epoch, key),
@@ -345,7 +371,9 @@ impl OpenRaftStorage {
                 }
                 ThinWriteOp::Delete { key } => {
                     let sk = sm_key(self.group_id, key);
-                    overlay.insert(sk.clone(), false);
+                    if let Some(ov) = overlay.as_deref_mut() {
+                        ov.insert(sk.clone(), false);
+                    }
                     batch.delete(sk);
                     batch.put(
                         mig_tombstone_key(self.group_id, epoch, key),
@@ -363,7 +391,7 @@ impl OpenRaftStorage {
     fn append_migration_gc_to_batch(&self, batch: &mut WriteBatch, epoch: u64) -> Result<()> {
         let start = mig_range_start(self.group_id, epoch);
         let end = mig_range_end(self.group_id, epoch);
-        for item in self.db.scan(Some(&start), Some(&end))? {
+        for item in self.db.read().scan(Some(&start), Some(&end))? {
             let (key, _) = item?;
             batch.delete(key);
         }
@@ -374,7 +402,7 @@ impl OpenRaftStorage {
         &self,
         batch: &mut WriteBatch,
         request: &Request,
-        overlay: &mut HashMap<Vec<u8>, bool>,
+        mut overlay: Option<&mut HashMap<Vec<u8>, bool>>,
     ) -> Result<Response> {
         match request {
             Request::Meta(_) => Ok(Response::Error("meta request on non-meta storage".into())),
@@ -383,18 +411,25 @@ impl OpenRaftStorage {
                 value,
                 migration_epoch,
             } => {
-                self.append_put_conditional_to_batch(batch, key, value, *migration_epoch, overlay)?;
+                let ov = overlay
+                    .as_deref_mut()
+                    .expect("overlay must be initialized when PutConditional is present");
+                self.append_put_conditional_to_batch(batch, key, value, *migration_epoch, ov)?;
                 Ok(Response::Ok)
             }
             Request::Put { key, value } => {
                 let sk = sm_key(self.group_id, key);
-                overlay.insert(sk.clone(), true);
+                if let Some(ov) = overlay.as_deref_mut() {
+                    ov.insert(sk.clone(), true);
+                }
                 batch.put(sk, value.clone());
                 Ok(Response::Ok)
             }
             Request::Delete { key } => {
                 let sk = sm_key(self.group_id, key);
-                overlay.insert(sk.clone(), false);
+                if let Some(ov) = overlay.as_deref_mut() {
+                    ov.insert(sk.clone(), false);
+                }
                 batch.delete(sk);
                 Ok(Response::Ok)
             }
@@ -427,6 +462,7 @@ impl OpenRaftStorage {
             Self::serialize_last_applied(log_id)?,
         );
         self.db
+            .read()
             .write(&batch)
             .map_err(|e| Error::Cluster(map_db_err(e)))?;
         self.state.write().last_applied = Some(*log_id);
@@ -448,6 +484,7 @@ impl OpenRaftStorage {
             Self::serialize_last_applied(log_id)?,
         );
         self.db
+            .read()
             .write(&batch)
             .map_err(|e| Error::Cluster(map_db_err(e)))?;
         self.state.write().last_applied = Some(*log_id);
@@ -471,6 +508,7 @@ impl OpenRaftStorage {
             Self::serialize_last_applied(log_id)?,
         );
         self.db
+            .read()
             .write(&batch)
             .map_err(|e| Error::Cluster(map_db_err(e)))?;
         self.state.write().last_applied = Some(*log_id);
@@ -479,14 +517,15 @@ impl OpenRaftStorage {
 
     pub fn get_state_machine_value(&self, user_key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.db
+            .read()
             .get(&sm_key(self.group_id, user_key))
             .map_err(|e| Error::Cluster(map_db_err(e)))
     }
 
     pub fn get_state_machine_bytes(&self, user_key: &[u8]) -> Result<Option<bytes::Bytes>> {
         let key = sm_key(self.group_id, user_key);
-        let pinned = self
-            .db
+        let db = self.db.read();
+        let pinned = db
             .get_pinned(&key)
             .map_err(|e| Error::Cluster(map_db_err(e)))?;
         Ok(pinned.map(|p| p.into_bytes()))
@@ -497,6 +536,7 @@ impl OpenRaftStorage {
         let key = mig_tip_key(self.group_id, epoch);
         Ok(self
             .db
+            .read()
             .get(&key)
             .map_err(|e| Error::Cluster(map_db_err(e)))?
             .and_then(|v| decode_tip(&v))
@@ -510,6 +550,7 @@ impl OpenRaftStorage {
         let key = mig_tombstone_key(self.group_id, epoch, user_key);
         Ok(self
             .db
+            .read()
             .get(&key)
             .map_err(|e| Error::Cluster(map_db_err(e)))?
             .and_then(|v| decode_tombstone(&v))
@@ -603,7 +644,11 @@ mod tests {
             Some(b"v1".to_vec())
         );
         assert_eq!(
-            storage.db.get(&sm_key(DEFAULT_GROUP_ID, b"k")).unwrap(),
+            storage
+                .db
+                .read()
+                .get(&sm_key(DEFAULT_GROUP_ID, b"k"))
+                .unwrap(),
             Some(b"v1".to_vec())
         );
     }
@@ -638,12 +683,14 @@ mod tests {
 
         let ts1 = storage
             .db
+            .read()
             .get(&mig_tombstone_key(DEFAULT_GROUP_ID, 7, b"k1"))
             .unwrap()
             .expect("Put op 必须同 entry 写入 tombstone");
         assert_eq!(decode_tombstone(&ts1), Some((MigOp::Put, 1)));
         let ts2 = storage
             .db
+            .read()
             .get(&mig_tombstone_key(DEFAULT_GROUP_ID, 7, b"k2"))
             .unwrap()
             .expect("Delete op 必须同 entry 写入 tombstone");
@@ -769,6 +816,7 @@ mod tests {
         assert!(
             storage
                 .db
+                .read()
                 .get(&mig_tombstone_key(DEFAULT_GROUP_ID, 1, b"k1"))
                 .unwrap()
                 .is_none(),
@@ -796,9 +844,9 @@ mod tests {
                 &mut batch,
                 &Request::Put {
                     key: b"k".to_vec(),
-                    value: b"v".to_vec(),
+                    value: bytes::Bytes::from(b"v".to_vec()),
                 },
-                &mut overlay,
+                Some(&mut overlay),
             )
             .unwrap();
         assert_eq!(batch.len(), 1);
@@ -816,7 +864,7 @@ mod tests {
             log_id: LogId::new(openraft::vote::leader_id_std::CommittedLeaderId::new(1), 1),
             payload: EntryPayload::Normal(Request::Put {
                 key: b"k".to_vec(),
-                value: b"v".to_vec(),
+                value: bytes::Bytes::from(b"v".to_vec()),
             }),
         };
         storage
@@ -852,7 +900,12 @@ mod tests {
             })),
         };
         storage.apply_entries_internal(&[entry]).unwrap();
-        assert!(storage.db.get(&meta_cluster_meta_key()).unwrap().is_some());
+        assert!(storage
+            .db
+            .read()
+            .get(&meta_cluster_meta_key())
+            .unwrap()
+            .is_some());
         assert_eq!(
             storage
                 .read_last_applied_from_db()
@@ -917,7 +970,7 @@ mod tests {
         assert_eq!(epoch_before, meta_state.get_cluster_meta().version);
 
         // 模拟重启: 对同一底层 db 重新构造 MetaStateMachine (走 reload_from_db).
-        let restarted = MetaStateMachine::new(storage.db.clone()).unwrap();
+        let restarted = MetaStateMachine::new(storage.db.read().clone()).unwrap();
         assert_eq!(
             restarted.get_migration_epoch(),
             Some(epoch_before),
@@ -942,7 +995,7 @@ mod tests {
             log_id: LogId::new(openraft::vote::leader_id_std::CommittedLeaderId::new(1), 1),
             payload: EntryPayload::Normal(Request::Put {
                 key: b"k1".to_vec(),
-                value: b"v1".to_vec(),
+                value: bytes::Bytes::from(b"v1".to_vec()),
             }),
         };
         storage
@@ -965,7 +1018,7 @@ mod tests {
             log_id: LogId::new(openraft::vote::leader_id_std::CommittedLeaderId::new(1), 2),
             payload: EntryPayload::Normal(Request::PutConditional {
                 key: b"k2".to_vec(),
-                value: b"v2".to_vec(),
+                value: bytes::Bytes::from(b"v2".to_vec()),
                 migration_epoch: None,
             }),
         };
@@ -1025,6 +1078,80 @@ mod tests {
                 .unwrap()
                 .map(|id| id.index),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn test_apply_uses_state_last_applied_and_skips_duplicate() {
+        let dir = TempDir::new().unwrap();
+        let db = DB::open(dir.path(), Options::for_testing()).unwrap();
+        let storage = OpenRaftStorage::new(db, DEFAULT_GROUP_ID, None).unwrap();
+        use openraft::{EntryPayload, LogId};
+
+        let make_put = |idx: u64, key: &[u8], val: &[u8]| crate::cluster::types::LogEntry {
+            log_id: LogId::new(
+                openraft::vote::leader_id_std::CommittedLeaderId::new(1),
+                idx,
+            ),
+            payload: EntryPayload::Normal(Request::Put {
+                key: key.to_vec(),
+                value: bytes::Bytes::from(val.to_vec()),
+            }),
+        };
+
+        storage
+            .apply_entries_internal(&[make_put(1, b"k1", b"v1")])
+            .unwrap();
+        assert_eq!(
+            storage.state.read().last_applied.map(|id| id.index),
+            Some(1)
+        );
+
+        // 重复提交 index 1（不同值）应被跳过，index 2 应正常生效
+        storage
+            .apply_entries_internal(&[make_put(1, b"k1", b"stale"), make_put(2, b"k2", b"v2")])
+            .unwrap();
+        assert_eq!(
+            storage.get_state_machine_value(b"k1").unwrap(),
+            Some(b"v1".to_vec())
+        );
+        assert_eq!(
+            storage.get_state_machine_value(b"k2").unwrap(),
+            Some(b"v2".to_vec())
+        );
+        assert_eq!(
+            storage.state.read().last_applied.map(|id| id.index),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn test_apply_lazy_overlay_handles_put_then_put_conditional_in_same_batch() {
+        let dir = TempDir::new().unwrap();
+        let db = DB::open(dir.path(), Options::for_testing()).unwrap();
+        let storage = OpenRaftStorage::new(db, DEFAULT_GROUP_ID, None).unwrap();
+        use openraft::{EntryPayload, LogId};
+
+        let e1 = crate::cluster::types::LogEntry {
+            log_id: LogId::new(openraft::vote::leader_id_std::CommittedLeaderId::new(1), 1),
+            payload: EntryPayload::Normal(Request::Put {
+                key: b"k".to_vec(),
+                value: bytes::Bytes::from(b"v1".to_vec()),
+            }),
+        };
+        let e2 = crate::cluster::types::LogEntry {
+            log_id: LogId::new(openraft::vote::leader_id_std::CommittedLeaderId::new(1), 2),
+            payload: EntryPayload::Normal(Request::PutConditional {
+                key: b"k".to_vec(),
+                value: bytes::Bytes::from(b"v2".to_vec()),
+                migration_epoch: None,
+            }),
+        };
+
+        storage.apply_entries_internal(&[e1, e2]).unwrap();
+        assert_eq!(
+            storage.get_state_machine_value(b"k").unwrap(),
+            Some(b"v1".to_vec())
         );
     }
 }

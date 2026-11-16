@@ -485,7 +485,7 @@ async fn put_conditional_does_not_resurrect_after_migration_del_tombstone() {
             2,
             Request::PutConditional {
                 key: TEST_KEY.to_vec(),
-                value: b"stale-source-value".to_vec(),
+                value: bytes::Bytes::from(b"stale-source-value".to_vec()),
                 migration_epoch: Some(9),
             },
         )

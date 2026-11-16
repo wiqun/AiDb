@@ -359,12 +359,15 @@ impl DB {
         if batch.is_empty() {
             return Ok(());
         }
+        let started = std::time::Instant::now();
         let parker = crossbeam::sync::Parker::new();
         let unparker = parker.unparker().clone();
         let mut writer = Writer::new(batch, unparker, use_wal, sync_wal);
 
+        let join_started = std::time::Instant::now();
         match self.write_thread.join_batch_group(&mut writer, &parker)? {
             WriteGroupStatus::Leader(leader) => {
+                let join = join_started.elapsed();
                 let group = &leader.group;
                 let mut total_ops = 0u64;
                 for &w_ptr in group {
@@ -394,8 +397,10 @@ impl DB {
                     cur_seq += b.len() as u64;
                 }
 
+                let wal_started = std::time::Instant::now();
                 if self.options.use_wal {
-                    let mut encoded: Vec<Vec<u8>> =
+                    let mut wal_buf: Vec<u8> = Vec::with_capacity((total_ops as usize) * 96);
+                    let mut wal_ranges: Vec<(usize, usize)> =
                         Vec::with_capacity(total_ops as usize + group.len());
                     for &w_ptr in group {
                         let w = unsafe { &*w_ptr };
@@ -404,20 +409,20 @@ impl DB {
                         }
                         let b = unsafe { &*w.batch };
                         if b.len() > 1 {
-                            let mut start_buf = Vec::new();
+                            let start = wal_buf.len();
                             WalEntry::encode_to_buf(
                                 0,
                                 OpType::BatchStart,
                                 true,
                                 &[],
                                 Some(&(b.len() as u32).to_le_bytes()),
-                                &mut start_buf,
+                                &mut wal_buf,
                             );
-                            encoded.push(start_buf);
+                            wal_ranges.push((start, wal_buf.len()));
                         }
                         for (i, op) in b.operations.iter().enumerate() {
                             let seq = w.seq + i as u64;
-                            let mut op_buf = Vec::new();
+                            let start = wal_buf.len();
                             match op {
                                 WriteOp::Put { key, value } => {
                                     WalEntry::encode_to_buf(
@@ -426,7 +431,7 @@ impl DB {
                                         true,
                                         key,
                                         Some(value),
-                                        &mut op_buf,
+                                        &mut wal_buf,
                                     );
                                 }
                                 WriteOp::Delete { key } => {
@@ -436,32 +441,34 @@ impl DB {
                                         false,
                                         key,
                                         None,
-                                        &mut op_buf,
+                                        &mut wal_buf,
                                     );
                                 }
-                                WriteOp::DeleteRange { start, end } => {
+                                WriteOp::DeleteRange { start: rs, end } => {
                                     WalEntry::encode_to_buf(
                                         seq,
                                         OpType::TypeDeleteRange,
                                         true,
-                                        start,
+                                        rs,
                                         Some(end),
-                                        &mut op_buf,
+                                        &mut wal_buf,
                                     );
                                 }
                             }
-                            encoded.push(op_buf);
+                            wal_ranges.push((start, wal_buf.len()));
                         }
                     }
-                    if !encoded.is_empty() {
+                    if !wal_ranges.is_empty() {
                         let mut wal = self.wal.write();
-                        if let Err(e) = wal.append_encoded_write_batch(&encoded, base_seq) {
+                        if let Err(e) = wal.append_encoded_ranges(&wal_buf, &wal_ranges, base_seq) {
                             leader.fail(&e.to_string());
                             return Err(e);
                         }
                     }
                 }
 
+                let wal = wal_started.elapsed();
+                let memtable_started = std::time::Instant::now();
                 // Leader 统一将当前 Group 中所有批次顺序写入 MemTable (消除 Followers 线程上下文切换与自旋空转)
                 for &w_ptr in group {
                     let w = unsafe { &*w_ptr };
@@ -477,32 +484,53 @@ impl DB {
                         .fetch_max(last_seq, AtomicOrdering::SeqCst);
                 }
 
+                let memtable = memtable_started.elapsed();
                 // 如果任何一个写入者请求 sync WAL, 则执行 sync
+                let mut sync = Duration::ZERO;
                 let need_sync =
                     self.options.sync_wal || group.iter().any(|&w_ptr| unsafe { (*w_ptr).sync });
                 if need_sync && self.options.use_wal {
-                    let mut wal = self.wal.write();
-                    if let Err(e) = wal.sync() {
+                    let sync_started = std::time::Instant::now();
+                    let mut wal_file = self.wal.write();
+                    if let Err(e) = wal_file.sync() {
                         leader.fail(&e.to_string());
                         return Err(e);
                     }
+                    sync = sync_started.elapsed();
                     self.group_commit_synced_seq
                         .store(last_seq, AtomicOrdering::Release);
                 }
 
-                // 一次性唤醒全部 Followers 完成写入 (消除二次 park 与二次唤醒开销)
+                // 一次性唤醒全部 Followers 完成写入并释放 leader_lock, 再在锁外检查 maybe_freeze
                 leader.complete();
+                drop(leader);
 
+                let freeze_started = std::time::Instant::now();
                 self.maybe_freeze()?;
+                note_slow_db_write(
+                    use_wal,
+                    sync_wal,
+                    total_ops,
+                    started.elapsed(),
+                    join,
+                    wal.saturating_add(sync),
+                    memtable,
+                    freeze_started.elapsed(),
+                    Duration::ZERO,
+                );
                 Ok(())
             }
             WriteGroupStatus::FollowerMemtable(seq) => {
+                let join = join_started.elapsed();
                 let b = unsafe { &*writer.batch };
+                let memtable_started = std::time::Instant::now();
                 self.insert_batch_to_memtable(b, seq)?;
+                let memtable = memtable_started.elapsed();
                 writer
                     .state
                     .store(STATE_MEMTABLE_DONE, AtomicOrdering::Release);
 
+                let wait_started = std::time::Instant::now();
                 while writer.state.load(AtomicOrdering::Acquire) != STATE_COMPLETED {
                     if writer.state.load(AtomicOrdering::Acquire) == STATE_FAILED {
                         let msg = writer
@@ -513,6 +541,17 @@ impl DB {
                     }
                     parker.park_timeout(Duration::from_micros(50));
                 }
+                note_slow_db_write(
+                    use_wal,
+                    sync_wal,
+                    batch.len() as u64,
+                    started.elapsed(),
+                    join,
+                    Duration::ZERO,
+                    memtable,
+                    Duration::ZERO,
+                    wait_started.elapsed(),
+                );
                 Ok(())
             }
             WriteGroupStatus::Completed => Ok(()),
@@ -597,6 +636,42 @@ impl DB {
 fn note_stall_start(kind: WriteStallKind) {
     let (cause, kind_name) = kind.cause_and_type();
     tracing::warn!(target: "db", cause, kind = kind_name, "write stall start");
+}
+
+/// 与慢日志默认阈值一致. 快路径只做几次 `Instant` 读数.
+const SLOW_DB_WRITE: Duration = Duration::from_millis(100);
+
+fn db_write_is_slow(total: Duration) -> bool {
+    total >= SLOW_DB_WRITE
+}
+
+#[allow(clippy::too_many_arguments)]
+fn note_slow_db_write(
+    use_wal: bool,
+    sync_wal: bool,
+    ops: u64,
+    total: Duration,
+    join: Duration,
+    wal: Duration,
+    memtable: Duration,
+    freeze: Duration,
+    wait: Duration,
+) {
+    if !db_write_is_slow(total) {
+        return;
+    }
+    tracing::warn!(
+        use_wal,
+        sync_wal,
+        ops,
+        total_us = total.as_micros() as u64,
+        join_us = join.as_micros() as u64,
+        wal_us = wal.as_micros() as u64,
+        memtable_us = memtable.as_micros() as u64,
+        freeze_us = freeze.as_micros() as u64,
+        wait_us = wait.as_micros() as u64,
+        "db_write_slow"
+    );
 }
 
 #[cfg(test)]
@@ -689,6 +764,12 @@ mod sequence_tests {
                 self.fields.push_str(&format!("{}={value} ", field.name()));
             }
         }
+    }
+
+    #[test]
+    fn slow_db_write_matches_slowlog_threshold() {
+        assert!(!db_write_is_slow(Duration::from_millis(99)));
+        assert!(db_write_is_slow(Duration::from_millis(100)));
     }
 
     #[test]

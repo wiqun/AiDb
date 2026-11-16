@@ -33,7 +33,7 @@ fn put_entry(index: u64, key: &[u8], value: &[u8]) -> LogEntry {
         log_id: LogId::new(CommittedLeaderId::new(1), index),
         payload: EntryPayload::Normal(Request::Put {
             key: key.to_vec(),
-            value: value.to_vec(),
+            value: bytes::Bytes::from(value.to_vec()),
         }),
     }
 }
@@ -174,7 +174,7 @@ async fn test_put_conditional_skips_existing_key() {
             log_id: LogId::new(CommittedLeaderId::new(1), 2),
             payload: EntryPayload::Normal(Request::PutConditional {
                 key: b"k".to_vec(),
-                value: b"v2".to_vec(),
+                value: bytes::Bytes::from(b"v2".to_vec()),
                 migration_epoch: None,
             }),
         };

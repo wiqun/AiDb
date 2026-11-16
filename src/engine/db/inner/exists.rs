@@ -48,7 +48,7 @@ impl DB {
         max_seq: u64,
         record_stats: bool,
     ) -> Result<bool> {
-        if self.has_active_range_tombstones() {
+        if self.covered_by_range_tombstone(key, max_seq)? {
             self.key_exists_at_sequence_with_range_tombstones(key, max_seq, record_stats)
         } else {
             self.key_exists_at_sequence_fast(key, max_seq, record_stats)
@@ -178,14 +178,13 @@ impl DB {
 
         for reader in &l0_readers {
             absorb_point(reader.point_state_opt(key, max_seq, record_stats)?);
-            absorb_range(reader.max_range_tombstone_seq(key, max_seq));
         }
         for level in &l1_plus_readers {
             if let Some(reader) = find_sstable_for_key(level, key) {
                 absorb_point(reader.point_state_opt(key, max_seq, record_stats)?);
-                absorb_range(reader.max_range_tombstone_seq(key, max_seq));
             }
         }
+        absorb_range(self.max_range_seq_across_indexes(key, max_seq)?);
 
         let tombstone = match (best_delete, best_range) {
             (Some(d), Some(r)) => Some(d.max(r)),

@@ -224,6 +224,7 @@ impl DB {
                 run_start.elapsed().as_micros() as u64,
                 AtomicOrdering::Relaxed,
             );
+            self.publish_sst_range_tombstones(&sst_guard);
         }
         self.update_write_stall_state();
 
@@ -340,6 +341,7 @@ impl DB {
             if task.output_level == 0 {
                 self.l0_sstable_count.fetch_add(1, AtomicOrdering::Relaxed);
             }
+            self.publish_sst_range_tombstones(&sst_guard);
         }
         self.update_write_stall_state();
 
@@ -583,5 +585,86 @@ mod tests {
                 self.fields.push_str(&format!("{}={value} ", field.name()));
             }
         }
+    }
+
+    /// B 层: 走真实 DB 层验证 `min_snapshot_sequence` 确实被接进了 `CompactionJob`.
+    ///
+    /// A 层 (`with_snapshot_threshold`) 只证明 job 内部逻辑对; 这里补 job 与 DB 之间
+    /// 的接线: `run_compaction_once` 是否把活跃快照的最小 sequence 传下去, 压缩后的
+    /// 读路径还能否看到被 pin 的旧版本, 以及重开库后从 SST 重建的范围墓碑索引会不会
+    /// 让已删区间复活.
+    ///
+    /// 直接调 `run_compaction_once()` 驱动, 不靠后台压缩 + sleep 轮询, 避免抖动.
+    #[test]
+    fn compaction_pins_active_snapshot_and_reload_has_no_resurrection() {
+        use crate::config::Options;
+        use crate::DB;
+
+        let dir = tempdir().unwrap();
+        let mut opts = Options::for_testing();
+        // 每次 flush 产出独立 L0, 且任务一定够格切分
+        opts.memtable_size = 64 * 1024;
+        opts.level0_compaction_trigger = 2;
+        opts.compaction_threads = 2;
+        opts.subcompaction_min_size = 1024;
+        opts.background_compaction = false;
+        opts.compression = CompressionType::None;
+        let db = DB::open(dir.path(), opts).unwrap();
+
+        // 大 value: 平均记录远大于 200 字节, 旧估算 (file_size/100) 会高估一个数量级
+        let v1 = vec![b'a'; 2048];
+        let v2 = vec![b'b'; 2048];
+        for i in 0..200 {
+            db.put(format!("s{i:05}").as_bytes(), &v1).unwrap();
+        }
+        db.flush().unwrap();
+
+        // 快照 pin 在 v1 这一代
+        let snap = db.snapshot().unwrap();
+        assert_eq!(snap.get(b"s00100").unwrap().as_deref(), Some(v1.as_slice()));
+
+        for i in 0..200 {
+            db.put(format!("s{i:05}").as_bytes(), &v2).unwrap();
+            db.put(format!("d{i:05}").as_bytes(), &v1).unwrap();
+        }
+        db.flush().unwrap();
+        db.delete_range(b"d", b"e").unwrap();
+        db.flush().unwrap();
+
+        let mut rounds = 0;
+        while db.run_compaction_once().unwrap() {
+            rounds += 1;
+            assert!(rounds < 64, "compaction 未收敛");
+        }
+        assert!(rounds > 0, "压缩根本没跑, 断言无意义");
+
+        // 1) 接线正确: 被 pin 的旧版本没被压掉
+        assert_eq!(
+            snap.get(b"s00100").unwrap().as_deref(),
+            Some(v1.as_slice()),
+            "活跃快照的旧版本被压缩丢掉了 (min_snapshot_sequence 没接进 job)"
+        );
+        // 2) 当前读看到新版本
+        assert_eq!(db.get(b"s00100").unwrap().as_deref(), Some(v2.as_slice()));
+        // 3) 范围删除生效, 切分/合并不会让已删 key 复活
+        for i in 0..200 {
+            assert!(
+                db.get(format!("d{i:05}").as_bytes()).unwrap().is_none(),
+                "已删 key 复活"
+            );
+        }
+
+        drop(snap);
+        drop(db);
+
+        // 4) 重开库: 从 SST 重建范围墓碑索引后仍不能复活
+        let db = DB::open(dir.path(), Options::for_testing()).unwrap();
+        for i in 0..200 {
+            assert!(
+                db.get(format!("d{i:05}").as_bytes()).unwrap().is_none(),
+                "重开库后已删 key 复活"
+            );
+        }
+        assert_eq!(db.get(b"s00100").unwrap().as_deref(), Some(v2.as_slice()));
     }
 }

@@ -197,7 +197,7 @@ async fn get_key_from_group_remote_reads_leader_value_from_non_local_node() {
             TARGET_GROUP,
             Request::Put {
                 key: b"k1".to_vec(),
-                value: b"v1".to_vec(),
+                value: bytes::Bytes::from(b"v1".to_vec()),
             },
         )
         .await
@@ -233,7 +233,7 @@ async fn get_key_from_group_local_delegates_without_remote_rpc() {
             TARGET_GROUP,
             Request::Put {
                 key: b"k1".to_vec(),
-                value: b"v1".to_vec(),
+                value: bytes::Bytes::from(b"v1".to_vec()),
             },
         )
         .await

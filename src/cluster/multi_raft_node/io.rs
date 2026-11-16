@@ -135,7 +135,10 @@ impl MultiRaftNode {
     pub async fn propose_key(&self, key: Vec<u8>, value: Option<Vec<u8>>) -> Result<Response> {
         let (gid, _status) = self.router.route_key(&key)?;
         let request = match value {
-            Some(v) => Request::Put { key, value: v },
+            Some(v) => Request::Put {
+                key,
+                value: bytes::Bytes::from(v),
+            },
             None => Request::Delete { key },
         };
         self.propose_group(gid, request).await
@@ -622,7 +625,7 @@ mod tests {
 
         let mut keys = Vec::new();
         visit_sm_user_pairs(
-            storage.db(),
+            storage.db().as_ref(),
             DEFAULT_GROUP_ID,
             b"doc:",
             Some(b"doc;"),
@@ -636,7 +639,7 @@ mod tests {
 
         let mut seen = 0usize;
         visit_sm_user_pairs(
-            storage.db(),
+            storage.db().as_ref(),
             DEFAULT_GROUP_ID,
             b"doc:",
             Some(b"doc;"),
@@ -665,7 +668,7 @@ mod tests {
         let scan = |start: &[u8], end: &[u8], limit: usize, reverse: bool| {
             keys(
                 scan_sm_user_pairs_limited(
-                    storage.db(),
+                    storage.db().as_ref(),
                     DEFAULT_GROUP_ID,
                     start,
                     end,
@@ -712,7 +715,7 @@ mod tests {
             vec![b"q:z".to_vec(), b"p:e".to_vec()]
         );
         assert_eq!(
-            last_sm_user_pair(storage.db(), DEFAULT_GROUP_ID, b"", b"").unwrap(),
+            last_sm_user_pair(storage.db().as_ref(), DEFAULT_GROUP_ID, b"", b"").unwrap(),
             Some((b"q:z".to_vec(), b"other".to_vec()))
         );
     }

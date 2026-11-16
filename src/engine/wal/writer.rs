@@ -229,10 +229,10 @@ impl Writer {
         self.block_offset += needed;
 
         tracing::debug!(
-          target: "wal",
-          "wal.write.complete: record_type={:?} record_size={}",
-          record_type,
-          data_len + HEADER_SIZE,
+            target: "wal",
+            "wal.write.complete: record_type={:?} record_size={}",
+            record_type,
+            data_len + HEADER_SIZE,
         );
 
         Ok(())

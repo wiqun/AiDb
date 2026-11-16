@@ -45,14 +45,14 @@ fn apply_put_does_not_report_inserted() {
         log_id: LogId::new(CommittedLeaderId::new(1), 1),
         payload: EntryPayload::Normal(Request::Put {
             key: b"k".to_vec(),
-            value: b"v1".to_vec(),
+            value: bytes::Bytes::from(b"v1".to_vec()),
         }),
     };
     let second = LogEntry {
         log_id: LogId::new(CommittedLeaderId::new(1), 2),
         payload: EntryPayload::Normal(Request::Put {
             key: b"k".to_vec(),
-            value: b"v2".to_vec(),
+            value: bytes::Bytes::from(b"v2".to_vec()),
         }),
     };
     let responses = storage.apply_entries_internal(&[first, second]).unwrap();

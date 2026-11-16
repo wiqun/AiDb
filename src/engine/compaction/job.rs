@@ -27,10 +27,11 @@ use super::trackers::{RangeTombstoneTracker, SnapshotDedupTracker};
 use crate::config::CompressionType;
 use crate::engine::compaction::filter::{CompactionFilter, CompactionPointReader, FilterDecision};
 use crate::engine::memtable::{
-    encode_internal_key, extract_sequence, extract_value_type, ValueType,
+    compare_internal_key, encode_internal_key, extract_sequence, extract_value_type, ValueType,
 };
 use crate::engine::sstable::{sstable_path, SSTableBuilder, SSTableReader};
 use crate::error::Result;
+use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -61,6 +62,10 @@ pub struct CompactionResult {
     /// 本子任务中因 filter 丢弃的最新 Put 的 user_key (去重前由调用方合并).
     pub filter_removed_user_keys: Vec<Vec<u8>>,
 }
+
+/// 切分点候选样本上限. 每个样本约 32 字节, 1024 个约 32KB.
+/// 样本按输出序号均匀分布, 步长在超限时翻倍, 因此粒度变粗但内存有界.
+const SPLIT_SAMPLE_CAP: usize = 1024;
 
 impl CompactionJob {
     #[allow(clippy::too_many_arguments)]
@@ -157,64 +162,79 @@ impl CompactionJob {
         Ok(count)
     }
 
-    /// 单遍计数 + 分裂点记录. 基于文件大小粗估条目数以确定分裂间隔.
+    /// 单遍计数 + 分裂点记录.
+    ///
+    /// 切分点不能按 "估算条目数 / num_splits" 当间隔放: 条目数只能从 SST 文件
+    /// 大小粗估, 平均记录远大于 200 字节时会高估一个数量级, 间隔永远够不到,
+    /// `splits` 为空 —— `num_splits` 报 2 却只有 1 个输出文件, 切分静默退化成
+    /// 单写手, 还白多一遍计数扫描.
+    ///
+    /// 改成单遍扫描时按输出序号均匀采样, 扫描结束后总数已知, 再在样本里取最接近
+    /// `count * k / num_splits` 的 user key. 步长随样本数翻倍, 内存有界, 且不需要
+    /// 额外一遍扫描.
     fn count_dedup_with_splits(&self, num_splits: usize) -> Result<(usize, Vec<Vec<u8>>)> {
         if num_splits <= 1 {
             let count = self.count_dedup_entries()?;
             return Ok((count, vec![]));
         }
 
-        // 基于文件大小粗估条目数 (~100 bytes/entry 经验值)
-        let estimated_total: usize = self
-            .all_inputs()
-            .iter()
-            .map(|r| r.file_size() as usize / 100)
-            .sum::<usize>()
-            .max(1);
-        let est_per_split = estimated_total / num_splits;
-        let mut next_split_at = est_per_split;
-
         let mut merge_iter = MergeIterator::new(self.all_inputs())?;
         let mut count = 0usize;
         let mut last_user_key: Option<Vec<u8>> = None;
-        let mut splits: Vec<Vec<u8>> = Vec::new();
         let mut tracker = SnapshotDedupTracker::default();
+        let mut samples: Vec<(usize, Vec<u8>)> = Vec::new();
+        let mut stride = 1usize;
 
         while let Some((key, value)) = merge_iter.next_entry()? {
             let user_key = user_key_from_internal(&key)?;
             let seq = extract_sequence(&key)?;
-            if last_user_key.as_deref() == Some(user_key) {
-                if !tracker.already_crossed() {
-                    count += 1;
+            let counted = if last_user_key.as_deref() == Some(user_key) {
+                let counted = !tracker.already_crossed();
+                if counted {
                     tracker.observe(seq, self.min_snapshot_sequence);
-                    if count >= next_split_at && splits.len() < num_splits - 1 {
-                        splits.push(user_key.to_vec());
-                        next_split_at = count + est_per_split;
-                    }
                 }
-                continue;
-            }
-            tracker.start_key();
-            let value_type = extract_value_type(&key)?;
-            if drop_delete_marker(
-                value_type,
-                seq,
-                self.min_snapshot_sequence,
-                user_key,
-                &value,
-                &self.surviving_user_ranges,
-            ) {
+                counted
+            } else {
+                tracker.start_key();
+                let value_type = extract_value_type(&key)?;
+                let dropped = drop_delete_marker(
+                    value_type,
+                    seq,
+                    self.min_snapshot_sequence,
+                    user_key,
+                    &value,
+                    &self.surviving_user_ranges,
+                );
                 last_user_key = Some(user_key.to_vec());
                 tracker.observe(seq, self.min_snapshot_sequence);
+                !dropped
+            };
+            if !counted {
                 continue;
             }
             count += 1;
-            last_user_key = Some(user_key.to_vec());
-            tracker.observe(seq, self.min_snapshot_sequence);
+            if count.is_multiple_of(stride) {
+                samples.push((count, user_key.to_vec()));
+                if samples.len() > SPLIT_SAMPLE_CAP {
+                    stride *= 2;
+                    samples.retain(|(i, _)| i.is_multiple_of(stride));
+                }
+            }
+        }
 
-            if count >= next_split_at && splits.len() < num_splits - 1 {
-                splits.push(user_key.to_vec());
-                next_split_at = count + est_per_split;
+        // 总数已知, 按真实的 k/N 分位取最近样本; 粒度受 stride 限制, 但分布均匀.
+        let mut splits: Vec<Vec<u8>> = Vec::with_capacity(num_splits - 1);
+        for k in 1..num_splits {
+            let target = count * k / num_splits;
+            if target == 0 {
+                continue;
+            }
+            let pos = samples.partition_point(|(i, _)| *i < target);
+            let Some(pick) = samples.get(pos).or_else(|| samples.last()) else {
+                break;
+            };
+            if splits.last().map(|prev| prev.as_slice()) != Some(pick.1.as_slice()) {
+                splits.push(pick.1.clone());
             }
         }
 
@@ -319,7 +339,9 @@ impl CompactionJob {
                 continue;
             }
 
-            if value_type != ValueType::TypeRangeDelete && range_tracker.covers(user_key, seq) {
+            if value_type != ValueType::TypeRangeDelete
+                && range_tracker.covers(user_key, seq, self.min_snapshot_sequence)
+            {
                 last_user_key = Some(user_key.to_vec());
                 tracker.observe(seq, self.min_snapshot_sequence);
                 continue;
@@ -507,6 +529,76 @@ fn drop_delete_marker(
     )
 }
 
+fn add_output_entry(
+    builder: &mut SSTableBuilder,
+    key: &[u8],
+    value: &[u8],
+    value_type: ValueType,
+    user_key: &[u8],
+    range_end: Option<&[u8]>,
+    entry_count: &mut usize,
+) -> Result<()> {
+    if value_type == ValueType::TypeRangeDelete {
+        let clipped = clip_range_end(value, range_end);
+        if clipped.as_slice() > user_key {
+            builder.add(key, &clipped)?;
+            *entry_count += 1;
+        }
+        return Ok(());
+    }
+    builder.add(key, value)?;
+    *entry_count += 1;
+    Ok(())
+}
+
+fn clip_range_end(end: &[u8], range_end: Option<&[u8]>) -> Vec<u8> {
+    match range_end {
+        Some(bound) if end > bound => bound.to_vec(),
+        _ => end.to_vec(),
+    }
+}
+
+/// 把起点落在本段之前的墓碑写成 `[range_start, end)` 片段.
+/// `before` 是当前内部键; 只写出排在它前面的片段, 其余留在 `pending`.
+fn flush_spanning_fragments(
+    builder: &mut SSTableBuilder,
+    pending: &mut Vec<(u64, Vec<u8>)>,
+    range_start: Option<&[u8]>,
+    before: Option<&[u8]>,
+    entry_count: &mut usize,
+    smallest_key: &mut Option<Vec<u8>>,
+    largest_key: &mut Option<Vec<u8>>,
+) -> Result<()> {
+    let Some(range_start) = range_start else {
+        return Ok(());
+    };
+    if pending.is_empty() {
+        return Ok(());
+    }
+    pending.sort_by(|left, right| {
+        let left_key = encode_internal_key(range_start, left.0, ValueType::TypeRangeDelete);
+        let right_key = encode_internal_key(range_start, right.0, ValueType::TypeRangeDelete);
+        compare_internal_key(&left_key, &right_key)
+    });
+    let mut rest = Vec::new();
+    for (sequence, end) in pending.drain(..) {
+        let internal = encode_internal_key(range_start, sequence, ValueType::TypeRangeDelete);
+        if before.is_some_and(|current| compare_internal_key(&internal, current) != Ordering::Less)
+        {
+            rest.push((sequence, end));
+            continue;
+        }
+        builder.add(&internal, &end)?;
+        *entry_count += 1;
+        if smallest_key.is_none() {
+            *smallest_key = Some(internal.clone());
+        }
+        *largest_key = Some(internal);
+    }
+    *pending = rest;
+    Ok(())
+}
+
 /// filter 与可选点查句柄, 随写入路径下发. 两者都是借用, 因此整体 `Copy`, 可直接 move 进子任务线程.
 #[derive(Clone, Copy)]
 struct FilterCtx<'a> {
@@ -546,9 +638,8 @@ fn write_sub_compaction(
 ) -> Result<CompactionResult> {
     let output_path = sstable_path(db_path, file_number, output_level);
 
-    // 无预期条目时提前返回空结果
-    if expected_keys == 0 {
-        // No keys expected for this range, produce empty result
+    // 无预期条目时提前返回空结果. 跨段墓碑不在本段的点 key 计数里, 仍要写出片段.
+    if expected_keys == 0 && !readers.iter().any(|reader| reader.has_range_tombstones()) {
         return Ok(CompactionResult {
             file_number: 0,
             entry_count: 0,
@@ -584,22 +675,35 @@ fn write_sub_compaction(
     let mut largest_key: Option<Vec<u8>> = None;
     let mut tracker = SnapshotDedupTracker::default();
     let mut range_tracker = RangeTombstoneTracker::default();
-
+    let mut pending_fragments: Vec<(u64, Vec<u8>)> = Vec::new();
     while let Some((key, value)) = merge_iter.next_entry()? {
         let user_key = user_key_from_internal(&key)?;
         let value_type = extract_value_type(&key)?;
         let seq = extract_sequence(&key)?;
 
         // 跳过 range_start 之前的条目 (由前一个子任务处理).
-        // 起点在本段之前、终点伸进本段的范围删除仍要记进 tracker, 否则标记被丢掉后本段的 key 会写出来.
+        // 终点伸进本段的范围删除写成 [range_start, min(end, range_end)).
         if let Some(ref start) = range_start {
             if user_key < start.as_slice() {
                 if value_type == ValueType::TypeRangeDelete && value.as_slice() > start.as_slice() {
-                    range_tracker.add(user_key.to_vec(), value.clone(), seq);
+                    let end = clip_range_end(&value, range_end.as_deref());
+                    if end.as_slice() > start.as_slice() {
+                        pending_fragments.push((seq, end.clone()));
+                        range_tracker.add(start.clone(), end, seq);
+                    }
                 }
                 continue;
             }
         }
+        flush_spanning_fragments(
+            &mut builder,
+            &mut pending_fragments,
+            range_start.as_deref(),
+            Some(&key),
+            &mut entry_count,
+            &mut smallest_key,
+            &mut largest_key,
+        )?;
 
         if last_user_key.as_deref() != Some(user_key) {
             range_tracker.advance_past(user_key);
@@ -608,8 +712,15 @@ fn write_sub_compaction(
         if last_user_key.as_deref() == Some(user_key) {
             if !tracker.already_crossed() {
                 if !should_filter_impl(ctx, output_level, &key, &value) {
-                    builder.add(&key, &value)?;
-                    entry_count += 1;
+                    add_output_entry(
+                        &mut builder,
+                        &key,
+                        &value,
+                        value_type,
+                        user_key,
+                        range_end.as_deref(),
+                        &mut entry_count,
+                    )?;
                 }
                 tracker.observe(seq, min_snap_seq);
             }
@@ -627,7 +738,9 @@ fn write_sub_compaction(
             continue;
         }
 
-        if value_type != ValueType::TypeRangeDelete && range_tracker.covers(user_key, seq) {
+        if value_type != ValueType::TypeRangeDelete
+            && range_tracker.covers(user_key, seq, min_snap_seq)
+        {
             last_user_key = Some(user_key.to_vec());
             tracker.observe(seq, min_snap_seq);
             continue;
@@ -636,8 +749,15 @@ fn write_sub_compaction(
         // 最新版本被 filter 删除时, 同 key 的更老版本若仍在快照或幸存文件里, 直接丢弃会让它们重新可见.
         // 这种情况下以同 sequence 写出删除标记, 语义等同于 filter 把该 key 删除.
         let tombstone: Option<Vec<u8>> = if !should_filter_impl(ctx, output_level, &key, &value) {
-            builder.add(&key, &value)?;
-            entry_count += 1;
+            add_output_entry(
+                &mut builder,
+                &key,
+                &value,
+                value_type,
+                user_key,
+                range_end.as_deref(),
+                &mut entry_count,
+            )?;
             None
         } else if value_type == ValueType::TypePut {
             filter_removed.push(user_key.to_vec());
@@ -659,6 +779,16 @@ fn write_sub_compaction(
         }
         largest_key = Some(tombstone.unwrap_or(key));
     }
+
+    flush_spanning_fragments(
+        &mut builder,
+        &mut pending_fragments,
+        range_start.as_deref(),
+        None,
+        &mut entry_count,
+        &mut smallest_key,
+        &mut largest_key,
+    )?;
 
     if entry_count == 0 {
         builder.abandon()?;
@@ -857,29 +987,305 @@ mod tests {
         // Total entries should be 5 (no dedup needed, no tombstones)
         let total: usize = non_empty.iter().map(|r| r.entry_count).sum();
         assert_eq!(total, 5);
-        // Verify all keys are reachable through the output files
         for res in &non_empty {
             let reader = SSTableReader::open(&res.output_path, None).unwrap();
             for key in [b"a", b"b", b"c", b"d", b"e"] {
                 let ik = encode_internal_key(key, u64::MAX, ValueType::TypePut);
                 if let Some((val, _)) = reader.get(&ik).unwrap() {
-                    let expected: &[u8] = if key == b"a" {
-                        b"1"
-                    } else if key == b"b" {
-                        b"2"
-                    } else if key == b"c" {
-                        b"3"
-                    } else if key == b"d" {
-                        b"4"
-                    } else if key == b"e" {
-                        b"5"
-                    } else {
-                        unreachable!()
+                    let expected: &[u8] = match key {
+                        b"a" => b"1".as_slice(),
+                        b"b" => b"2".as_slice(),
+                        b"c" => b"3".as_slice(),
+                        b"d" => b"4".as_slice(),
+                        _ => b"5".as_slice(),
                     };
                     assert_eq!(&val[..], expected);
                 }
             }
         }
+    }
+
+    #[test]
+    fn split_truncates_range_delete_and_keeps_both_sides() {
+        let dir = tempdir().unwrap();
+        let input = sst(
+            dir.path(),
+            1,
+            0,
+            &[
+                (b"a", 5, ValueType::TypeRangeDelete, b"z"),
+                (b"a", 4, ValueType::TypePut, b"va"),
+                (b"m", 6, ValueType::TypePut, b"new"),
+                (b"m", 4, ValueType::TypePut, b"vm"),
+                (b"y", 4, ValueType::TypePut, b"vy"),
+                (b"z", 4, ValueType::TypePut, b"vz"),
+            ],
+        );
+        let readers = vec![input];
+        let ctx = FilterCtx {
+            filter: None,
+            reader: None,
+        };
+        let left = write_sub_compaction(
+            &readers,
+            10,
+            None,
+            Some(b"m".to_vec()),
+            1,
+            dir.path(),
+            512,
+            16,
+            CompressionType::None,
+            0.0,
+            0,
+            8,
+            ctx,
+            Vec::new(),
+        )
+        .unwrap();
+        let right = write_sub_compaction(
+            &readers,
+            11,
+            Some(b"m".to_vec()),
+            None,
+            1,
+            dir.path(),
+            512,
+            16,
+            CompressionType::None,
+            0.0,
+            0,
+            8,
+            ctx,
+            Vec::new(),
+        )
+        .unwrap();
+        let outputs = [&left, &right];
+        let mut records = Vec::new();
+        let mut saw_new_m = false;
+        for result in &outputs {
+            let reader = SSTableReader::open(&result.output_path, None).unwrap();
+            for (start, end, _) in reader.collect_range_tombstones() {
+                assert!(
+                    !(start.as_slice() == b"a" && end.as_slice() == b"z"),
+                    "a split output must not keep the unclipped [a, z)"
+                );
+                records.push(crate::engine::memtable::RangeTombstoneRecord {
+                    start,
+                    end,
+                    sequence: 5,
+                });
+            }
+            let seek = encode_internal_key(b"m", u64::MAX, ValueType::TypePut);
+            if let Some((value, ty)) = reader.get(&seek).unwrap() {
+                if ty == ValueType::TypePut {
+                    assert_eq!(value, b"new");
+                    saw_new_m = true;
+                }
+            }
+        }
+        let fragmented = crate::engine::memtable::FragmentedRangeTombstones::from_records(records);
+        assert_eq!(fragmented.max_seq(b"a", 10), Some(5));
+        assert_eq!(fragmented.max_seq(b"y", 10), Some(5));
+        assert_eq!(fragmented.max_seq(b"z", 10), None);
+        assert!(saw_new_m, "point newer than the tombstone stays visible");
+    }
+
+    /// 大 value 时切分点必须仍然落在真实条目上.
+    ///
+    /// 条目数只能从 `file_size / 100` 粗估, 平均记录远大于 200 字节时估算值会高估
+    /// 一个数量级以上, 切分间隔永远够不到, `splits` 为空, 切分静默退化成单写手:
+    /// `num_splits` 报 2 却只有一个输出文件, 还白多一遍计数扫描.
+    #[test]
+    fn split_points_survive_large_values() {
+        let dir = tempdir().unwrap();
+        let value = vec![b'v'; 4096];
+        let keys: Vec<Vec<u8>> = (0..400).map(|i| format!("k{i:05}").into_bytes()).collect();
+        let entries: Vec<(&[u8], u64, ValueType, &[u8])> = keys
+            .iter()
+            .map(|k| (k.as_slice(), 1u64, ValueType::TypePut, value.as_slice()))
+            .collect();
+        let input = sst(dir.path(), 1, 0, &entries);
+        // 约 1.6MB / 400 条: file_size / 100 ≈ 16000, 高于真实条数 40 倍
+        let job = CompactionJob::new(
+            vec![input],
+            vec![],
+            1,
+            dir.path().to_path_buf(),
+            4096,
+            16,
+            CompressionType::None,
+            0.0,
+        );
+        let results = job.run(&[100, 101]).unwrap();
+        let non_empty = results.iter().filter(|r| r.entry_count > 0).count();
+        assert_eq!(
+            non_empty, 2,
+            "两条子任务都应产出文件, 实际 {non_empty} 个 (切分点落在了估算条目数之外)"
+        );
+        let total: usize = results.iter().map(|r| r.entry_count).sum();
+        assert_eq!(total, 400, "切分前后条目总数必须一致");
+    }
+
+    /// 切分 + 活跃快照 pin + 跨段范围墓碑: 这个组合此前没有任何测试覆盖
+    /// (`test_subcompaction_split_two_ranges` 有切分无快照, 快照测试又都不切分).
+    ///
+    /// 断言两件事:
+    /// 1. 快照可见的旧版本在两侧子任务里都还在 (pin 住 seq <= min_snapshot_sequence);
+    /// 2. 跨段墓碑被切成首尾相接的片段, 拼回去正好覆盖原始区间, 不留缝隙也不重叠.
+    #[test]
+    fn split_with_snapshot_keeps_pinned_versions_and_stitches_tombstone() {
+        let dir = tempdir().unwrap();
+        // 10 个 key, 每个两条版本 (seq 4 新 / seq 2 旧); 一条 [k00, zz) 的墓碑盖住全部.
+        // 快照 pin 在 seq 3: 每个 key 的 seq 2 版本都是快照唯一可见的版本, 不能丢.
+        let mut rows: Vec<(Vec<u8>, u64, ValueType, Vec<u8>)> = Vec::new();
+        rows.push((
+            b"k00".to_vec(),
+            6,
+            ValueType::TypeRangeDelete,
+            b"zz".to_vec(),
+        ));
+        for i in 0..10 {
+            let key = format!("k{i:02}").into_bytes();
+            rows.push((
+                key.clone(),
+                4,
+                ValueType::TypePut,
+                format!("n{i:02}").into_bytes(),
+            ));
+            rows.push((key, 2, ValueType::TypePut, format!("o{i:02}").into_bytes()));
+        }
+        let entries: Vec<(&[u8], u64, ValueType, &[u8])> = rows
+            .iter()
+            .map(|(k, s, t, v)| (k.as_slice(), *s, *t, v.as_slice()))
+            .collect();
+        let input = sst(dir.path(), 1, 0, &entries);
+
+        let job = CompactionJob::new(
+            vec![input],
+            vec![],
+            1,
+            dir.path().to_path_buf(),
+            512,
+            16,
+            CompressionType::None,
+            0.0,
+        )
+        .with_snapshot_threshold(3);
+        let results = job.run(&[10, 11]).unwrap();
+        let non_empty: Vec<&CompactionResult> =
+            results.iter().filter(|r| r.entry_count > 0).collect();
+        assert_eq!(non_empty.len(), 2, "应切成两段");
+
+        // 1) 快照可见版本必须保留
+        let mut seen = 0;
+        for result in &non_empty {
+            let reader = SSTableReader::open(&result.output_path, None).unwrap();
+            for i in 0..10 {
+                let key = format!("k{i:02}");
+                let seek = encode_internal_key(key.as_bytes(), 3, ValueType::TypePut);
+                if let Some((value, ty)) = reader.get(&seek).unwrap() {
+                    if ty == ValueType::TypePut {
+                        assert_eq!(
+                            value,
+                            format!("o{i:02}").as_bytes(),
+                            "{key} 在 seq 3 快照下应看到 seq 2 的旧值"
+                        );
+                        seen += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(seen, 10, "10 个 key 的快照可见版本都应保留");
+
+        // 2) 墓碑片段首尾相接
+        let mut fragments: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for result in &non_empty {
+            let reader = SSTableReader::open(&result.output_path, None).unwrap();
+            for (start, end, _) in reader.collect_range_tombstones() {
+                fragments.push((start, end));
+            }
+        }
+        fragments.sort();
+        assert_eq!(fragments.first().unwrap().0, b"k00");
+        assert_eq!(fragments.last().unwrap().1, b"zz");
+        for pair in fragments.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0, "切分后的墓碑片段之间不能有缝隙");
+        }
+    }
+
+    /// 墓碑覆盖裁剪必须尊重活跃快照.
+    ///
+    /// `RangeTombstoneTracker::covers` 原先只看 `tombstone.sequence >= point.sequence`,
+    /// 不看 `min_snapshot_sequence`. 墓碑 seq 大于最小快照位点时, 存在看不到这次删除的
+    /// 快照 (seq 在 `[min_snapshot_sequence, tombstone.sequence)` 之间), 它需要被覆盖的
+    /// 最新版本. 一旦被裁掉, 这类快照会读到更旧的版本, 甚至读不到.
+    #[test]
+    fn range_tombstone_must_not_drop_version_needed_by_snapshot() {
+        let dir = tempdir().unwrap();
+        let input = sst(
+            dir.path(),
+            1,
+            0,
+            &[
+                // 墓碑在 seq 6, 盖住 [k00, zz)
+                (b"k00", 6, ValueType::TypeRangeDelete, b"zz"),
+                (b"k01", 4, ValueType::TypePut, b"n01"),
+                (b"k01", 2, ValueType::TypePut, b"o01"),
+                // 落点之外, 保证无快照时仍有输出文件可检查
+                (b"zzz", 3, ValueType::TypePut, b"live"),
+            ],
+        );
+
+        // min_snapshot = 2, 但同时有快照在 seq 4: seq 4 的版本必须留下
+        let job = CompactionJob::new(
+            vec![Arc::clone(&input)],
+            vec![],
+            1,
+            dir.path().to_path_buf(),
+            512,
+            16,
+            CompressionType::None,
+            0.0,
+        )
+        .with_snapshot_threshold(2);
+        let results = job.run(&[10]).unwrap();
+        let reader = SSTableReader::open(&results[0].output_path, None).unwrap();
+        let seek = encode_internal_key(b"k01", 4, ValueType::TypePut);
+        assert_eq!(
+            reader.get(&seek).unwrap().map(|(value, _)| value),
+            Some(b"n01".to_vec()),
+            "墓碑 seq 6 大于 min_snapshot_sequence 2 时不能吞掉 seq 4 的版本"
+        );
+
+        // 无活跃快照时仍要裁掉被覆盖的点, 不能为了修这个把优化整条关掉
+        let job = CompactionJob::new(
+            vec![Arc::clone(&input)],
+            vec![],
+            1,
+            dir.path().to_path_buf(),
+            512,
+            16,
+            CompressionType::None,
+            0.0,
+        );
+        let results = job.run(&[11]).unwrap();
+        let reader = SSTableReader::open(&results[0].output_path, None).unwrap();
+        assert_eq!(
+            reader
+                .get(&encode_internal_key(b"k01", u64::MAX, ValueType::TypePut))
+                .unwrap(),
+            None,
+            "无快照时墓碑覆盖的点应被裁掉"
+        );
+        assert_eq!(
+            reader
+                .get(&encode_internal_key(b"zzz", u64::MAX, ValueType::TypePut))
+                .unwrap()
+                .map(|(value, _)| value),
+            Some(b"live".to_vec()),
+            "墓碑区间之外的 key 应原样保留"
+        );
     }
 
     #[test]

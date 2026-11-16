@@ -14,6 +14,7 @@ pub struct RaftNetworkClientFactory {
     /// gRPC channel 连接池 — 按 node_id 缓存, 避免每次 RPC 都重新 TCP + HTTP/2 握手.
     /// Docker 容器 DNS 解析 (aikv-N) 每次 50-100ms, 复用 channel 可消除此开销.
     channels: Arc<DashMap<NodeId, RaftServiceClient<tonic::transport::Channel>>>,
+    payload_cache: Arc<super::client::PayloadCache>,
     stats: Option<Arc<Statistics>>,
 }
 
@@ -36,6 +37,7 @@ impl RaftNetworkClientFactory {
             max_message_size,
             nodes: Arc::new(RwLock::new(HashMap::new())),
             channels: Arc::new(DashMap::new()),
+            payload_cache: Arc::new(super::client::PayloadCache::new()),
             stats,
         }
     }
@@ -57,6 +59,8 @@ impl RaftNetworkClientFactory {
             max_message_size: self.max_message_size,
             nodes: Arc::clone(&self.nodes),
             channels: Arc::clone(&self.channels),
+            // 每个 Raft group 有独立的 log_index 空间, 因此按 group 建独立缓存.
+            payload_cache: Arc::new(super::client::PayloadCache::new()),
             stats: self.stats.clone(),
         }
     }
@@ -97,26 +101,10 @@ impl RaftNetworkClientFactory {
         let normalized = normalize_grpc_addr(addr);
         tracing::debug!(%target, %normalized, "gRPC: establishing new channel for peer");
         let req_timeout = Duration::from_millis(self.rpc_timeout_ms);
-        let connect_fut = RaftServiceClient::connect(normalized);
-        let client = match tokio::time::timeout(req_timeout, connect_fut).await {
-            Ok(Ok(c)) => c,
-            Ok(Err(e)) => {
-                return Err(NetworkError::<TypeConfig>::new(
-                    &Unreachable::<TypeConfig>::new(&e),
-                ))
-            }
-            Err(_) => {
-                let io_err = std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("gRPC connect timeout after {}ms", req_timeout.as_millis()),
-                );
-                return Err(NetworkError::<TypeConfig>::new(
-                    &Unreachable::<TypeConfig>::new(&io_err),
-                ));
-            }
-        }
-        .max_decoding_message_size(max_message_size)
-        .max_encoding_message_size(max_message_size);
+        let client = connect_raft_client(&normalized, req_timeout)
+            .await?
+            .max_decoding_message_size(max_message_size)
+            .max_encoding_message_size(max_message_size);
         self.channels.insert(target, client.clone());
         Ok(client)
     }
@@ -140,11 +128,17 @@ impl RaftNetworkFactory<TypeConfig> for RaftNetworkClientFactory {
     type Network = RaftNetworkClient;
 
     async fn new_client(&mut self, target: NodeId, node: &openraft::BasicNode) -> Self::Network {
-        // 解析目标地址
+        // 解析目标地址: 未变化时仅读锁命中，避免每轮 RPC 都抢写锁。
         let raw_addr = if !node.addr.is_empty() {
-            let addr = node.addr.clone();
-            self.nodes.write().insert(target, addr.clone());
-            addr
+            let unchanged = self
+                .nodes
+                .read()
+                .get(&target)
+                .is_some_and(|cur| cur == &node.addr);
+            if !unchanged {
+                self.nodes.write().insert(target, node.addr.clone());
+            }
+            node.addr.clone()
         } else {
             self.nodes.read().get(&target).cloned().unwrap_or_else(|| {
                 tracing::error!(
@@ -181,5 +175,52 @@ impl RaftNetworkFactory<TypeConfig> for RaftNetworkClientFactory {
             Some(self.channels.clone()),
             self.stats.clone(),
         )
+        .with_payload_cache(Arc::clone(&self.payload_cache))
+    }
+}
+
+pub(super) async fn connect_raft_client(
+    addr: &str,
+    req_timeout: Duration,
+) -> std::result::Result<RaftServiceClient<tonic::transport::Channel>, NetworkError<TypeConfig>> {
+    let endpoint = tonic::transport::Endpoint::from_shared(addr.to_string())
+        .map_err(|e| NetworkError::<TypeConfig>::new(&Unreachable::<TypeConfig>::new(&e)))?
+        .tcp_nodelay(true);
+    let channel = match tokio::time::timeout(req_timeout, endpoint.connect()).await {
+        Ok(Ok(ch)) => ch,
+        Ok(Err(e)) => {
+            return Err(NetworkError::<TypeConfig>::new(
+                &Unreachable::<TypeConfig>::new(&e),
+            ))
+        }
+        Err(_) => {
+            let io_err = std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("gRPC connect timeout after {}ms", req_timeout.as_millis()),
+            );
+            return Err(NetworkError::<TypeConfig>::new(
+                &Unreachable::<TypeConfig>::new(&io_err),
+            ));
+        }
+    };
+    Ok(RaftServiceClient::new(channel))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_new_client_preserves_registered_addr_without_overwrite() {
+        let mut factory = RaftNetworkClientFactory::new(1, 1, 50, 1024 * 1024);
+        factory.add_node(2, "127.0.0.1:19999".into());
+        let node = openraft::BasicNode {
+            addr: "127.0.0.1:19999".into(),
+        };
+        let _client = factory.new_client(2, &node).await;
+        assert_eq!(
+            factory.list_nodes(),
+            vec![(2, "127.0.0.1:19999".to_string())]
+        );
     }
 }

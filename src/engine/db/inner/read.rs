@@ -8,8 +8,8 @@ use super::{
     PinnableSlice, PointState, Result, SSTableReader, Snapshot, ValueType, DB,
 };
 use crate::engine::memtable::{
-    extract_user_key, extract_value_type, max_covering_range_tombstone_seq, InternalKeyBytes,
-    InternalKeySlice, RangeTombstoneRecord, SharedSkipMap, K_MAX_SEQUENCE,
+    extract_user_key, extract_value_type, range_overlaps, InternalKeyBytes, InternalKeySlice,
+    SharedSkipMap, K_MAX_SEQUENCE,
 };
 use crate::statistics::DbOp;
 use std::ops::Bound;
@@ -68,30 +68,33 @@ impl DB {
         key: &[u8],
         max_seq: u64,
     ) -> Result<Option<Vec<u8>>> {
-        if self.has_active_range_tombstones() {
+        if self.covered_by_range_tombstone(key, max_seq)? {
             self.get_at_sequence_with_range_tombstones(key, max_seq)
         } else {
             self.get_at_sequence_fast(key, max_seq)
         }
     }
 
-    pub(super) fn has_active_range_tombstones(&self) -> bool {
-        if self.memtable.read().has_range_tombstones() {
-            return true;
+    /// 只在范围墓碑盖住这个 key 时离开快路径.
+    /// SST 部分按层二分片段索引, 不拿 `sstables` 锁, 也不随文件数遍历.
+    pub(super) fn covered_by_range_tombstone(&self, key: &[u8], max_seq: u64) -> Result<bool> {
+        if self
+            .memtable
+            .read()
+            .max_range_tombstone_seq(key, max_seq)?
+            .is_some()
+        {
+            return Ok(true);
         }
         for imm in self.immutable_memtables.read().iter() {
-            if imm.has_range_tombstones() {
-                return true;
+            if imm.max_range_tombstone_seq(key, max_seq)?.is_some() {
+                return Ok(true);
             }
         }
-        for level in self.sstables.read().iter() {
-            for reader in level {
-                if reader.has_range_tombstones() {
-                    return true;
-                }
-            }
-        }
-        false
+        let levels = Arc::clone(&self.sst_range_tombstones.read());
+        Ok(levels
+            .iter()
+            .any(|level| level.max_seq(key, max_seq).is_some()))
     }
 
     /// 无 range tombstone 时走旧短路路径 (mem → imm → sst 逐层返回).
@@ -142,31 +145,24 @@ impl DB {
         self.get_from_sstables(key, max_seq)
     }
 
-    fn max_range_seq_across_indexes(
+    pub(super) fn max_range_seq_across_indexes(
         &self,
-        l0: &[Arc<SSTableReader>],
-        l1_plus: &[Vec<Arc<SSTableReader>>],
         key: &[u8],
         max_seq: u64,
-    ) -> Option<u64> {
-        let mut records = Vec::new();
-        if let Ok(found) = self.memtable.read().collect_range_tombstones() {
-            push_range_records(&mut records, found);
-        }
+    ) -> Result<Option<u64>> {
+        let mut best = self.memtable.read().max_range_tombstone_seq(key, max_seq)?;
         for imm in self.immutable_memtables.read().iter() {
-            if let Ok(found) = imm.collect_range_tombstones() {
-                push_range_records(&mut records, found);
+            if let Some(seq) = imm.max_range_tombstone_seq(key, max_seq)? {
+                best = Some(best.map_or(seq, |current| current.max(seq)));
             }
         }
-        for reader in l0 {
-            push_range_records(&mut records, reader.collect_range_tombstones());
-        }
-        for level in l1_plus {
-            for reader in level {
-                push_range_records(&mut records, reader.collect_range_tombstones());
+        let levels = Arc::clone(&self.sst_range_tombstones.read());
+        for level in levels.iter() {
+            if let Some(seq) = level.max_seq(key, max_seq) {
+                best = Some(best.map_or(seq, |current| current.max(seq)));
             }
         }
-        max_covering_range_tombstone_seq(&records, key, max_seq)
+        Ok(best)
     }
 
     fn get_from_sstables(&self, key: &[u8], max_seq: u64) -> Result<Option<Vec<u8>>> {
@@ -249,12 +245,7 @@ impl DB {
                 absorb_point(reader.point_state(key, max_seq)?);
             }
         }
-        absorb_range(self.max_range_seq_across_indexes(
-            &l0_readers,
-            &l1_plus_readers,
-            key,
-            max_seq,
-        ));
+        absorb_range(self.max_range_seq_across_indexes(key, max_seq)?);
 
         let tombstone = match (best_delete, best_range) {
             (Some(d), Some(r)) => Some(d.max(r)),
@@ -353,7 +344,12 @@ impl DB {
                     .iter()
                     .all(|r| !crate::engine::db::iterator::sst_overlaps(r, start, end))
             });
-            let pure = imm.is_empty() && no_sst_overlap && !mem.has_range_tombstones();
+            let tombstone_hits_scan = mem.collect_range_tombstones().map_or(true, |records| {
+                records
+                    .iter()
+                    .any(|(start_key, end_key, _)| range_overlaps(start_key, end_key, start, end))
+            });
+            let pure = imm.is_empty() && no_sst_overlap && !tombstone_hits_scan;
             (pure, mem.rep().shared_map())
         };
 
@@ -425,16 +421,6 @@ pub(super) fn min_sequence_in_memtable(mt: &MemTable) -> Option<u64> {
         }
     }
     min
-}
-
-fn push_range_records(out: &mut Vec<RangeTombstoneRecord>, records: Vec<(Vec<u8>, Vec<u8>, u64)>) {
-    for (start, end, sequence) in records {
-        out.push(RangeTombstoneRecord {
-            start,
-            end,
-            sequence,
-        });
-    }
 }
 
 pub(super) fn find_sstable_for_key<'a>(
@@ -654,6 +640,7 @@ mod tests {
         levels[1].push(file_b);
         db.replace_sstables_for_test(levels);
         assert_eq!(db.get(b"m").unwrap(), None);
+        assert!(!db.key_exists(b"m").unwrap());
         let keys: Vec<Vec<u8>> = db
             .scan(None, None)
             .unwrap()
@@ -675,6 +662,34 @@ mod tests {
         db.replace_sstables_for_test(levels);
         assert_eq!(db.get(b"a").unwrap().as_deref(), Some(b"a".as_slice()));
         assert_eq!(db.get(b"m").unwrap().as_deref(), Some(b"m".as_slice()));
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn raft_log_range_delete_does_not_hide_user_key() {
+        let dir = tempdir().unwrap();
+        let db = DB::open(dir.path(), Options::for_testing()).unwrap();
+        let user = b"\x01sm/biz";
+        let inside = crate::cluster::storage::keys::log_key(1, 1);
+        let boundary = crate::cluster::storage::keys::log_key(1, 2);
+        db.put(user, b"live").unwrap();
+        db.put(&inside, b"old-log").unwrap();
+        db.put(&boundary, b"keep-log").unwrap();
+        db.delete_range(&inside, &boundary).unwrap();
+
+        assert_eq!(db.get(user).unwrap().as_deref(), Some(b"live".as_slice()));
+        assert!(db.key_exists(user).unwrap());
+        assert_eq!(db.get(&inside).unwrap(), None);
+        assert!(!db.key_exists(&inside).unwrap());
+        assert_eq!(
+            db.get(&boundary).unwrap().as_deref(),
+            Some(b"keep-log".as_slice())
+        );
+        let scanned = db
+            .scan_limited(Some(user), Some(b"\x01sm/c"), 10, false)
+            .unwrap();
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].0, user);
     }
 
     #[test]

@@ -106,6 +106,8 @@ flowchart TB
 - **地址规范**: MOVED 重定向优先使用 `NodeInfo.client_addr`, 缺省时 fallback `rpc_addr`; 节点间 Raft RPC 始终使用 `rpc_addr`.
 - **Meta 版本单调递增**: 每次成功 `apply_meta_request` 后 `ClusterMeta.version += 1`.
 - **Apply Fail-Fast 机制**: `apply_entries_internal` 遇到真实底级存储错误时必须直接 `?` 向上抛, 交给 openraft 判定该实例 `Fatal` 并停机; 绝不能当作业务错误吞掉, 否则会导致 `last_applied` 越过失败 entry, 造成数据丢失或副本分叉.
+- **Snapshot 位点必须等于已落盘内容位点**: `build_snapshot` 持有 `capture_lock` 写锁, `apply_entries_internal` 持有读锁, 二者互斥. 若位点之后的数据还没落盘, `SnapshotMeta.last_log_id` 会领先于实际内容; openraft 随后按该位点 purge raft 日志, 重启时这段日志既不在 SST 也不在日志里, 直接丢数据且 group 卡死.
+- **日常快照只发布位点, 整库 bundle 按需生成**: openraft 日常清理只取 `build_snapshot` 返回的 meta. 日常路径 (`full=false`) 在写锁内只冻结 memtable 并读位点, 落盘 (`flush_frozen`) 在锁外完成, 落盘后才持久化 `snapshot_meta`; 同步 flush 实测要 2~4 秒, 不能放在写锁内. 副本落后或重启时 `get_current_snapshot` 才调用 `build_full_snapshot` 生成 bundle (锁内 flush 并定格文件清单, 锁外读 SST), 缓存位点不低于 purge 位点时复用.
 - **本地同步读**: 本机 group 的点查和按 user key 区间取最后一条提供同步入口, 供脚本线程直接调用. 异步包装仍走 `spawn_blocking`. 不在本地的 group 不能用这两条同步入口.
 
 ## 数据流

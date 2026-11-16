@@ -123,6 +123,13 @@ flowchart TD
     VS2 --> WALGC[try_cleanup_wals]
 ```
 
+#### Subcompaction 边界约定
+
+子压缩的分裂点是 user key, 不是 InternalKey. 所有跨子任务的边界判断 (含 `MergeIterator::with_range` 的
+`range_end` 过滤) 必须比较 user key: InternalKey 尾部是取反的 sequence, 字节序上与 user key 前缀关系
+相反 (空 user key 的范围墓碑内部键形如 `0xff..`, 会大于任意普通 user key). 按字节比较会让左侧子任务
+漏掉跨段的 range tombstone, 被它覆盖的 key 全部复活.
+
 ### Checkpoint (目录一致性快照)
 
 ```mermaid

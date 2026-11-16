@@ -137,7 +137,7 @@ async fn supervise_groups_restarts_fatal_group_and_preserves_data() {
 
     node.propose(Request::Put {
         key: b"k1".to_vec(),
-        value: b"v1".to_vec(),
+        value: bytes::Bytes::from(b"v1".to_vec()),
     })
     .await
     .expect("initial write before fault injection must succeed");
@@ -151,7 +151,7 @@ async fn supervise_groups_restarts_fatal_group_and_preserves_data() {
     let propose_err = node
         .propose(Request::PutConditional {
             key: b"k2".to_vec(),
-            value: b"v2".to_vec(),
+            value: bytes::Bytes::from(b"v2".to_vec()),
             migration_epoch: None,
         })
         .await;

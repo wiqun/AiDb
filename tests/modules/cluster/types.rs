@@ -11,7 +11,7 @@ fn test_request_serde_roundtrip() {
         log_id: LogId::new(CommittedLeaderId::new(1), 1),
         payload: EntryPayload::Normal(Request::Put {
             key: b"k".to_vec(),
-            value: b"v".to_vec(),
+            value: bytes::Bytes::from(b"v".to_vec()),
         }),
     };
     let bytes = rmp_serde::to_vec(&entry).unwrap();
@@ -26,7 +26,7 @@ fn test_request_serde_roundtrip() {
 fn test_request_to_batch_conversion() {
     let batch = Request::Put {
         key: b"a".to_vec(),
-        value: b"b".to_vec(),
+        value: bytes::Bytes::from(b"b".to_vec()),
     }
     .to_batch();
     assert_eq!(batch.len(), 1);

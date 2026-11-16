@@ -19,8 +19,57 @@ pub struct RaftNetworkClient {
     request_timeout: Duration,
     group_id: u64,
     max_message_size: usize,
+    payload_cache: Option<Arc<PayloadCache>>,
     stats: Option<Arc<Statistics>>,
 }
+
+const PAYLOAD_CACHE_SLOTS: usize = 64;
+
+type PayloadSlots = Vec<Option<(u64, u64, Vec<u8>)>>;
+
+/// 共享的近期 LogEntry payload 序列化缓存, 避免 Leader 向多个副本广播同一批日志时
+/// 重复执行 `rmp_serde::to_vec`.
+pub(super) struct PayloadCache {
+    slots: parking_lot::Mutex<PayloadSlots>,
+}
+
+impl PayloadCache {
+    pub(super) fn new() -> Self {
+        Self {
+            slots: parking_lot::Mutex::new(vec![None; PAYLOAD_CACHE_SLOTS]),
+        }
+    }
+
+    pub(super) fn get_or_serialize(
+        &self,
+        entry: &crate::cluster::types::LogEntry,
+    ) -> std::result::Result<Vec<u8>, RPCError<TypeConfig>> {
+        let idx = entry.log_id.index;
+        let term = entry.log_id.leader_id.term;
+        let slot = (idx as usize) & (PAYLOAD_CACHE_SLOTS - 1);
+        {
+            let guard = self.slots.lock();
+            if let Some((cached_idx, cached_term, ref bytes)) = guard[slot] {
+                if cached_idx == idx && cached_term == term {
+                    return Ok(bytes.clone());
+                }
+            }
+        }
+        let bytes = rmp_serde::to_vec(&entry.payload).map_err(|e| {
+            RPCError::Network(NetworkError::<TypeConfig>::new(
+                &Unreachable::<TypeConfig>::new(&e),
+            ))
+        })?;
+        let mut guard = self.slots.lock();
+        guard[slot] = Some((idx, term, bytes.clone()));
+        Ok(bytes)
+    }
+}
+
+/// 单片上限, 留在 gRPC 默认 64MB 消息限制之内.
+const SNAPSHOT_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+/// 安装要把整包写回磁盘, 比心跳用的 rpc 超时长. 只包住快照 RPC.
+const SNAPSHOT_RPC_TIMEOUT: Duration = Duration::from_secs(120);
 
 impl RaftNetworkClient {
     #[allow(clippy::too_many_arguments)]
@@ -44,8 +93,14 @@ impl RaftNetworkClient {
             request_timeout: Duration::from_millis(rpc_timeout_ms),
             group_id,
             max_message_size: max_message_size as usize,
+            payload_cache: None,
             stats,
         }
+    }
+
+    pub(super) fn with_payload_cache(mut self, cache: Arc<PayloadCache>) -> Self {
+        self.payload_cache = Some(cache);
+        self
     }
 
     /// 对端网络不可达时失效连接池缓存, 迫使下个 RPC 重新解析地址并建连.
@@ -249,35 +304,72 @@ impl RaftNetworkClient {
               "gRPC: lazy connect (channel not cached)",
             );
             let req_timeout = self.request_timeout;
-            let target_addr = self.target_addr.clone();
-            let connect_fut = RaftServiceClient::connect(target_addr);
-            let client = match tokio::time::timeout(req_timeout, connect_fut).await {
-                Ok(Ok(c)) => c,
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                      target_addr = %self.target_addr,
-                      error = %e,
-                      "gRPC client connect failed",
-                    );
-                    return Err(NetworkError::<TypeConfig>::new(
-                        &Unreachable::<TypeConfig>::new(&e),
-                    ));
+            let client =
+                match super::factory::connect_raft_client(&self.target_addr, req_timeout).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(
+                          target_addr = %self.target_addr,
+                          error = %e,
+                          "gRPC client connect failed",
+                        );
+                        return Err(e);
+                    }
                 }
-                Err(_) => {
-                    let io_err = std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!("gRPC connect timeout after {}ms", req_timeout.as_millis()),
-                    );
-                    return Err(NetworkError::<TypeConfig>::new(
-                        &Unreachable::<TypeConfig>::new(&io_err),
-                    ));
-                }
-            }
-            .max_decoding_message_size(self.max_message_size)
-            .max_encoding_message_size(self.max_message_size);
+                .max_decoding_message_size(self.max_message_size)
+                .max_encoding_message_size(self.max_message_size);
             self.client = Some(client);
         }
         Ok(self.client.as_mut().unwrap())
+    }
+
+    async fn install_snapshot_rpc(
+        &mut self,
+        request: raft_rpc::InstallSnapshotRequest,
+    ) -> std::result::Result<
+        raft_rpc::InstallSnapshotResponse,
+        openraft::error::StreamingError<TypeConfig>,
+    > {
+        let client = match self.get_client().await {
+            Ok(c) => c,
+            Err(e) => {
+                self.invalidate_channel();
+                return Err(openraft::error::StreamingError::Network(e));
+            }
+        };
+        let rpc_future = client.install_snapshot(TonicRequest::new(request));
+        match timeout(SNAPSHOT_RPC_TIMEOUT, rpc_future).await {
+            Ok(Ok(response)) => Ok(response.into_inner()),
+            Ok(Err(e)) => {
+                self.invalidate_on_unavailable(&e);
+                if e.code() == tonic::Code::Unavailable {
+                    return Err(openraft::error::StreamingError::Unreachable(Unreachable::<
+                        TypeConfig,
+                    >::new(
+                        &e
+                    )));
+                }
+                Err(openraft::error::StreamingError::Network(NetworkError::<
+                    TypeConfig,
+                >::new(
+                    &e
+                )))
+            }
+            Err(_) => {
+                let io_err = std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "InstallSnapshot timeout after {}ms",
+                        SNAPSHOT_RPC_TIMEOUT.as_millis()
+                    ),
+                );
+                Err(openraft::error::StreamingError::Unreachable(Unreachable::<
+                    TypeConfig,
+                >::new(
+                    &io_err
+                )))
+            }
+        }
     }
 }
 
@@ -302,6 +394,7 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkClient {
         }
         let req_timeout = self.request_timeout;
         let group_id = self.group_id;
+        let payload_cache = self.payload_cache.clone();
         let client = match self.get_client().await {
             Ok(c) => c,
             Err(e) => {
@@ -310,22 +403,7 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkClient {
             }
         };
 
-        let mut entries = Vec::new();
-        for entry in rpc.entries {
-            let payload = rmp_serde::to_vec(&entry.payload).map_err(|e| {
-                RPCError::Network(NetworkError::<TypeConfig>::new(
-                    &Unreachable::<TypeConfig>::new(&e),
-                ))
-            })?;
-            entries.push(raft_rpc::LogEntry {
-                log_index: entry.log_id.index,
-                log_term: entry.log_id.leader_id.term,
-                log_leader_id: 0, // v0.10 std mode CommittedLeaderId only has term
-                payload,
-                is_blank: matches!(entry.payload, openraft::EntryPayload::Blank),
-                is_membership: matches!(entry.payload, openraft::EntryPayload::Membership(_)),
-            });
-        }
+        let entries = encode_log_entries(&rpc.entries, payload_cache.as_deref())?;
 
         let request = raft_rpc::AppendEntriesRequest {
             group_id,
@@ -407,16 +485,7 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkClient {
             )));
         }
         drop(cancel); // Not using cancellation in this implementation
-        let req_timeout = self.request_timeout;
         let group_id = self.group_id;
-        let client = match self.get_client().await {
-            Ok(c) => c,
-            Err(e) => {
-                self.invalidate_channel();
-                return Err(openraft::error::StreamingError::Network(e));
-            }
-        };
-
         let meta = raft_rpc::SnapshotMeta {
             last_log_index: snapshot.meta.last_log_id.map(|id| id.index),
             last_log_term: snapshot.meta.last_log_id.map(|id| id.leader_id.term),
@@ -436,50 +505,26 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkClient {
         };
 
         let data = snapshot.snapshot.into_inner();
-        let request = raft_rpc::InstallSnapshotRequest {
-            group_id,
-            vote_term: vote.leader_id.term,
-            vote_node_id: vote.leader_id.voted_for,
-            vote_committed: vote.committed,
-            meta: Some(meta),
-            snapshot_data: data,
-        };
-
-        let rpc_future = client.install_snapshot(TonicRequest::new(request));
-        let response = match timeout(req_timeout, rpc_future).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                self.invalidate_on_unavailable(&e);
-                if e.code() == tonic::Code::Unavailable {
-                    return Err(openraft::error::StreamingError::Unreachable(Unreachable::<
-                        TypeConfig,
-                    >::new(
-                        &e
-                    )));
-                }
-                return Err(openraft::error::StreamingError::Network(NetworkError::<
-                    TypeConfig,
-                >::new(
-                    &e
-                )));
+        let total = data.len() as u64;
+        let mut offset = 0usize;
+        let resp = loop {
+            let end = (offset + SNAPSHOT_CHUNK_BYTES).min(data.len());
+            let request = raft_rpc::InstallSnapshotRequest {
+                group_id,
+                vote_term: vote.leader_id.term,
+                vote_node_id: vote.leader_id.voted_for,
+                vote_committed: vote.committed,
+                meta: Some(meta.clone()),
+                snapshot_data: data[offset..end].to_vec(),
+                snapshot_offset: offset as u64,
+                snapshot_total: total,
+            };
+            let r = self.install_snapshot_rpc(request).await?;
+            if end == data.len() {
+                break r;
             }
-            Err(_) => {
-                let io_err = std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!(
-                        "InstallSnapshot timeout after {}ms",
-                        req_timeout.as_millis()
-                    ),
-                );
-                return Err(openraft::error::StreamingError::Unreachable(Unreachable::<
-                    TypeConfig,
-                >::new(
-                    &io_err
-                )));
-            }
+            offset = end;
         };
-
-        let resp = response.into_inner();
         Ok(SnapshotResponse {
             vote: vote_from_wire(resp.vote_term, resp.vote_node_id, resp.vote_committed),
         })
@@ -581,5 +626,67 @@ fn map_rpc_status_error(rpc_name: &str, status: tonic::Status) -> Error {
             "{rpc_name} failed: {}",
             status.message()
         ))),
+    }
+}
+
+pub(super) fn encode_log_entries(
+    raw_entries: &[crate::cluster::types::LogEntry],
+    cache: Option<&PayloadCache>,
+) -> std::result::Result<Vec<raft_rpc::LogEntry>, RPCError<TypeConfig>> {
+    let mut entries = Vec::with_capacity(raw_entries.len());
+    for entry in raw_entries {
+        let payload = match cache {
+            Some(c) => c.get_or_serialize(entry)?,
+            None => rmp_serde::to_vec(&entry.payload).map_err(|e| {
+                RPCError::Network(NetworkError::<TypeConfig>::new(
+                    &Unreachable::<TypeConfig>::new(&e),
+                ))
+            })?,
+        };
+        entries.push(raft_rpc::LogEntry {
+            log_index: entry.log_id.index,
+            log_term: entry.log_id.leader_id.term,
+            log_leader_id: 0, // v0.10 std mode CommittedLeaderId only has term
+            payload,
+            is_blank: matches!(entry.payload, openraft::EntryPayload::Blank),
+            is_membership: matches!(entry.payload, openraft::EntryPayload::Membership(_)),
+        });
+    }
+    Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cluster::network::server::decode_log_entries;
+    use openraft::vote::leader_id_std::CommittedLeaderId;
+    use openraft::{EntryPayload, LogId};
+
+    #[test]
+    fn test_encode_append_entries_preallocates_and_roundtrips() {
+        let cache = PayloadCache::new();
+        let e1 = crate::cluster::types::LogEntry {
+            log_id: LogId::new(CommittedLeaderId::new(2), 10),
+            payload: EntryPayload::Normal(Request::Put {
+                key: b"k1".to_vec(),
+                value: bytes::Bytes::from_static(b"v1"),
+            }),
+        };
+        let e2 = crate::cluster::types::LogEntry {
+            log_id: LogId::new(CommittedLeaderId::new(2), 11),
+            payload: EntryPayload::Blank,
+        };
+        let input = vec![e1, e2];
+
+        let encoded1 = encode_log_entries(&input, Some(&cache)).expect("encode first");
+        let encoded2 = encode_log_entries(&input, Some(&cache)).expect("encode cached");
+        assert_eq!(encoded1.len(), 2);
+        assert_eq!(encoded1[0].payload, encoded2[0].payload);
+
+        let decoded = decode_log_entries(encoded2).expect("decode");
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].log_id.index, 10);
+        assert_eq!(decoded[1].log_id.index, 11);
+        assert!(matches!(decoded[1].payload, EntryPayload::Blank));
     }
 }

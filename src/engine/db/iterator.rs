@@ -66,109 +66,119 @@ fn replaces(best_seq: u64, seq: u64, value_type: ValueType) -> bool {
     seq > best_seq || (seq == best_seq && value_type == ValueType::TypeDelete)
 }
 
-/// 内存表层游标每次跳表定位后预读的可见版本数, 摊薄跳表查找成本; 窗口大小与表大小无关.
-const MEM_CURSOR_WINDOW: usize = 32;
+use crossbeam_skiplist::map::Entry;
 
-/// 内存表层游标: 持有 SkipMap 的 `Arc` 句柄, 按需定位并预读一个可见版本窗口.
-/// 窗口只含 `seq <= visible_seq` 的版本, 按内部 key 升序存放, `pos` 为当前位置.
+/// 将借用自 SkipMap 的 Entry 生命周期扩展为 'static.
+///
+/// # Safety
+/// 仅限 MemCursor 内部使用: MemCursor 同时持有 SkipMap 的 Arc 句柄,
+/// 且在字段销毁顺序上 entry 先于 map 销毁, entry 不会逃逸出 MemCursor.
+#[inline]
+unsafe fn extend_entry_lifetime(
+    entry: Entry<'_, InternalKeyBytes, Arc<[u8]>>,
+) -> Entry<'static, InternalKeyBytes, Arc<[u8]>> {
+    std::mem::transmute::<
+        Entry<'_, InternalKeyBytes, Arc<[u8]>>,
+        Entry<'static, InternalKeyBytes, Arc<[u8]>>,
+    >(entry)
+}
+
+/// 内存表层游标: 直接持有 SkipMap 的活性 Entry 指针, 零堆分配、零数据复制.
+/// 移动时通过 `move_next` / `move_prev` 原地沿跳表链表前进, 避免滑动窗口内存分配与重新定位.
 struct MemCursor {
+    entry: Option<Entry<'static, InternalKeyBytes, Arc<[u8]>>>,
     map: SharedSkipMap,
     visible_seq: u64,
-    window: Vec<(InternalKeyBytes, Arc<[u8]>)>,
-    pos: usize,
 }
 
 impl MemCursor {
-    fn current_pair(&self) -> Option<&(InternalKeyBytes, Arc<[u8]>)> {
-        self.window.get(self.pos)
-    }
-
-    /// 从 `lower` 起向后预读 (升序).
-    fn fill_forward(&mut self, lower: Bound<InternalKeyBytes>) {
-        self.window.clear();
-        self.pos = 0;
-        let map = Arc::clone(&self.map);
-        let mut entry = match &lower {
-            Bound::Unbounded => map.front(),
-            Bound::Included(k) => map.lower_bound(Bound::Included(k)),
-            Bound::Excluded(k) => map.lower_bound(Bound::Excluded(k)),
-        };
-        while let Some(e) = entry {
-            if is_visible(e.key().as_ref(), self.visible_seq) {
-                self.window.push((e.key().clone(), e.value().clone()));
-                if self.window.len() == MEM_CURSOR_WINDOW {
-                    break;
-                }
-            }
-            entry = e.next();
-        }
-    }
-
-    /// 从 `upper` 起向前预读, 窗口仍按升序存放, `pos` 指向最后一条 (当前位置).
-    fn fill_backward(&mut self, upper: Bound<InternalKeyBytes>) {
-        self.window.clear();
-        let map = Arc::clone(&self.map);
-        let mut entry = match &upper {
-            Bound::Unbounded => map.back(),
-            Bound::Included(k) => map.upper_bound(Bound::Included(k)),
-            Bound::Excluded(k) => map.upper_bound(Bound::Excluded(k)),
-        };
-        let mut collected = Vec::new();
-        while let Some(e) = entry {
-            if is_visible(e.key().as_ref(), self.visible_seq) {
-                collected.push((e.key().clone(), e.value().clone()));
-                if collected.len() == MEM_CURSOR_WINDOW {
-                    break;
-                }
-            }
-            entry = e.prev();
-        }
-        collected.reverse();
-        self.pos = collected.len().saturating_sub(1);
-        self.window = collected;
+    fn current_pair(&self) -> Option<(&InternalKeyBytes, &[u8])> {
+        self.entry.as_ref().map(|e| (e.key(), e.value().as_ref()))
     }
 
     fn seek_user_key(&mut self, user_key: &[u8]) {
         let target = bound_key(user_key, K_MAX_SEQUENCE, ValueType::TypePut);
-        self.fill_forward(Bound::Included(target));
+        let entry = self.map.lower_bound(Bound::Included(&target));
+        if let Some(mut e) = entry {
+            while !is_visible(e.key().as_ref(), self.visible_seq) {
+                if !e.move_next() {
+                    self.entry = None;
+                    return;
+                }
+            }
+            self.entry = Some(unsafe { extend_entry_lifetime(e) });
+        } else {
+            self.entry = None;
+        }
     }
 
     fn seek_first(&mut self) {
-        self.fill_forward(Bound::Unbounded);
+        let entry = self.map.front();
+        if let Some(mut e) = entry {
+            while !is_visible(e.key().as_ref(), self.visible_seq) {
+                if !e.move_next() {
+                    self.entry = None;
+                    return;
+                }
+            }
+            self.entry = Some(unsafe { extend_entry_lifetime(e) });
+        } else {
+            self.entry = None;
+        }
     }
 
     fn seek_last(&mut self) {
-        self.fill_backward(Bound::Unbounded);
+        let entry = self.map.back();
+        if let Some(mut e) = entry {
+            while !is_visible(e.key().as_ref(), self.visible_seq) {
+                if !e.move_prev() {
+                    self.entry = None;
+                    return;
+                }
+            }
+            self.entry = Some(unsafe { extend_entry_lifetime(e) });
+        } else {
+            self.entry = None;
+        }
     }
 
     /// 定位到 user_key < `user_key` 的最后一个可见版本.
     fn seek_last_before(&mut self, user_key: &[u8]) {
         let target = bound_key(user_key, K_MAX_SEQUENCE, ValueType::TypePut);
-        self.fill_backward(Bound::Excluded(target));
+        let entry = self.map.upper_bound(Bound::Excluded(&target));
+        if let Some(mut e) = entry {
+            while !is_visible(e.key().as_ref(), self.visible_seq) {
+                if !e.move_prev() {
+                    self.entry = None;
+                    return;
+                }
+            }
+            self.entry = Some(unsafe { extend_entry_lifetime(e) });
+        } else {
+            self.entry = None;
+        }
     }
 
     fn advance(&mut self) {
-        if self.pos + 1 < self.window.len() {
-            self.pos += 1;
-            return;
+        if let Some(ref mut e) = self.entry {
+            while e.move_next() {
+                if is_visible(e.key().as_ref(), self.visible_seq) {
+                    return;
+                }
+            }
+            self.entry = None;
         }
-        let key = match self.current_pair() {
-            Some((k, _)) => k.clone(),
-            None => return,
-        };
-        self.fill_forward(Bound::Excluded(key));
     }
 
     fn retreat(&mut self) {
-        if self.pos > 0 {
-            self.pos -= 1;
-            return;
+        if let Some(ref mut e) = self.entry {
+            while e.move_prev() {
+                if is_visible(e.key().as_ref(), self.visible_seq) {
+                    return;
+                }
+            }
+            self.entry = None;
         }
-        let key = match self.current_pair() {
-            Some((k, _)) => k.clone(),
-            None => return,
-        };
-        self.fill_backward(Bound::Excluded(key));
     }
 }
 
@@ -187,10 +197,9 @@ impl LayerIter {
     fn from_memtable(map: SharedSkipMap, visible_seq: u64) -> Self {
         Self {
             inner: LayerIterInner::Mem(MemCursor {
+                entry: None,
                 map,
                 visible_seq,
-                window: Vec::new(),
-                pos: 0,
             }),
             visible_seq,
         }
@@ -207,7 +216,7 @@ impl LayerIter {
         let (key, value) = match &self.inner {
             LayerIterInner::Mem(c) => {
                 let (k, v) = c.current_pair()?;
-                (k.as_ref(), v.as_ref())
+                (k.as_ref(), v)
             }
             LayerIterInner::Sst(it) => (it.key()?, it.value()?),
         };
