@@ -213,11 +213,11 @@ impl CompactionJob {
                 continue;
             }
             count += 1;
-            if count % stride == 0 {
+            if count.is_multiple_of(stride) {
                 samples.push((count, user_key.to_vec()));
                 if samples.len() > SPLIT_SAMPLE_CAP {
                     stride *= 2;
-                    samples.retain(|(i, _)| i % stride == 0);
+                    samples.retain(|(i, _)| i.is_multiple_of(stride));
                 }
             }
         }

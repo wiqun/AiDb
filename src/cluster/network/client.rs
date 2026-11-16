@@ -507,8 +507,7 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkClient {
         let data = snapshot.snapshot.into_inner();
         let total = data.len() as u64;
         let mut offset = 0usize;
-        let mut resp = None;
-        loop {
+        let resp = loop {
             let end = (offset + SNAPSHOT_CHUNK_BYTES).min(data.len());
             let request = raft_rpc::InstallSnapshotRequest {
                 group_id,
@@ -520,13 +519,12 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkClient {
                 snapshot_offset: offset as u64,
                 snapshot_total: total,
             };
-            resp = Some(self.install_snapshot_rpc(request).await?);
+            let r = self.install_snapshot_rpc(request).await?;
             if end == data.len() {
-                break;
+                break r;
             }
             offset = end;
-        }
-        let resp = resp.expect("至少发送一片");
+        };
         Ok(SnapshotResponse {
             vote: vote_from_wire(resp.vote_term, resp.vote_node_id, resp.vote_committed),
         })

@@ -143,18 +143,18 @@ pub struct OpenRaftSnapshotBuilder {
     state: std::sync::Arc<parking_lot::RwLock<super::StorageState>>,
     /// 与 `OpenRaftStorage::get_current_snapshot` 共享. 复制落后副本时从这里取回
     /// 刚构建的那一份, 而不是回答「没有快照」.
-    built_snapshot: std::sync::Arc<parking_lot::RwLock<Option<(SMOf, Vec<u8>)>>>,
+    built_snapshot: super::BuiltSnapshotSlot,
     /// 与 apply 共享的抓取锁: 抓快照期间持有写锁, 保证 flush 到读取 `last_applied`
     /// 之间没有并发 apply 插入.
     capture_lock: std::sync::Arc<parking_lot::RwLock<()>>,
 }
 
 impl OpenRaftSnapshotBuilder {
-    pub fn new(
+    pub(crate) fn new(
         db: super::DbSlot,
         group_id: u64,
         state: std::sync::Arc<parking_lot::RwLock<super::StorageState>>,
-        built_snapshot: std::sync::Arc<parking_lot::RwLock<Option<(SMOf, Vec<u8>)>>>,
+        built_snapshot: super::BuiltSnapshotSlot,
         capture_lock: std::sync::Arc<parking_lot::RwLock<()>>,
     ) -> Self {
         Self {

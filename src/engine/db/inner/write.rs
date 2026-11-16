@@ -645,6 +645,7 @@ fn db_write_is_slow(total: Duration) -> bool {
     total >= SLOW_DB_WRITE
 }
 
+#[allow(clippy::too_many_arguments)]
 fn note_slow_db_write(
     use_wal: bool,
     sync_wal: bool,

@@ -494,6 +494,19 @@ impl RaftService for RaftServiceImpl {
     }
 }
 
+/// 将 `OpenRaftNode::get`/`get_migration_tip` 的错误映射为 `tonic::Status`.
+/// `NotLeader` (含 linearizable 检查失败时的 `ForwardToLeader`) 映射为
+/// `failed_precondition`, 供客户端 (`RaftNetworkClient::get_key` 等) 区分
+/// "对端不是 leader" 与其它内部错误.
+fn map_node_error_to_status(e: Error) -> tonic::Status {
+    match e {
+        Error::Cluster(ClusterError::NotLeader { .. }) => {
+            tonic::Status::failed_precondition(e.to_string())
+        }
+        _ => tonic::Status::internal(e.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::push_snapshot_chunk;
@@ -521,18 +534,5 @@ mod tests {
         let mut slot = None;
         let got = push_snapshot_chunk(&mut slot, "snap-1", 0, 0, b"whole".to_vec()).unwrap();
         assert_eq!(got.unwrap(), b"whole");
-    }
-}
-
-/// 将 `OpenRaftNode::get`/`get_migration_tip` 的错误映射为 `tonic::Status`.
-/// `NotLeader` (含 linearizable 检查失败时的 `ForwardToLeader`) 映射为
-/// `failed_precondition`, 供客户端 (`RaftNetworkClient::get_key` 等) 区分
-/// "对端不是 leader" 与其它内部错误.
-fn map_node_error_to_status(e: Error) -> tonic::Status {
-    match e {
-        Error::Cluster(ClusterError::NotLeader { .. }) => {
-            tonic::Status::failed_precondition(e.to_string())
-        }
-        _ => tonic::Status::internal(e.to_string()),
     }
 }

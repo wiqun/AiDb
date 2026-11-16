@@ -664,6 +664,7 @@ mod tests {
         assert_eq!(db.get(b"m").unwrap().as_deref(), Some(b"m".as_slice()));
     }
 
+    #[cfg(feature = "cluster")]
     #[test]
     fn raft_log_range_delete_does_not_hide_user_key() {
         let dir = tempdir().unwrap();

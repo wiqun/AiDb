@@ -95,6 +95,7 @@ fn build_openraft_config(config: &RaftNodeConfig) -> Result<Config> {
     .map_err(|e| Error::Cluster(ClusterError::InvalidConfig(e.to_string())))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn note_slow_propose(
     group_id: u64,
     request: &Request,

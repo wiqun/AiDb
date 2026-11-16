@@ -63,7 +63,7 @@ impl Checkpoint {
         };
 
         let files = db.collect_checkpoint_file_paths(true)?;
-        let file_count = files.len();
+        let mut file_count = 0usize;
         for src in &files {
             let rel = src
                 .strip_prefix(db.path())
@@ -72,7 +72,17 @@ impl Checkpoint {
             if let Some(parent) = dst.parent() {
                 fs::create_dir_all(parent)?;
             }
-            link_or_copy(src, &dst)?;
+            match link_or_copy(src, &dst) {
+                Ok(()) => file_count += 1,
+                Err(Error::Io(ref e))
+                    if e.kind() == std::io::ErrorKind::NotFound
+                        && src.extension().and_then(|s| s.to_str()) == Some("wal") =>
+                {
+                    // 后台异步 WAL GC 可能在 scan_wal_file_paths 后删掉已刷盘的旧 WAL
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         sync_dir(&tmp)?;

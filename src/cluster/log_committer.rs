@@ -332,6 +332,7 @@ fn spawn_committer_inner(
     handle
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_committer(
     group_id: u64,
     db: DbSlot,
@@ -424,6 +425,7 @@ impl BatchState {
 
 // ── flush_batch 核心逻辑 ──
 
+#[allow(clippy::too_many_arguments)]
 async fn flush_batch(
     group_id: u64,
     db: &DbSlot,

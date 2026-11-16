@@ -133,6 +133,15 @@ impl RaftPhaseMarks {
     }
 }
 
+pub(crate) type BuiltSnapshotSlot = Arc<RwLock<Option<(SMOf, Vec<u8>)>>>;
+pub(crate) type PendingLogOverlaySlot = Arc<
+    parking_lot::Mutex<
+        crate::cluster::pending_log::PendingLogOverlay<
+            Arc<<TypeConfig as openraft::RaftTypeConfig>::Entry>,
+        >,
+    >,
+>;
+
 #[derive(Clone)]
 pub struct OpenRaftStorage {
     pub(crate) db: DbSlot,
@@ -144,7 +153,7 @@ pub struct OpenRaftStorage {
     pub(crate) phases: Arc<RaftPhaseMarks>,
     /// 本机最近一次 `build_snapshot` 的元数据和字节.
     /// 复制给落后副本时 `get_current_snapshot` 必须返回这一份, 不能返回 None.
-    pub(crate) built_snapshot: Arc<RwLock<Option<(SMOf, Vec<u8>)>>>,
+    pub(crate) built_snapshot: BuiltSnapshotSlot,
     /// apply 与 snapshot 抓取的互斥锁.
     ///
     /// snapshot bundle 必须对应"某个 last_applied 位点的完整状态". 若 flush 与读取
@@ -161,17 +170,7 @@ impl OpenRaftStorage {
     }
 
     /// 获取 PendingLogOverlay 引用 (用于 get_log_entries 读 pending entry).
-    pub(crate) fn pending_overlay(
-        &self,
-    ) -> Option<
-        Arc<
-            parking_lot::Mutex<
-                crate::cluster::pending_log::PendingLogOverlay<
-                    Arc<<TypeConfig as openraft::RaftTypeConfig>::Entry>,
-                >,
-            >,
-        >,
-    > {
+    pub(crate) fn pending_overlay(&self) -> Option<PendingLogOverlaySlot> {
         self.committer.as_ref().map(|h| h.overlay.clone())
     }
 }
