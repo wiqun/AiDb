@@ -76,7 +76,10 @@ impl Checkpoint {
                 Ok(()) => file_count += 1,
                 Err(Error::Io(ref e))
                     if e.kind() == std::io::ErrorKind::NotFound
-                        && src.extension().and_then(|s| s.to_str()) == Some("wal") =>
+                        && src
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .is_some_and(|n| n.starts_with("wal_") && n.ends_with(".log")) =>
                 {
                     // 后台异步 WAL GC 可能在 scan_wal_file_paths 后删掉已刷盘的旧 WAL
                     continue;
