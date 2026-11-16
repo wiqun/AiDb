@@ -161,7 +161,6 @@ impl MemTable {
         let val = Arc::from(value);
         self.rep.insert(ik, val);
         self.entry_count.fetch_add(1, Ordering::Relaxed);
-        tracing::debug!(target: "mem", "mem.put");
         self.sync_active_metric();
         Ok(())
     }
@@ -175,7 +174,6 @@ impl MemTable {
         ));
         self.rep.insert(ik, Arc::from(&[] as &[u8]));
         self.entry_count.fetch_add(1, Ordering::Relaxed);
-        tracing::debug!(target: "mem", "mem.delete");
         self.sync_active_metric();
         Ok(())
     }

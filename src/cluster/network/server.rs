@@ -84,6 +84,25 @@ impl Default for RaftServiceDispatcher {
     }
 }
 
+pub(super) fn decode_log_entries(
+    raw_entries: Vec<raft_rpc::LogEntry>,
+) -> std::result::Result<Vec<crate::cluster::types::LogEntry>, tonic::Status> {
+    let mut entries = Vec::with_capacity(raw_entries.len());
+    for entry in raw_entries {
+        let payload: openraft::EntryPayload<Request, NodeId, openraft::BasicNode> =
+            rmp_serde::from_slice(&entry.payload)
+                .map_err(|e| tonic::Status::internal(format!("deserialize entry: {e}")))?;
+        entries.push(crate::cluster::types::LogEntry {
+            log_id: openraft::LogId::new(
+                openraft::vote::leader_id_std::CommittedLeaderId::new(entry.log_term),
+                entry.log_index,
+            ),
+            payload,
+        });
+    }
+    Ok(entries)
+}
+
 pub struct RaftServiceImpl {
     dispatcher: Arc<RaftServiceDispatcher>,
     /// group_id -> 尚未拼完的快照片. 分片按顺序到达, 拼满后才交给 raft.
@@ -217,19 +236,7 @@ impl RaftService for RaftServiceImpl {
             "gRPC: received AppendEntries",
         );
 
-        let mut entries = Vec::new();
-        for entry in req.entries {
-            let payload: openraft::EntryPayload<Request, NodeId, openraft::BasicNode> =
-                rmp_serde::from_slice(&entry.payload)
-                    .map_err(|e| tonic::Status::internal(format!("deserialize entry: {e}")))?;
-            entries.push(crate::cluster::types::LogEntry {
-                log_id: openraft::LogId::new(
-                    openraft::vote::leader_id_std::CommittedLeaderId::new(entry.log_term),
-                    entry.log_index,
-                ),
-                payload,
-            });
-        }
+        let entries = decode_log_entries(req.entries)?;
 
         let prev_log_id = match (
             req.prev_log_index,

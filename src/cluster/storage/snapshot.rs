@@ -168,8 +168,8 @@ impl OpenRaftSnapshotBuilder {
 
     /// 持久化快照位点并更新内存态. openraft 据此位点 purge raft 日志.
     fn persist_meta(&self, db: &DB, meta: &SMOf) -> std::io::Result<()> {
-        let meta_bytes = postcard::to_allocvec(meta)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let meta_bytes =
+            postcard::to_allocvec(meta).map_err(|e| std::io::Error::other(e.to_string()))?;
         db.put(&snapshot_meta_key(self.group_id), &meta_bytes)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         self.state.write().snapshot_meta = Some(meta.clone());
@@ -693,7 +693,12 @@ mod tests {
         };
         storage.apply_entries_internal(&[entry]).unwrap();
 
-        let built = storage.get_snapshot_builder().await.build_snapshot().await.unwrap();
+        let built = storage
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
         let sent = storage
             .get_current_snapshot()
             .await
@@ -705,7 +710,10 @@ mod tests {
         // 真正要发给副本时 `get_current_snapshot` 才现做完整 bundle.
         assert!(built.snapshot.into_inner().is_empty());
         let bundle: SnapshotBundle = postcard::from_bytes(&sent.snapshot.into_inner()).unwrap();
-        assert!(bundle.files.iter().any(|f| f.relative_path.ends_with(".sst")));
+        assert!(bundle
+            .files
+            .iter()
+            .any(|f| f.relative_path.ends_with(".sst")));
     }
 
     /// 日常快照在发布位点前必须把冻结的数据落盘, 否则 purge 之后重启会丢这段状态.
@@ -729,7 +737,12 @@ mod tests {
         storage.apply_entries_internal(&[entry]).unwrap();
         assert_eq!(db.level0_sstable_count(), 0);
 
-        storage.get_snapshot_builder().await.build_snapshot().await.unwrap();
+        storage
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
         assert!(db.level0_sstable_count() >= 1, "位点发布前数据必须已在 SST");
     }
 
@@ -753,12 +766,23 @@ mod tests {
         };
         storage.apply_entries_internal(&[entry]).unwrap();
 
-        let built = storage.get_snapshot_builder().await.build_snapshot().await.unwrap();
+        let built = storage
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
         assert_eq!(built.meta.last_log_id.map(|id| id.index), Some(3));
         assert!(built.snapshot.into_inner().is_empty());
         assert!(storage.built_snapshot.read().is_none());
         assert_eq!(
-            storage.state.read().snapshot_meta.as_ref().and_then(|m| m.last_log_id).map(|id| id.index),
+            storage
+                .state
+                .read()
+                .snapshot_meta
+                .as_ref()
+                .and_then(|m| m.last_log_id)
+                .map(|id| id.index),
             Some(3)
         );
     }

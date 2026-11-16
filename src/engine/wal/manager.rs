@@ -162,6 +162,7 @@ impl WALManager {
     }
 
     /// 估算多条 WalEntry 编码连续落盘的总字节数.
+    #[cfg(test)]
     pub(crate) fn estimated_batch_disk_bytes(&self, encoded_entries: &[Vec<u8>]) -> u64 {
         let mut block_off = self.writer.block_offset();
         let mut total = 0u64;
@@ -239,6 +240,7 @@ impl WALManager {
     }
 
     /// WriteBatch 原子写入 WAL: 预检空间 + 写入期间不 auto-rotate.
+    #[cfg(test)]
     pub(crate) fn append_encoded_write_batch(
         &mut self,
         encoded_entries: &[Vec<u8>],
@@ -251,6 +253,31 @@ impl WALManager {
         self.ensure_space_for_batch(batch_bytes, base_seq)?;
         for (i, data) in encoded_entries.iter().enumerate() {
             self.append_in_batch(data)?;
+            if i > 0 {
+                self.note_appended_sequence(base_seq + (i - 1) as u64);
+            }
+        }
+        self.writer.flush_buffer()?;
+        Ok(())
+    }
+
+    pub(crate) fn append_encoded_ranges(
+        &mut self,
+        flat_buf: &[u8],
+        ranges: &[(usize, usize)],
+        base_seq: u64,
+    ) -> Result<()> {
+        if ranges.is_empty() {
+            return Ok(());
+        }
+        const WAL_RECORD_HEADER: usize = 7;
+        let batch_bytes: u64 = ranges
+            .iter()
+            .map(|(s, e)| ((e - s) + WAL_RECORD_HEADER) as u64)
+            .sum();
+        self.ensure_space_for_batch(batch_bytes, base_seq)?;
+        for (i, &(s, e)) in ranges.iter().enumerate() {
+            self.append_in_batch(&flat_buf[s..e])?;
             if i > 0 {
                 self.note_appended_sequence(base_seq + (i - 1) as u64);
             }

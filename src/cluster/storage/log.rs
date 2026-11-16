@@ -76,7 +76,7 @@ impl OpenRaftStorage {
             if let Some(ref ov) = overlay {
                 let ov_guard = ov.lock();
                 if let Some(entry) = ov_guard.get(idx) {
-                    entries.push(entry.clone());
+                    entries.push((**entry).clone());
                     continue;
                 }
             }

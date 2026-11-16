@@ -399,7 +399,8 @@ impl DB {
 
                 let wal_started = std::time::Instant::now();
                 if self.options.use_wal {
-                    let mut encoded: Vec<Vec<u8>> =
+                    let mut wal_buf: Vec<u8> = Vec::with_capacity((total_ops as usize) * 96);
+                    let mut wal_ranges: Vec<(usize, usize)> =
                         Vec::with_capacity(total_ops as usize + group.len());
                     for &w_ptr in group {
                         let w = unsafe { &*w_ptr };
@@ -408,20 +409,20 @@ impl DB {
                         }
                         let b = unsafe { &*w.batch };
                         if b.len() > 1 {
-                            let mut start_buf = Vec::new();
+                            let start = wal_buf.len();
                             WalEntry::encode_to_buf(
                                 0,
                                 OpType::BatchStart,
                                 true,
                                 &[],
                                 Some(&(b.len() as u32).to_le_bytes()),
-                                &mut start_buf,
+                                &mut wal_buf,
                             );
-                            encoded.push(start_buf);
+                            wal_ranges.push((start, wal_buf.len()));
                         }
                         for (i, op) in b.operations.iter().enumerate() {
                             let seq = w.seq + i as u64;
-                            let mut op_buf = Vec::new();
+                            let start = wal_buf.len();
                             match op {
                                 WriteOp::Put { key, value } => {
                                     WalEntry::encode_to_buf(
@@ -430,7 +431,7 @@ impl DB {
                                         true,
                                         key,
                                         Some(value),
-                                        &mut op_buf,
+                                        &mut wal_buf,
                                     );
                                 }
                                 WriteOp::Delete { key } => {
@@ -440,26 +441,26 @@ impl DB {
                                         false,
                                         key,
                                         None,
-                                        &mut op_buf,
+                                        &mut wal_buf,
                                     );
                                 }
-                                WriteOp::DeleteRange { start, end } => {
+                                WriteOp::DeleteRange { start: rs, end } => {
                                     WalEntry::encode_to_buf(
                                         seq,
                                         OpType::TypeDeleteRange,
                                         true,
-                                        start,
+                                        rs,
                                         Some(end),
-                                        &mut op_buf,
+                                        &mut wal_buf,
                                     );
                                 }
                             }
-                            encoded.push(op_buf);
+                            wal_ranges.push((start, wal_buf.len()));
                         }
                     }
-                    if !encoded.is_empty() {
+                    if !wal_ranges.is_empty() {
                         let mut wal = self.wal.write();
-                        if let Err(e) = wal.append_encoded_write_batch(&encoded, base_seq) {
+                        if let Err(e) = wal.append_encoded_ranges(&wal_buf, &wal_ranges, base_seq) {
                             leader.fail(&e.to_string());
                             return Err(e);
                         }
@@ -500,8 +501,9 @@ impl DB {
                         .store(last_seq, AtomicOrdering::Release);
                 }
 
-                // 一次性唤醒全部 Followers 完成写入 (消除二次 park 与二次唤醒开销)
+                // 一次性唤醒全部 Followers 完成写入并释放 leader_lock, 再在锁外检查 maybe_freeze
                 leader.complete();
+                drop(leader);
 
                 let freeze_started = std::time::Instant::now();
                 self.maybe_freeze()?;

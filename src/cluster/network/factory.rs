@@ -14,6 +14,7 @@ pub struct RaftNetworkClientFactory {
     /// gRPC channel 连接池 — 按 node_id 缓存, 避免每次 RPC 都重新 TCP + HTTP/2 握手.
     /// Docker 容器 DNS 解析 (aikv-N) 每次 50-100ms, 复用 channel 可消除此开销.
     channels: Arc<DashMap<NodeId, RaftServiceClient<tonic::transport::Channel>>>,
+    payload_cache: Arc<super::client::PayloadCache>,
     stats: Option<Arc<Statistics>>,
 }
 
@@ -36,6 +37,7 @@ impl RaftNetworkClientFactory {
             max_message_size,
             nodes: Arc::new(RwLock::new(HashMap::new())),
             channels: Arc::new(DashMap::new()),
+            payload_cache: Arc::new(super::client::PayloadCache::new()),
             stats,
         }
     }
@@ -57,6 +59,8 @@ impl RaftNetworkClientFactory {
             max_message_size: self.max_message_size,
             nodes: Arc::clone(&self.nodes),
             channels: Arc::clone(&self.channels),
+            // 每个 Raft group 有独立的 log_index 空间, 因此按 group 建独立缓存.
+            payload_cache: Arc::new(super::client::PayloadCache::new()),
             stats: self.stats.clone(),
         }
     }
@@ -171,6 +175,7 @@ impl RaftNetworkFactory<TypeConfig> for RaftNetworkClientFactory {
             Some(self.channels.clone()),
             self.stats.clone(),
         )
+        .with_payload_cache(Arc::clone(&self.payload_cache))
     }
 }
 

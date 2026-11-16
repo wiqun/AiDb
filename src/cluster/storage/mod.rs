@@ -167,7 +167,7 @@ impl OpenRaftStorage {
         Arc<
             parking_lot::Mutex<
                 crate::cluster::pending_log::PendingLogOverlay<
-                    <TypeConfig as openraft::RaftTypeConfig>::Entry,
+                    Arc<<TypeConfig as openraft::RaftTypeConfig>::Entry>,
                 >,
             >,
         >,
@@ -276,11 +276,12 @@ impl RaftLogStorage<TypeConfig> for OpenRaftStorage {
         let count = entries_vec.len() as u64;
 
         if let Some(ref committer) = self.committer {
-            // 写入 PendingLogOverlay, 使其立即可读.
+            let last_log_id = entries_vec.last().map(|e| e.log_id);
+            // 写入 PendingLogOverlay, 使其立即可读 (move 进 Arc, 零 entry 深拷贝).
             {
                 let mut ov = committer.overlay.lock();
-                for entry in &entries_vec {
-                    ov.insert_at(entry.log_id.index, entry.clone());
+                for entry in entries_vec {
+                    ov.insert_at(entry.log_id.index, Arc::new(entry));
                 }
             }
 
@@ -291,8 +292,8 @@ impl RaftLogStorage<TypeConfig> for OpenRaftStorage {
                 .note_append(self.group_id, count, started.elapsed());
 
             // 更新 in-memory last_log_id. overlay 已可读, 落盘完成前即可被读取.
-            if let Some(last) = entries_vec.last() {
-                self.state.write().last_log_id = Some(last.log_id);
+            if let Some(last) = last_log_id {
+                self.state.write().last_log_id = Some(last);
             }
 
             Ok(())

@@ -160,7 +160,7 @@ pub struct LogCommitterHandle {
     join: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     pub metrics: Arc<LogCommitterMetrics>,
     pub fatal: Arc<AtomicBool>,
-    pub overlay: Arc<Mutex<PendingLogOverlay<EOf>>>,
+    pub overlay: Arc<Mutex<PendingLogOverlay<Arc<EOf>>>>,
 }
 
 impl LogCommitterHandle {
@@ -339,7 +339,7 @@ async fn run_committer(
     cfg: LogCommitterConfig,
     metrics: Arc<LogCommitterMetrics>,
     _fatal: Arc<AtomicBool>,
-    overlay: Arc<Mutex<PendingLogOverlay<EOf>>>,
+    overlay: Arc<Mutex<PendingLogOverlay<Arc<EOf>>>>,
     before_write: Option<BeforeWriteHook>,
 ) {
     let mut pending_commands: u64 = 0;
@@ -396,9 +396,6 @@ async fn build_batch(
 struct BatchState {
     commands: Vec<IoCommand>,
     entry_count: u64,
-    approx_bytes: usize,
-    #[allow(dead_code)]
-    first_cmd_at: Instant,
 }
 
 impl BatchState {
@@ -410,15 +407,11 @@ impl BatchState {
         Self {
             commands: vec![cmd],
             entry_count,
-            approx_bytes: 0,
-            first_cmd_at: Instant::now(),
         }
     }
 
     fn can_add(&self, cfg: &LogCommitterConfig) -> bool {
-        self.commands.len() < cfg.max_commands
-            && self.entry_count < cfg.max_entries as u64
-            && self.approx_bytes < cfg.max_bytes
+        self.commands.len() < cfg.max_commands && self.entry_count < cfg.max_entries as u64
     }
 
     fn add(&mut self, cmd: IoCommand) {
@@ -435,7 +428,7 @@ async fn flush_batch(
     group_id: u64,
     db: &DbSlot,
     batch: Vec<IoCommand>,
-    overlay: &Arc<Mutex<PendingLogOverlay<EOf>>>,
+    overlay: &Arc<Mutex<PendingLogOverlay<Arc<EOf>>>>,
     metrics: &Arc<LogCommitterMetrics>,
     pending_commands: &mut u64,
     pending_entries: &mut u64,
@@ -510,14 +503,14 @@ async fn flush_batch(
     // `core/sm/worker.rs: assert_eq!(end - 1, got_last_index)`.
     let flushed_generation: u64;
     let mut flushed_indices: Vec<u64> = Vec::new();
-    let batch_entries: Vec<(u64, Vec<EOf>)> = {
+    let batch_entries: Vec<(u64, Vec<Arc<EOf>>)> = {
         let mut ov = overlay.lock();
         flushed_generation = ov.current_generation();
         ov.next_generation(); // 新 insert 进入新 generation
         let mut result = Vec::with_capacity(appends.len());
         for op in &appends {
             let end = op.first_index + op.count;
-            let entries: Vec<EOf> = ov
+            let entries: Vec<Arc<EOf>> = ov
                 .get_range(op.first_index, end)
                 .into_iter()
                 .cloned()
@@ -534,7 +527,7 @@ async fn flush_batch(
     let last_log_id = batch_entries
         .last()
         .and_then(|(_, entries)| entries.last())
-        .map(|entry| entry.log_id.clone());
+        .map(|entry| entry.log_id);
     let total_cmds_val =
         (appends.len() + truncates.len() + purges.len() + usize::from(vote_to_save.is_some()))
             as u64;
@@ -710,7 +703,7 @@ fn queue_log_purge(
 fn sync_flush(
     db: &Arc<DB>,
     group_id: u64,
-    append_batches: &[(u64, Vec<EOf>)],
+    append_batches: &[(u64, Vec<Arc<EOf>>)],
     vote: Option<VOf>,
     truncate_data: &[(Option<LIdOf>,)],
     purge_data: &[(u64, LIdOf)],
@@ -729,7 +722,7 @@ fn sync_flush(
         for (_, entries) in append_batches {
             for entry in entries {
                 let key = keys::log_key(group_id, entry.log_id.index);
-                let data = rmp_serde::to_vec(entry)
+                let data = rmp_serde::to_vec(entry.as_ref())
                     .map_err(|e| ClusterError::Serialization(e.to_string()))?;
                 batch.put(key, data);
             }
@@ -765,8 +758,8 @@ fn sync_flush(
 
             // 保留的最后一条就是 `lid.index`, 直接落盘该 log_id. 不回读 DB:
             // 这条 entry 可能仍在 overlay 未落盘, 回读落空会留下过期的 last_log_id.
-            let lid_data = rmp_serde::to_vec(&lid)
-                .map_err(|e| ClusterError::Serialization(e.to_string()))?;
+            let lid_data =
+                rmp_serde::to_vec(&lid).map_err(|e| ClusterError::Serialization(e.to_string()))?;
             let mut b = WriteBatch::new();
             b.put(keys::last_log_id_key(group_id), lid_data);
             db.write(&b)?;
@@ -783,7 +776,9 @@ fn sync_flush(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cluster::storage::keys::{last_log_id_key, last_purged_log_id_key, log_key, vote_key};
+    use crate::cluster::storage::keys::{
+        last_log_id_key, last_purged_log_id_key, log_key, vote_key,
+    };
     use crate::cluster::types::Request;
     use crate::config::Options;
     use openraft::vote::leader_id_std::CommittedLeaderId;
@@ -810,12 +805,16 @@ mod tests {
     #[tokio::test]
     async fn test_append_and_flush() {
         let (_dir, db) = setup_db();
-        let handle = spawn_committer(1, Arc::new(parking_lot::RwLock::new(db.clone())), LogCommitterConfig::default());
+        let handle = spawn_committer(
+            1,
+            Arc::new(parking_lot::RwLock::new(db.clone())),
+            LogCommitterConfig::default(),
+        );
 
         {
             let mut ov = handle.overlay.lock();
-            ov.insert_at(1, mk_entry(1, 1));
-            ov.insert_at(2, mk_entry(2, 1));
+            ov.insert_at(1, Arc::new(mk_entry(1, 1)));
+            ov.insert_at(2, Arc::new(mk_entry(2, 1)));
         }
 
         handle.append(1, 2).await.unwrap();
@@ -831,7 +830,11 @@ mod tests {
     #[tokio::test]
     async fn test_save_vote() {
         let (_dir, db) = setup_db();
-        let handle = spawn_committer(1, Arc::new(parking_lot::RwLock::new(db.clone())), LogCommitterConfig::default());
+        let handle = spawn_committer(
+            1,
+            Arc::new(parking_lot::RwLock::new(db.clone())),
+            LogCommitterConfig::default(),
+        );
 
         let vote = VOf {
             leader_id: LeaderId {
@@ -856,13 +859,17 @@ mod tests {
     #[tokio::test]
     async fn test_truncate_after() {
         let (_dir, db) = setup_db();
-        let handle = spawn_committer(1, Arc::new(parking_lot::RwLock::new(db.clone())), LogCommitterConfig::default());
+        let handle = spawn_committer(
+            1,
+            Arc::new(parking_lot::RwLock::new(db.clone())),
+            LogCommitterConfig::default(),
+        );
 
         {
             let mut ov = handle.overlay.lock();
-            ov.insert_at(1, mk_entry(1, 1));
-            ov.insert_at(2, mk_entry(2, 1));
-            ov.insert_at(3, mk_entry(3, 1));
+            ov.insert_at(1, Arc::new(mk_entry(1, 1)));
+            ov.insert_at(2, Arc::new(mk_entry(2, 1)));
+            ov.insert_at(3, Arc::new(mk_entry(3, 1)));
         }
         handle.append(1, 3).await.unwrap();
 
@@ -889,13 +896,17 @@ mod tests {
     #[tokio::test]
     async fn test_purge_upto() {
         let (_dir, db) = setup_db();
-        let handle = spawn_committer(1, Arc::new(parking_lot::RwLock::new(db.clone())), LogCommitterConfig::default());
+        let handle = spawn_committer(
+            1,
+            Arc::new(parking_lot::RwLock::new(db.clone())),
+            LogCommitterConfig::default(),
+        );
 
         {
             let mut ov = handle.overlay.lock();
-            ov.insert_at(1, mk_entry(1, 1));
-            ov.insert_at(2, mk_entry(2, 1));
-            ov.insert_at(3, mk_entry(3, 1));
+            ov.insert_at(1, Arc::new(mk_entry(1, 1)));
+            ov.insert_at(2, Arc::new(mk_entry(2, 1)));
+            ov.insert_at(3, Arc::new(mk_entry(3, 1)));
         }
         handle.append(1, 3).await.unwrap();
 
@@ -933,7 +944,14 @@ mod tests {
         sync_flush(
             &db,
             1,
-            &[(1, vec![mk_entry(1, 1), mk_entry(2, 1), mk_entry(3, 1)])],
+            &[(
+                1,
+                vec![
+                    Arc::new(mk_entry(1, 1)),
+                    Arc::new(mk_entry(2, 1)),
+                    Arc::new(mk_entry(3, 1)),
+                ],
+            )],
             None,
             &[],
             &[(0, purge_to)],
@@ -947,7 +965,7 @@ mod tests {
         sync_flush(
             &db,
             1,
-            &[(4, vec![mk_entry(4, 1)])],
+            &[(4, vec![Arc::new(mk_entry(4, 1))])],
             None,
             &[],
             &[(3, LogId::new(CommittedLeaderId::new(1), 3))],
@@ -995,11 +1013,16 @@ mod tests {
                 .recv()
                 .map_err(|_| ClusterError::Internal("flush gate dropped".into()))?
         });
-        let handle = spawn_committer_for_test(1, Arc::new(parking_lot::RwLock::new(db.clone())), LogCommitterConfig::default(), hook);
+        let handle = spawn_committer_for_test(
+            1,
+            Arc::new(parking_lot::RwLock::new(db.clone())),
+            LogCommitterConfig::default(),
+            hook,
+        );
         {
             let mut ov = handle.overlay.lock();
-            ov.insert_at(1, mk_entry(1, 1));
-            ov.insert_at(2, mk_entry(2, 1));
+            ov.insert_at(1, Arc::new(mk_entry(1, 1)));
+            ov.insert_at(2, Arc::new(mk_entry(2, 1)));
         }
         let (cb1, rx1) = signal_callback();
         let (cb2, mut rx2) = signal_callback();
@@ -1032,11 +1055,16 @@ mod tests {
         let (_dir, db) = setup_db();
         let hook: BeforeWriteHook =
             Arc::new(|| Err(ClusterError::Internal("injected write failure".into()).into()));
-        let handle = spawn_committer_for_test(1, Arc::new(parking_lot::RwLock::new(db.clone())), LogCommitterConfig::default(), hook);
+        let handle = spawn_committer_for_test(
+            1,
+            Arc::new(parking_lot::RwLock::new(db.clone())),
+            LogCommitterConfig::default(),
+            hook,
+        );
         {
             let mut ov = handle.overlay.lock();
-            ov.insert_at(1, mk_entry(1, 1));
-            ov.insert_at(2, mk_entry(2, 1));
+            ov.insert_at(1, Arc::new(mk_entry(1, 1)));
+            ov.insert_at(2, Arc::new(mk_entry(2, 1)));
         }
         let (cb, rx) = signal_callback();
         handle.submit_append(1, 2, cb).unwrap();
@@ -1058,10 +1086,15 @@ mod tests {
         let (_dir, db) = setup_db();
         let hook: BeforeWriteHook =
             Arc::new(|| Err(ClusterError::Internal("injected write failure".into()).into()));
-        let handle = spawn_committer_for_test(1, Arc::new(parking_lot::RwLock::new(db.clone())), LogCommitterConfig::default(), hook);
+        let handle = spawn_committer_for_test(
+            1,
+            Arc::new(parking_lot::RwLock::new(db.clone())),
+            LogCommitterConfig::default(),
+            hook,
+        );
         {
             let mut ov = handle.overlay.lock();
-            ov.insert_at(1, mk_entry(1, 1));
+            ov.insert_at(1, Arc::new(mk_entry(1, 1)));
         }
         let (cb, rx) = signal_callback();
         handle.submit_append(1, 1, cb).unwrap();

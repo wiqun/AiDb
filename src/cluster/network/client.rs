@@ -19,7 +19,51 @@ pub struct RaftNetworkClient {
     request_timeout: Duration,
     group_id: u64,
     max_message_size: usize,
+    payload_cache: Option<Arc<PayloadCache>>,
     stats: Option<Arc<Statistics>>,
+}
+
+const PAYLOAD_CACHE_SLOTS: usize = 64;
+
+type PayloadSlots = Vec<Option<(u64, u64, Vec<u8>)>>;
+
+/// 共享的近期 LogEntry payload 序列化缓存, 避免 Leader 向多个副本广播同一批日志时
+/// 重复执行 `rmp_serde::to_vec`.
+pub(super) struct PayloadCache {
+    slots: parking_lot::Mutex<PayloadSlots>,
+}
+
+impl PayloadCache {
+    pub(super) fn new() -> Self {
+        Self {
+            slots: parking_lot::Mutex::new(vec![None; PAYLOAD_CACHE_SLOTS]),
+        }
+    }
+
+    pub(super) fn get_or_serialize(
+        &self,
+        entry: &crate::cluster::types::LogEntry,
+    ) -> std::result::Result<Vec<u8>, RPCError<TypeConfig>> {
+        let idx = entry.log_id.index;
+        let term = entry.log_id.leader_id.term;
+        let slot = (idx as usize) & (PAYLOAD_CACHE_SLOTS - 1);
+        {
+            let guard = self.slots.lock();
+            if let Some((cached_idx, cached_term, ref bytes)) = guard[slot] {
+                if cached_idx == idx && cached_term == term {
+                    return Ok(bytes.clone());
+                }
+            }
+        }
+        let bytes = rmp_serde::to_vec(&entry.payload).map_err(|e| {
+            RPCError::Network(NetworkError::<TypeConfig>::new(
+                &Unreachable::<TypeConfig>::new(&e),
+            ))
+        })?;
+        let mut guard = self.slots.lock();
+        guard[slot] = Some((idx, term, bytes.clone()));
+        Ok(bytes)
+    }
 }
 
 /// 单片上限, 留在 gRPC 默认 64MB 消息限制之内.
@@ -49,8 +93,14 @@ impl RaftNetworkClient {
             request_timeout: Duration::from_millis(rpc_timeout_ms),
             group_id,
             max_message_size: max_message_size as usize,
+            payload_cache: None,
             stats,
         }
+    }
+
+    pub(super) fn with_payload_cache(mut self, cache: Arc<PayloadCache>) -> Self {
+        self.payload_cache = Some(cache);
+        self
     }
 
     /// 对端网络不可达时失效连接池缓存, 迫使下个 RPC 重新解析地址并建连.
@@ -344,6 +394,7 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkClient {
         }
         let req_timeout = self.request_timeout;
         let group_id = self.group_id;
+        let payload_cache = self.payload_cache.clone();
         let client = match self.get_client().await {
             Ok(c) => c,
             Err(e) => {
@@ -352,22 +403,7 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkClient {
             }
         };
 
-        let mut entries = Vec::new();
-        for entry in rpc.entries {
-            let payload = rmp_serde::to_vec(&entry.payload).map_err(|e| {
-                RPCError::Network(NetworkError::<TypeConfig>::new(
-                    &Unreachable::<TypeConfig>::new(&e),
-                ))
-            })?;
-            entries.push(raft_rpc::LogEntry {
-                log_index: entry.log_id.index,
-                log_term: entry.log_id.leader_id.term,
-                log_leader_id: 0, // v0.10 std mode CommittedLeaderId only has term
-                payload,
-                is_blank: matches!(entry.payload, openraft::EntryPayload::Blank),
-                is_membership: matches!(entry.payload, openraft::EntryPayload::Membership(_)),
-            });
-        }
+        let entries = encode_log_entries(&rpc.entries, payload_cache.as_deref())?;
 
         let request = raft_rpc::AppendEntriesRequest {
             group_id,
@@ -592,5 +628,67 @@ fn map_rpc_status_error(rpc_name: &str, status: tonic::Status) -> Error {
             "{rpc_name} failed: {}",
             status.message()
         ))),
+    }
+}
+
+pub(super) fn encode_log_entries(
+    raw_entries: &[crate::cluster::types::LogEntry],
+    cache: Option<&PayloadCache>,
+) -> std::result::Result<Vec<raft_rpc::LogEntry>, RPCError<TypeConfig>> {
+    let mut entries = Vec::with_capacity(raw_entries.len());
+    for entry in raw_entries {
+        let payload = match cache {
+            Some(c) => c.get_or_serialize(entry)?,
+            None => rmp_serde::to_vec(&entry.payload).map_err(|e| {
+                RPCError::Network(NetworkError::<TypeConfig>::new(
+                    &Unreachable::<TypeConfig>::new(&e),
+                ))
+            })?,
+        };
+        entries.push(raft_rpc::LogEntry {
+            log_index: entry.log_id.index,
+            log_term: entry.log_id.leader_id.term,
+            log_leader_id: 0, // v0.10 std mode CommittedLeaderId only has term
+            payload,
+            is_blank: matches!(entry.payload, openraft::EntryPayload::Blank),
+            is_membership: matches!(entry.payload, openraft::EntryPayload::Membership(_)),
+        });
+    }
+    Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cluster::network::server::decode_log_entries;
+    use openraft::vote::leader_id_std::CommittedLeaderId;
+    use openraft::{EntryPayload, LogId};
+
+    #[test]
+    fn test_encode_append_entries_preallocates_and_roundtrips() {
+        let cache = PayloadCache::new();
+        let e1 = crate::cluster::types::LogEntry {
+            log_id: LogId::new(CommittedLeaderId::new(2), 10),
+            payload: EntryPayload::Normal(Request::Put {
+                key: b"k1".to_vec(),
+                value: bytes::Bytes::from_static(b"v1"),
+            }),
+        };
+        let e2 = crate::cluster::types::LogEntry {
+            log_id: LogId::new(CommittedLeaderId::new(2), 11),
+            payload: EntryPayload::Blank,
+        };
+        let input = vec![e1, e2];
+
+        let encoded1 = encode_log_entries(&input, Some(&cache)).expect("encode first");
+        let encoded2 = encode_log_entries(&input, Some(&cache)).expect("encode cached");
+        assert_eq!(encoded1.len(), 2);
+        assert_eq!(encoded1[0].payload, encoded2[0].payload);
+
+        let decoded = decode_log_entries(encoded2).expect("decode");
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].log_id.index, 10);
+        assert_eq!(decoded[1].log_id.index, 11);
+        assert!(matches!(decoded[1].payload, EntryPayload::Blank));
     }
 }
