@@ -254,32 +254,20 @@ impl RaftNetworkClient {
               "gRPC: lazy connect (channel not cached)",
             );
             let req_timeout = self.request_timeout;
-            let target_addr = self.target_addr.clone();
-            let connect_fut = RaftServiceClient::connect(target_addr);
-            let client = match tokio::time::timeout(req_timeout, connect_fut).await {
-                Ok(Ok(c)) => c,
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                      target_addr = %self.target_addr,
-                      error = %e,
-                      "gRPC client connect failed",
-                    );
-                    return Err(NetworkError::<TypeConfig>::new(
-                        &Unreachable::<TypeConfig>::new(&e),
-                    ));
+            let client =
+                match super::factory::connect_raft_client(&self.target_addr, req_timeout).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(
+                          target_addr = %self.target_addr,
+                          error = %e,
+                          "gRPC client connect failed",
+                        );
+                        return Err(e);
+                    }
                 }
-                Err(_) => {
-                    let io_err = std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!("gRPC connect timeout after {}ms", req_timeout.as_millis()),
-                    );
-                    return Err(NetworkError::<TypeConfig>::new(
-                        &Unreachable::<TypeConfig>::new(&io_err),
-                    ));
-                }
-            }
-            .max_decoding_message_size(self.max_message_size)
-            .max_encoding_message_size(self.max_message_size);
+                .max_decoding_message_size(self.max_message_size)
+                .max_encoding_message_size(self.max_message_size);
             self.client = Some(client);
         }
         Ok(self.client.as_mut().unwrap())
@@ -305,13 +293,17 @@ impl RaftNetworkClient {
             Ok(Err(e)) => {
                 self.invalidate_on_unavailable(&e);
                 if e.code() == tonic::Code::Unavailable {
-                    return Err(openraft::error::StreamingError::Unreachable(
-                        Unreachable::<TypeConfig>::new(&e),
-                    ));
+                    return Err(openraft::error::StreamingError::Unreachable(Unreachable::<
+                        TypeConfig,
+                    >::new(
+                        &e
+                    )));
                 }
-                Err(openraft::error::StreamingError::Network(
-                    NetworkError::<TypeConfig>::new(&e),
-                ))
+                Err(openraft::error::StreamingError::Network(NetworkError::<
+                    TypeConfig,
+                >::new(
+                    &e
+                )))
             }
             Err(_) => {
                 let io_err = std::io::Error::new(
@@ -321,9 +313,11 @@ impl RaftNetworkClient {
                         SNAPSHOT_RPC_TIMEOUT.as_millis()
                     ),
                 );
-                Err(openraft::error::StreamingError::Unreachable(
-                    Unreachable::<TypeConfig>::new(&io_err),
-                ))
+                Err(openraft::error::StreamingError::Unreachable(Unreachable::<
+                    TypeConfig,
+                >::new(
+                    &io_err
+                )))
             }
         }
     }

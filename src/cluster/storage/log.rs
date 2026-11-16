@@ -151,7 +151,8 @@ impl OpenRaftStorage {
         } else {
             let prev = log_key(self.group_id, log_id.index - 1);
             state.last_log_id = self
-                .db.read()
+                .db
+                .read()
                 .get(&prev)?
                 .and_then(|data| rmp_serde::from_slice(&data).ok())
                 .map(|e: <TypeConfig as openraft::RaftTypeConfig>::Entry| e.log_id);
@@ -189,7 +190,9 @@ impl OpenRaftStorage {
         self.state.write().last_purged_log_id = Some(log_id);
         let data =
             rmp_serde::to_vec(&log_id).map_err(|e| ClusterError::Serialization(e.to_string()))?;
-        self.db.read().put(&last_purged_log_id_key(self.group_id), &data)?;
+        self.db
+            .read()
+            .put(&last_purged_log_id_key(self.group_id), &data)?;
         Ok(())
     }
 
@@ -271,7 +274,12 @@ impl OpenRaftStorage {
             self.try_deser_or_clean::<LIdOf>(&last_log_id_key(gid), "last_log_id", &mut state)?
         {
             // 验证该 index 的 log entry 确实存在 (防止被手动删除导致的悬挂指针).
-            if self.db.read().get(&log_key(gid, persisted.index))?.is_some() {
+            if self
+                .db
+                .read()
+                .get(&log_key(gid, persisted.index))?
+                .is_some()
+            {
                 state.last_log_id = Some(persisted);
             } else {
                 // 持久化 key 存在但 log entry 丢失 (异常情况), 走 fallback.
@@ -290,11 +298,16 @@ impl OpenRaftStorage {
         );
 
         let _ = self
-            .db.read()
+            .db
+            .read()
             .delete_range(snapshot_temp_global_start(), snapshot_temp_global_end());
 
         // Clean up any leftover snapshot temp files from previous crash
-        let temp_path = self.db.read().path().join(format!(".snapshot_temp_{}", gid));
+        let temp_path = self
+            .db
+            .read()
+            .path()
+            .join(format!(".snapshot_temp_{}", gid));
         let _ = std::fs::remove_file(&temp_path);
 
         if self.db.read().get(&membership_key(gid))?.is_none() {
@@ -340,6 +353,7 @@ impl OpenRaftStorage {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn read_last_applied_from_db(&self) -> Result<Option<LIdOf>> {
         match self.db.read().get(&last_applied_key(self.group_id))? {
             None => Ok(None),
@@ -515,7 +529,8 @@ mod tests {
         storage.save_vote_internal(&vote).unwrap();
         assert_eq!(storage.state.read().vote, Some(vote));
         assert!(storage
-            .db.read()
+            .db
+            .read()
             .get(&vote_key(DEFAULT_GROUP_ID))
             .unwrap()
             .is_some());
@@ -532,7 +547,8 @@ mod tests {
         assert_eq!(read[0].log_id.index, 1);
         assert_eq!(read[1].log_id.index, 2);
         assert!(storage
-            .db.read()
+            .db
+            .read()
             .get(&log_key(DEFAULT_GROUP_ID, 1))
             .unwrap()
             .is_some());

@@ -71,6 +71,30 @@ fn phase_gap_us(client_write_us: u64, append_us: u64, apply_us: u64) -> u64 {
     client_write_us.saturating_sub(append_us.saturating_add(apply_us))
 }
 
+fn build_openraft_config(config: &RaftNodeConfig) -> Result<Config> {
+    let tick_interval = config.heartbeat_interval * 13 / 64;
+    let max_min = config.election_timeout_min.saturating_sub(
+        config
+            .heartbeat_interval
+            .saturating_add(tick_interval)
+            .saturating_add(1),
+    );
+    let min_interval = config.heartbeat_interval.min(max_min);
+
+    Config {
+        cluster_name: format!("aidb-raft-{}", config.group_id),
+        election_timeout_min: config.election_timeout_min,
+        election_timeout_max: config.election_timeout_max,
+        heartbeat_interval: config.heartbeat_interval,
+        heartbeat_min_interval: (min_interval > 0).then_some(min_interval),
+        max_payload_entries: config.max_payload_entries,
+        snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(config.snapshot_logs_since_last),
+        ..Default::default()
+    }
+    .validate()
+    .map_err(|e| Error::Cluster(ClusterError::InvalidConfig(e.to_string())))
+}
+
 fn note_slow_propose(
     group_id: u64,
     request: &Request,
@@ -142,9 +166,10 @@ impl OpenRaftNode {
         }
 
         // 可选: 创建 LogCommitter. 和状态机共用一个槽, 安装快照换库时两边一起换.
-        let committer = config.log_committer_config.as_ref().map(|cfg| {
-            spawn_committer(config.group_id, Arc::clone(&db_slot), cfg.clone())
-        });
+        let committer = config
+            .log_committer_config
+            .as_ref()
+            .map(|cfg| spawn_committer(config.group_id, Arc::clone(&db_slot), cfg.clone()));
 
         let opened = db_slot.read().clone();
         let storage =
@@ -167,19 +192,7 @@ impl OpenRaftNode {
             )));
         }
 
-        let raft_config = Config {
-            cluster_name: format!("aidb-raft-{}", config.group_id),
-            election_timeout_min: config.election_timeout_min,
-            election_timeout_max: config.election_timeout_max,
-            heartbeat_interval: config.heartbeat_interval,
-            max_payload_entries: config.max_payload_entries,
-            snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(
-                config.snapshot_logs_since_last,
-            ),
-            ..Default::default()
-        }
-        .validate()
-        .map_err(|e| Error::Cluster(ClusterError::InvalidConfig(e.to_string())))?;
+        let raft_config = build_openraft_config(&config)?;
 
         let network_factory_arc = Arc::new(RwLock::new(network_factory));
         let network_for_raft = network_factory_arc.read().clone();
@@ -418,7 +431,7 @@ impl OpenRaftNode {
             .unwrap_or(false)
     }
 
-    fn check_entry_size(&self, request: &Request) -> Result<()> {
+    fn check_entry_size(&self, request: &Request) -> Result<u64> {
         let size = request.estimated_serialized_size() as u64;
         if size > self.max_entry_size {
             return Err(Error::Cluster(ClusterError::InvalidConfig(format!(
@@ -426,7 +439,7 @@ impl OpenRaftNode {
                 self.max_entry_size
             ))));
         }
-        Ok(())
+        Ok(size)
     }
 
     pub async fn propose(&self, request: Request) -> Result<Response> {
@@ -436,8 +449,7 @@ impl OpenRaftNode {
 
     async fn propose_inner(&self, request: Request) -> Result<Response> {
         let t0 = std::time::Instant::now();
-        self.check_entry_size(&request)?;
-        let estimated_size = request.estimated_serialized_size() as u64;
+        let estimated_size = self.check_entry_size(&request)?;
         // Retry on ForwardToLeader — during leader re-election, the first
         // forward target may itself be in transition.  Up to 3 retries with
         // 200ms backoff.
@@ -908,6 +920,28 @@ mod tests {
     fn phase_gap_is_client_write_minus_append_and_apply() {
         assert_eq!(phase_gap_us(961_405, 1_000, 2_000), 958_405);
         assert_eq!(phase_gap_us(100, 80, 50), 0);
+    }
+
+    #[test]
+    fn test_build_openraft_config_sets_heartbeat_min_interval() {
+        let cfg = RaftNodeConfig {
+            heartbeat_interval: 100,
+            election_timeout_min: 500,
+            election_timeout_max: 800,
+            ..Default::default()
+        };
+        let built = build_openraft_config(&cfg).expect("valid openraft config");
+        assert_eq!(built.heartbeat_min_interval, Some(100));
+
+        let tight = RaftNodeConfig {
+            heartbeat_interval: 100,
+            election_timeout_min: 130,
+            election_timeout_max: 200,
+            ..Default::default()
+        };
+        let built_tight = build_openraft_config(&tight).expect("clamped config valid");
+        assert!(built_tight.heartbeat_min_interval.is_some());
+        assert!(built_tight.heartbeat_min_interval.unwrap() < 100);
     }
 
     #[tokio::test]
