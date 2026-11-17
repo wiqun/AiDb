@@ -1,0 +1,40 @@
+{
+  "options": {
+    "create_if_missing": true,
+    "max_open_files": 1000,
+    "memtable_size": 134217728,
+    "max_write_buffer_number": 4,
+    "block_size": 16384,
+    "block_cache_size": 268435456,
+    "row_cache_size": 33554432,
+    "compression": "snap",
+    "bloom_false_positive_rate": 0.01,
+    "use_wal": true,
+    "sync_wal": false,
+    "max_wal_size": 67108864,
+    "group_commit_batch_us": 0,
+    "level0_compaction_trigger": 4,
+    "level0_slowdown_writes_trigger": 8,
+    "level0_stop_writes_trigger": 16,
+    "compaction_threads": 2
+  },
+  "cluster": {
+    "group_count": 256,
+    "replication_factor": 3,
+    "max_log_entries": 1000,
+    "max_log_size_bytes": 67108864,
+    "migration": {
+      "max_batch_size": 1000,
+      "progress_report_interval": 100,
+      "max_retries": 3,
+      "retry_base_delay_ms": 1000,
+      "verify_sample_factor": 1.0
+    }
+  },
+  "log_committer": {
+    "max_commands": 64,
+    "max_entries": 512,
+    "max_bytes": 2097152,
+    "delay_us": 0
+  }
+}

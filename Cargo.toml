@@ -120,6 +120,10 @@ harness = false
 name = "backup"
 required-features = ["backup"]
 
+[[example]]
+name = "config_from_json"
+required-features = ["backup", "cluster"]
+
 [profile.release]
 lto            = true
 codegen-units  = 1

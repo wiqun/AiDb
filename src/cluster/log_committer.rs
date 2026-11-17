@@ -43,7 +43,8 @@ pub(crate) type VOf = Vote<LeaderId<u64, u64>>;
 // ── Configuration ──
 
 /// LogCommitter 配置参数.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct LogCommitterConfig {
     /// 单个 batch 最多聚合的 IoCommand 数.
     pub max_commands: usize,
