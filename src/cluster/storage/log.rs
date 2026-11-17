@@ -179,7 +179,7 @@ impl OpenRaftStorage {
         let start_key = log_key(self.group_id, start_index);
         let end_key = log_key(self.group_id, log_id.index.saturating_add(1));
         self.db.read().delete_range(&start_key, &end_key)?;
-        tracing::info!(
+        tracing::debug!(
             target: "perf",
             group_id = self.group_id,
             from_index = start_index,
@@ -258,7 +258,7 @@ impl OpenRaftStorage {
         }
 
         if let Some(data) = self.db.read().get(&snapshot_meta_key(gid))? {
-            tracing::warn!(
+            tracing::debug!(
                 key = "snapshot_meta",
                 len = data.len(),
                 "load_state: found key, deserializing"

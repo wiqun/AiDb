@@ -161,7 +161,6 @@ impl MemTable {
         let val = Arc::from(value);
         self.rep.insert(ik, val);
         self.entry_count.fetch_add(1, Ordering::Relaxed);
-        tracing::debug!(target: "mem", "mem.put");
         self.sync_active_metric();
         Ok(())
     }
@@ -175,7 +174,6 @@ impl MemTable {
         ));
         self.rep.insert(ik, Arc::from(&[] as &[u8]));
         self.entry_count.fetch_add(1, Ordering::Relaxed);
-        tracing::debug!(target: "mem", "mem.delete");
         self.sync_active_metric();
         Ok(())
     }
@@ -198,7 +196,6 @@ impl MemTable {
             sequence,
         });
         index.fragments = FragmentedRangeTombstones::from_records(index.records.iter().cloned());
-        tracing::debug!(target: "mem", "mem.put_range_delete");
         self.sync_active_metric();
         Ok(())
     }
@@ -248,16 +245,8 @@ impl MemTable {
                 self.search(seek_key)
             })?;
         match found {
-            Some((value, ValueType::TypePut)) => {
-                tracing::debug!(target: "mem", "mem.get.hit");
-                Ok(Some(value.as_ref().to_vec()))
-            }
-            Some((_, ValueType::TypeDelete)) | Some((_, ValueType::TypeRangeDelete)) => {
-                tracing::debug!(target: "mem", "mem.get.miss");
-                Ok(None)
-            }
-            None => {
-                tracing::debug!(target: "mem", "mem.get.miss");
+            Some((value, ValueType::TypePut)) => Ok(Some(value.as_ref().to_vec())),
+            Some((_, ValueType::TypeDelete)) | Some((_, ValueType::TypeRangeDelete)) | None => {
                 Ok(None)
             }
         }
@@ -295,10 +284,18 @@ impl MemTable {
     }
 
     pub fn freeze(self, flush_seq: u64) -> ImmutableMemTable {
-        tracing::info!(target: "mem", "mem.freeze");
+        let approx_bytes = self.approximate_size();
+        let entries = self.entry_count.load(Ordering::Relaxed);
+        tracing::info!(
+            target: "mem",
+            flush_seq,
+            entries,
+            approx_bytes,
+            "mem.freeze"
+        );
         if let Some(ref s) = self.stats {
             s.memtable_size_bytes[0].store(0, Ordering::Relaxed);
-            s.memtable_size_bytes[1].fetch_add(self.approximate_size() as u64, Ordering::Relaxed);
+            s.memtable_size_bytes[1].fetch_add(approx_bytes as u64, Ordering::Relaxed);
         }
         ImmutableMemTable {
             table: self,

@@ -1,13 +1,13 @@
-//! BlockCache 模块级 dataflow — cache hit / miss event
+//! BlockCache 模块级 dataflow — 统计计数器与无热路径 Span 契约
 //! @component aidb-cache
 
 use aidb::engine::cache::{BlockCache, CacheKey};
 use bytes::Bytes;
 
 use crate::common::dataflow::capture_spans_under_lock;
-use crate::common::observability::{capture_events_under_lock, tracing_test_lock};
+use crate::common::observability::tracing_test_lock;
 
-/// 验证 BlockCache Hit 与 Miss 的可观测性跟踪日志
+/// 验证 BlockCache Hit 与 Miss 统计计数器正确性及无热路径 Span 契约
 #[test]
 fn test_cache_observability() {
     let _lock = tracing_test_lock();
@@ -36,13 +36,15 @@ fn test_cache_observability() {
     });
     assert!(hit_caps.spans_named("cache_get").is_empty());
 
-    let events = capture_events_under_lock(|| {
-        cache.reset_stats();
-        let _ = cache.get(key.clone());
-        let _ = cache.get(key);
+    cache.reset_stats();
+    let _ = cache.get(key.clone());
+    let _ = cache.get(key);
+    let _ = cache.get(CacheKey {
+        file_number: 99,
+        offset: 0,
     });
-    assert!(
-        events.iter().any(|e| e.contains("cache.hit")),
-        "missing cache.hit event, got: {events:?}"
-    );
+    let stats = cache.stats();
+    assert_eq!(stats.hits, 2);
+    assert_eq!(stats.misses, 1);
+    assert_eq!(stats.lookups, 3);
 }

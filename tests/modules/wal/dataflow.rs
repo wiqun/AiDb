@@ -1,40 +1,32 @@
-//! WAL 模块级 dataflow — Writer event 时序
+//! WAL 模块级 dataflow — Writer 写入与同步落盘
 //! @component aidb-wal
 
-use crate::common::observability::capture_events_under_lock;
+use aidb::engine::wal::reader::Reader;
 use aidb::engine::wal::record::RecordType;
 use aidb::engine::wal::writer::Writer;
 use tempfile::tempdir;
 
-/// 验证 WAL Writer 事件顺序与追踪记录正确性
+/// 验证 WAL Writer 写入、同步后文件持久化且可被 Reader 完整读回
 #[test]
 fn test_wal_event_order() {
     let d = tempdir().unwrap();
     let path = d.path().join("order.log");
-    let events = capture_events_under_lock(|| {
+    {
         let mut w = Writer::open(&path).unwrap();
         w.write_record(RecordType::Full, b"t").unwrap();
         w.sync_data().unwrap();
-    });
-
-    let pos = |needle: &str| -> Option<usize> { events.iter().position(|e| e.contains(needle)) };
-    for needle in [
-        "wal.write.start",
-        "wal.write.complete",
-        "wal.sync.start",
-        "wal.sync.complete",
-    ] {
-        assert!(
-            events.iter().any(|e| e.contains(needle)),
-            "missing event {needle:?}, got: {events:?}"
-        );
     }
+
+    let meta = std::fs::metadata(&path).unwrap();
     assert!(
-        pos("wal.write.start").unwrap() < pos("wal.write.complete").unwrap(),
-        "write.start must precede write.complete, got: {events:?}"
+        meta.len() > 0,
+        "WAL file must be non-empty after write+sync"
     );
-    assert!(
-        pos("wal.sync.start").unwrap() < pos("wal.sync.complete").unwrap(),
-        "sync.start must precede sync.complete, got: {events:?}"
-    );
+
+    let mut r = Reader::open(&path).unwrap();
+    let rec = r.read_record().unwrap();
+    assert!(matches!(
+        rec,
+        aidb::engine::wal::reader::ReadStatus::Record(RecordType::Full, ref data) if data == b"t"
+    ));
 }

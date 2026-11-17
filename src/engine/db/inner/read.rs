@@ -279,7 +279,6 @@ impl DB {
         let snapshot_id = self.snapshots.register(seq);
         drop(_guard);
         self.stats.operations[DbOp::Snapshot as usize].fetch_add(1, AtomicOrdering::Relaxed);
-        tracing::debug!(target: "db", sequence = seq, id = snapshot_id, "db.snapshot.create");
         Ok(Snapshot::new(Arc::clone(self), seq, snapshot_id))
     }
 
@@ -310,7 +309,6 @@ impl DB {
         let mem = self.memtable.read();
         let imm = self.immutable_memtables.read();
         let sst = self.sstables.read();
-        tracing::debug!(target: "db", "db.scan.complete");
         Ok(crate::engine::db::DBIterator::new(
             &mem,
             &imm,

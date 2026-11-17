@@ -132,10 +132,19 @@ pub struct DB {
     /// 全局写停顿状态原子标志: 仅当触发 L0/MemTable/LevelSize stall 时为 true.
     /// 前台写路径通过 Relaxed 检查实现纳秒级短路, 消除正常写入下的全层读锁遍历开销.
     write_stall_active: AtomicBool,
+    /// 边沿触发写停顿日志状态: 记录当前活跃 stall 类型与进入时刻.
+    write_stall_state: Mutex<Option<(crate::statistics::WriteStallKind, std::time::Instant)>>,
     pub(crate) stats: Arc<Statistics>,
 }
 
 impl DB {
+    /// 提取 DB 目录末级名称作为日志标识 (不暴露完整宿主路径).
+    pub(super) fn db_id(&self) -> &str {
+        self.path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("db")
+    }
     /// 访问当前 DB 绑定的行级缓存句柄
     pub fn row_cache(&self) -> &Arc<RowCache> {
         &self.row_cache
@@ -340,6 +349,7 @@ impl DB {
             l0_sstable_count: AtomicUsize::new(l0_sstable_count_init),
             sst_range_tombstones: RwLock::new(sst_range_tombstones),
             write_stall_active: AtomicBool::new(false),
+            write_stall_state: Mutex::new(None),
             stats: Arc::clone(&stats),
         });
 

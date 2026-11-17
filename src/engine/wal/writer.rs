@@ -186,7 +186,6 @@ impl Writer {
     /// 写一条完整的单块 Record (自动处理 block padding).
     /// data 长度必须 ≤ BLOCK_SIZE - HEADER_SIZE.
     fn write_one_record(&mut self, record_type: RecordType, data: &[u8]) -> Result<()> {
-        tracing::debug!(target: "wal", "wal.write.start: record_type={:?} record_size={}", record_type, data.len() + HEADER_SIZE);
         let data_len = data.len();
         let needed = HEADER_SIZE + data_len;
 
@@ -228,31 +227,20 @@ impl Writer {
 
         self.block_offset += needed;
 
-        tracing::debug!(
-            target: "wal",
-            "wal.write.complete: record_type={:?} record_size={}",
-            record_type,
-            data_len + HEADER_SIZE,
-        );
-
         Ok(())
     }
 
     /// Flush 文件缓冲区
     pub fn flush(&mut self) -> Result<()> {
-        tracing::debug!(target: "wal", "wal.flush.start");
         self.flush_buffer()?;
         self.file.flush()?;
-        tracing::debug!(target: "wal", "wal.flush.complete");
         Ok(())
     }
 
     /// fdatasync — 仅 data+size, 跳过 mtime 元数据同步 (F-013)
     pub fn sync_data(&mut self) -> Result<()> {
-        tracing::debug!(target: "wal", "wal.sync.start");
         self.flush_buffer()?;
         self.file.sync_data()?;
-        tracing::debug!(target: "wal", "wal.sync.complete");
         Ok(())
     }
 

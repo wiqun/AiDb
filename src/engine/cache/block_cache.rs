@@ -113,7 +113,6 @@ impl ShardInner {
                     if let Some((bytes, _)) = self.cache.remove(&key) {
                         self.current_size -= bytes.len();
                         evictions.fetch_add(1, Ordering::Relaxed);
-                        tracing::debug!(target: "cache", evicted_count = 1, "cache.evict");
                         return true;
                     }
                 }
@@ -130,17 +129,9 @@ impl ShardInner {
         if self.lru_queue.len() <= threshold {
             return;
         }
-        let before = self.lru_queue.len();
         let cache = &self.cache;
         self.lru_queue.retain(
             |(key, counter)| matches!(cache.get(key), Some((_, stored)) if stored == counter),
-        );
-        tracing::debug!(
-            target: "cache",
-            before,
-            after = self.lru_queue.len(),
-            live,
-            "cache.lru_queue.compact"
         );
     }
 }
@@ -221,7 +212,6 @@ impl BlockCache {
             if let Some(ref s) = self.stats {
                 s.block_cache_misses.fetch_add(1, Ordering::Relaxed);
             }
-            tracing::debug!(target: "cache", "cache.miss");
             return None;
         }
 
@@ -253,7 +243,6 @@ impl BlockCache {
             if let Some(ref s) = self.stats {
                 s.block_cache_hits.fetch_add(1, Ordering::Relaxed);
             }
-            tracing::debug!(target: "cache", "cache.hit");
             Some(result)
         } else {
             drop(guard);
@@ -261,7 +250,6 @@ impl BlockCache {
             if let Some(ref s) = self.stats {
                 s.block_cache_misses.fetch_add(1, Ordering::Relaxed);
             }
-            tracing::debug!(target: "cache", "cache.miss");
             None
         }
     }
@@ -302,8 +290,8 @@ impl BlockCache {
         // Guaranteed eviction (locked)
         while guard.current_size + value_len > self.capacity_per_shard {
             if !guard.evict_one(&self.evictions, None) {
-                // 所有 entry 均被 pin, 无法驱逐; 记录告警日志但不拒绝插入.
-                tracing::warn!(
+                // 所有 entry 均被 pin, 无法驱逐; 记录 debug 日志但不拒绝插入.
+                tracing::debug!(
                     target: "cache",
                     file_number = key.file_number,
                     offset = key.offset,
@@ -322,7 +310,6 @@ impl BlockCache {
         guard.lru_queue.push_back((key, counter));
         guard.compact_lru_queue_if_needed();
         self.insertions.fetch_add(1, Ordering::Relaxed);
-        tracing::debug!(target: "cache", "cache.insert");
         drop(guard);
         if let Some(ref s) = self.stats {
             s.block_cache_size.store(self.size(), Ordering::Relaxed);

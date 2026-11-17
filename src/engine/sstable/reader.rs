@@ -153,17 +153,10 @@ impl SSTableReader {
 
         let bloom_passed = if let Some(ref filter) = self.bloom_filter {
             let hit = filter.may_contain(target_user);
-            tracing::debug!(
-              target: "sst",
-              file_number = self.file_number,
-              hit,
-              "bloom_check"
-            );
             if !hit {
                 if let Some(ref s) = self.stats {
                     s.bloom_useful.fetch_add(1, AtomicOrdering::Relaxed);
                 }
-                tracing::debug!(target: "sst", found = false, "sst.seek.result");
                 return Ok(None);
             }
             true
@@ -193,14 +186,12 @@ impl SSTableReader {
             if seq <= seek_seq {
                 let ty = extract_value_type(key)?;
                 let val = it.value().to_vec();
-                tracing::debug!(target: "sst", found = true, "sst.seek.result");
                 return Ok(Some((val, ty)));
             }
             if !it.advance() {
                 break;
             }
         }
-        tracing::debug!(target: "sst", found = false, "sst.seek.result");
         if bloom_passed {
             if let Some(ref s) = self.stats {
                 s.bloom_false_positive
@@ -223,19 +214,12 @@ impl SSTableReader {
 
         let bloom_passed = if let Some(ref filter) = self.bloom_filter {
             let hit = filter.may_contain(target_user);
-            tracing::debug!(
-              target: "sst",
-              file_number = self.file_number,
-              hit,
-              "bloom_check"
-            );
             if !hit {
                 if record_stats {
                     if let Some(ref s) = self.stats {
                         s.bloom_useful.fetch_add(1, AtomicOrdering::Relaxed);
                     }
                 }
-                tracing::debug!(target: "sst", found = false, "sst.value_type.result");
                 return Ok(None);
             }
             true
@@ -263,14 +247,12 @@ impl SSTableReader {
             let seq = extract_sequence(key)?;
             if seq <= seek_seq {
                 let ty = extract_value_type(key)?;
-                tracing::debug!(target: "sst", found = true, "sst.value_type.result");
                 return Ok(Some(ty));
             }
             if !it.advance() {
                 break;
             }
         }
-        tracing::debug!(target: "sst", found = false, "sst.value_type.result");
         if bloom_passed && record_stats {
             if let Some(ref s) = self.stats {
                 s.bloom_false_positive

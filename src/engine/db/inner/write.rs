@@ -7,8 +7,8 @@ use super::write_thread::{
     WriteGroupStatus, Writer, STATE_COMPLETED, STATE_FAILED, STATE_MEMTABLE_DONE,
 };
 use super::{
-    Arc, AtomicOrdering, CompactionPicker, Duration, Error, MemTable, OpType, Result, WalEntry,
-    WriteBatch, WriteOp, DB, SEQUENCE_LIMIT,
+    Arc, AtomicOrdering, CompactionPicker, Duration, Error, MemTable, Mutex, OpType, Result,
+    WalEntry, WriteBatch, WriteOp, DB, SEQUENCE_LIMIT,
 };
 use crate::statistics::{DbOp, WriteStallKind};
 
@@ -73,7 +73,7 @@ impl DB {
 
         if mt_mem > mt_limit.saturating_mul(4) / 5 {
             // stop: MemTable 总内存超过 80% 量级硬上限, 主动 freeze + flush 释放.
-            note_stall_start(WriteStallKind::MemTableStop);
+            self.note_stall_start(WriteStallKind::MemTableStop);
             let start = std::time::Instant::now();
             let mut fail_count = 0u32;
             loop {
@@ -117,7 +117,7 @@ impl DB {
                 0
             };
             if sleep_ms > 0 {
-                note_stall_start(WriteStallKind::MemTableSlowdown);
+                self.note_stall_start(WriteStallKind::MemTableSlowdown);
                 let start = std::time::Instant::now();
                 std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
                 let elapsed_us = start.elapsed().as_micros() as u64;
@@ -131,7 +131,7 @@ impl DB {
 
         // stop: 轮询等待 until L0 回到 slowdown 阈值以下
         if l0_count >= opts.level0_stop_writes_trigger {
-            note_stall_start(WriteStallKind::L0FilesStop);
+            self.note_stall_start(WriteStallKind::L0FilesStop);
             let start = std::time::Instant::now();
             while self.sstables.read()[0].len() >= opts.level0_slowdown_writes_trigger {
                 std::thread::sleep(std::time::Duration::from_millis(opts.write_stall_poll_ms));
@@ -154,7 +154,7 @@ impl DB {
                 0
             };
             if sleep_ms > 0 {
-                note_stall_start(WriteStallKind::L0FilesSlowdown);
+                self.note_stall_start(WriteStallKind::L0FilesSlowdown);
                 let start = std::time::Instant::now();
                 std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
                 let elapsed_us = start.elapsed().as_micros() as u64;
@@ -174,7 +174,7 @@ impl DB {
             }
 
             if actual > target.saturating_mul(4) {
-                note_stall_start(WriteStallKind::LevelSizeStop);
+                self.note_stall_start(WriteStallKind::LevelSizeStop);
                 let start = std::time::Instant::now();
                 // stop: 轮询等待, 主动触发 compaction
                 while {
@@ -200,7 +200,7 @@ impl DB {
                     0
                 };
                 if sleep_ms > 0 {
-                    note_stall_start(WriteStallKind::LevelSizeSlowdown);
+                    self.note_stall_start(WriteStallKind::LevelSizeSlowdown);
                     let start = std::time::Instant::now();
                     std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
                     let elapsed_us = start.elapsed().as_micros() as u64;
@@ -210,6 +210,9 @@ impl DB {
             }
         }
         self.update_write_stall_state();
+        if !self.is_write_stall_active() {
+            exit_stall_log(&self.write_stall_state, self.db_id());
+        }
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -226,7 +229,6 @@ impl DB {
         batch.put(key, value);
         self.write_internal(&batch, true, self.options.sync_wal)?;
 
-        tracing::debug!(target: "db", "db.put");
         self.stats.operation_durations[DbOp::Put as usize]
             .record(op_start.elapsed().as_micros() as u64);
         self.stats
@@ -248,7 +250,6 @@ impl DB {
         batch.delete(key);
         self.write_internal(&batch, true, self.options.sync_wal)?;
 
-        tracing::debug!(target: "db", "db.delete");
         self.stats.operation_durations[DbOp::Delete as usize]
             .record(op_start.elapsed().as_micros() as u64);
         self.stats
@@ -300,14 +301,7 @@ impl DB {
 
         self.write_internal(batch, true, self.options.sync_wal)?;
 
-        let total_us = t0.elapsed().as_micros();
-        tracing::debug!(
-            target: "perf",
-            op_count = batch.len(),
-            total_us,
-            "db_write_done"
-        );
-        tracing::debug!(target: "db", op_count = batch.len(), "db.write_batch");
+        let _total_us = t0.elapsed().as_micros();
         self.stats.operation_durations[DbOp::WriteBatch as usize]
             .record(op_start.elapsed().as_micros() as u64);
         self.stats
@@ -341,14 +335,7 @@ impl DB {
 
         self.write_internal(batch, false, false)?;
 
-        let total_us = t0.elapsed().as_micros();
-        tracing::debug!(
-            target: "perf",
-            op_count = batch.len(),
-            total_us,
-            "db_write_no_wal_done"
-        );
-        tracing::debug!(target: "db", op_count = batch.len(), "db.write_batch_no_wal");
+        let _total_us = t0.elapsed().as_micros();
         self.stats.operation_durations[DbOp::WriteBatchNoWal as usize]
             .record(op_start.elapsed().as_micros() as u64);
         Ok(())
@@ -631,11 +618,58 @@ impl DB {
             .push(Arc::new(old.freeze(flush_seq)));
         Ok(())
     }
+    fn note_stall_start(&self, kind: WriteStallKind) {
+        let l0_files = self.l0_sstable_count.load(AtomicOrdering::Relaxed);
+        let memtable_count = 1 + self.immutable_memtables.read().len();
+        enter_stall_log(
+            &self.write_stall_state,
+            self.db_id(),
+            kind,
+            l0_files,
+            memtable_count,
+        );
+    }
 }
 
-fn note_stall_start(kind: WriteStallKind) {
+fn enter_stall_log(
+    state: &Mutex<Option<(WriteStallKind, std::time::Instant)>>,
+    db_id: &str,
+    kind: WriteStallKind,
+    l0_files: usize,
+    memtable_count: usize,
+) {
+    let mut guard = state.lock();
+    if let Some((active, _)) = *guard {
+        if active == kind {
+            return;
+        }
+    }
+    *guard = Some((kind, std::time::Instant::now()));
     let (cause, kind_name) = kind.cause_and_type();
-    tracing::warn!(target: "db", cause, kind = kind_name, "write stall start");
+    tracing::warn!(
+        target: "db",
+        db_id,
+        cause,
+        kind = kind_name,
+        l0_files,
+        memtable_count,
+        "write stall start"
+    );
+}
+
+fn exit_stall_log(state: &Mutex<Option<(WriteStallKind, std::time::Instant)>>, db_id: &str) {
+    let prev = state.lock().take();
+    if let Some((kind, started)) = prev {
+        let (cause, kind_name) = kind.cause_and_type();
+        tracing::info!(
+            target: "db",
+            db_id,
+            cause,
+            kind = kind_name,
+            stall_duration_ms = started.elapsed().as_millis() as u64,
+            "write stall end"
+        );
+    }
 }
 
 /// 与慢日志默认阈值一致. 快路径只做几次 `Instant` 读数.
@@ -707,16 +741,23 @@ mod sequence_tests {
             messages: Arc::clone(&messages),
         };
         let subscriber = Registry::default().with(layer);
+        let state = parking_lot::Mutex::new(None);
         tracing::subscriber::with_default(subscriber, || {
-            super::note_stall_start(WriteStallKind::L0FilesStop);
+            super::enter_stall_log(&state, "testdb", WriteStallKind::L0FilesStop, 12, 2);
+            super::enter_stall_log(&state, "testdb", WriteStallKind::L0FilesStop, 12, 2);
+            super::exit_stall_log(&state, "testdb");
+            super::exit_stall_log(&state, "testdb");
         });
         let messages = messages.lock().unwrap();
-        assert_eq!(messages.len(), 1);
+        assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].0, tracing::Level::WARN);
         assert_eq!(messages[0].1, "write stall start");
         assert!(messages[0].2.contains("cause=l0"));
         assert!(messages[0].2.contains("kind=stop"));
         assert!(!messages[0].2.contains("key="));
+        assert_eq!(messages[1].0, tracing::Level::INFO);
+        assert_eq!(messages[1].1, "write stall end");
+        assert!(messages[1].2.contains("stall_duration_ms="));
     }
 
     struct MessageLayer {
