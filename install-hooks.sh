@@ -3,10 +3,11 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-for hook in hooks/*; do
-    hook_name=$(basename "$hook")
-    ln -sf "../../$hook" ".git/hooks/$hook_name"
-    chmod +x "$hook"
-done
+chmod +x hooks/*
 
-echo "Git hooks installed."
+# 清理旧版软链 (保留 .sample)
+find .git/hooks -maxdepth 1 -type l -delete
+
+git config core.hooksPath hooks
+
+echo "Git hooks installed (core.hooksPath=hooks)."

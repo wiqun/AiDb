@@ -43,19 +43,14 @@
 ```bash
 export RUSTFLAGS='-D warnings'
 cargo fmt --check
-cargo clippy --all-targets
-cargo test -- --test-threads=1
+cargo clippy --all-targets --all-features
+cargo check --no-default-features
+cargo nextest run --lib --tests --all-features
+# 若未安装 cargo-nextest, 退回单线程串行: cargo test --all-features -- --test-threads=1
 ```
 
-### Feature 专项与全量测试
+### Feature 专项与慢测
 ```bash
-# Cluster 特性验证 (需本地 protoc)
-cargo clippy --all-targets --features cluster
-cargo test --features cluster -- --test-threads=1
-
-# 块压缩特性测试 (Snap / LZ4)
-cargo test --features compression --test sstable -- multi_block_read_with -- --test-threads=1
-
 # 慢测与压力测试
 cargo test -- --ignored --test-threads=1
 ```

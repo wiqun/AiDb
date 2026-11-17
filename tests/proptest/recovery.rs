@@ -17,6 +17,18 @@ fn recovery_test_opts() -> Options {
     o
 }
 
+/// 模拟 crash (`drop` 未调 `close`) 后重新打开, 等待后台线程释放文件锁.
+fn reopen_after_drop(path: &std::path::Path) -> Arc<DB> {
+    for _ in 0..100 {
+        match DB::open(path, recovery_test_opts()) {
+            Ok(db) => return db,
+            Err(aidb::Error::Busy(_)) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(e) => panic!("reopen failed: {e}"),
+        }
+    }
+    DB::open(path, recovery_test_opts()).unwrap()
+}
+
 proptest! {
 #![proptest_config(ProptestConfig::with_cases(50))]
 
@@ -42,7 +54,7 @@ fn prop_recovery_after_flush(
 
     // 恢复
     {
-        let db = DB::open(&db_path, recovery_test_opts()).unwrap();
+        let db = reopen_after_drop(&db_path);
         for k in 0u8..=15u8 {
             let expected = model.get(&k).map(|v| vec![*v]);
             let actual = db.get(&[k]).unwrap();
@@ -74,7 +86,7 @@ fn prop_recovery_with_overwrites(
     }
 
     {
-        let db = DB::open(&db_path, recovery_test_opts()).unwrap();
+        let db = reopen_after_drop(&db_path);
         for k in 0u8..=10u8 {
             let expected = model.get(&k).map(|v| vec![*v]);
             let actual = db.get(&[k]).unwrap();
@@ -108,7 +120,7 @@ fn prop_recovery_with_deletes(
     }
 
     {
-        let db = DB::open(&db_path, recovery_test_opts()).unwrap();
+        let db = reopen_after_drop(&db_path);
         for k in 0u8..=10u8 {
             let actual = db.get(&[k]).unwrap();
             match model.get(&k) {
