@@ -156,7 +156,14 @@ impl DB {
         self.update_write_stall_state();
         let pending = self.pending_compaction_bytes();
         update_sstable_metrics(&self.sstables.read(), &self.stats, pending);
-        tracing::info!(target: "db", file_number, file_size, "db.flush.complete");
+        tracing::info!(
+            target: "db",
+            db_id = self.db_id(),
+            file_number,
+            file_size,
+            duration_ms = flush_start.elapsed().as_millis() as u64,
+            "db.flush.complete"
+        );
         self.stats
             .flush_duration
             .record(flush_start.elapsed().as_micros() as u64);

@@ -83,12 +83,42 @@ impl DB {
         }
 
         let level = task.level;
-        tracing::info!(target: "cmp", level, "compaction start");
+        let output_level = task.output_level;
+        let in_files = task.inputs.len() + task.expanded_inputs.len();
+        let in_bytes: u64 = task
+            .inputs
+            .iter()
+            .chain(task.expanded_inputs.iter())
+            .map(|f| f.file_size())
+            .sum();
+        tracing::info!(
+            target: "cmp",
+            db_id = self.db_id(),
+            level,
+            output_level,
+            in_files,
+            in_bytes,
+            trivial_move = task.is_trivial_move,
+            "compaction start"
+        );
 
         // --- TRIVIAL MOVE FAST PATH ---
         if task.is_trivial_move {
+            let t_move = std::time::Instant::now();
             let moved = self.run_trivial_move(task)?;
-            tracing::info!(target: "cmp", level, "compaction end");
+            tracing::info!(
+                target: "cmp",
+                db_id = self.db_id(),
+                level,
+                output_level,
+                in_files,
+                out_files = in_files,
+                in_bytes,
+                out_bytes = in_bytes,
+                duration_ms = t_move.elapsed().as_millis() as u64,
+                trivial_move = true,
+                "compaction end"
+            );
             return Ok(moved);
         }
         // --- END TRIVIAL MOVE ---
@@ -252,7 +282,21 @@ impl DB {
         }
 
         self.release_files(&task);
-        tracing::info!(target: "cmp", level = task.level, "compaction end");
+        let out_files = results.iter().filter(|r| r.entry_count > 0).count();
+        let out_bytes: u64 = results.iter().map(|r| r.file_size).sum();
+        tracing::info!(
+            target: "cmp",
+            db_id = self.db_id(),
+            level = task.level,
+            output_level = task.output_level,
+            in_files,
+            out_files,
+            in_bytes,
+            out_bytes,
+            duration_ms = run_start.elapsed().as_millis() as u64,
+            trivial_move = false,
+            "compaction end"
+        );
         Ok(true)
     }
 

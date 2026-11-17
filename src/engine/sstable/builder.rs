@@ -186,18 +186,7 @@ impl SSTableBuilder {
 
         let mut meta_index_builder = IndexBlockBuilder::new();
         if let Some(ref filter) = self.bloom_filter {
-            let key_count = self.num_entries;
-            let num_bits = filter.num_bits();
-            let num_hashes = filter.num_hashes();
             let encoded = filter.encode();
-            tracing::debug!(
-              target: "sst",
-              key_count,
-              num_bits,
-              num_hashes,
-              encoded_len = encoded.len(),
-              "bloom.build"
-            );
             let bloom_handle =
                 write_raw_block(&mut self.writer, &mut self.data_block_offset, &encoded)?;
             meta_index_builder.add_entry(&index_entry_for_bloom(bloom_handle))?;
@@ -249,14 +238,6 @@ impl SSTableBuilder {
         drop(self.writer);
         fs::rename(&self.tmp_path, &self.final_path)?;
         let file_size = fs::metadata(&self.final_path)?.len();
-
-        tracing::debug!(
-          target: "sst",
-          block_count = self.block_count,
-          file_size,
-          bloom = self.bloom_filter.is_some(),
-          "sst.build.complete"
-        );
         Ok(file_size)
     }
 

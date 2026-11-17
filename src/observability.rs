@@ -19,10 +19,27 @@ pub fn optional_span(name: &'static str) -> Span {
         return Span::none();
     }
     match name {
-        "db_flush" => tracing::info_span!("db_flush"),
-        "cmp_run" => tracing::info_span!("cmp_run"),
-        "raft_propose" => tracing::info_span!("raft_propose"),
-        "kv_command" => tracing::info_span!("kv_command", cmd = tracing::field::Empty),
+        "db_flush" => tracing::info_span!(
+            "db_flush",
+            trace_id = tracing::field::Empty,
+            span_id = tracing::field::Empty
+        ),
+        "cmp_run" => tracing::info_span!(
+            "cmp_run",
+            trace_id = tracing::field::Empty,
+            span_id = tracing::field::Empty
+        ),
+        "raft_propose" => tracing::info_span!(
+            "raft_propose",
+            trace_id = tracing::field::Empty,
+            span_id = tracing::field::Empty
+        ),
+        "kv_command" => tracing::info_span!(
+            "kv_command",
+            cmd = tracing::field::Empty,
+            trace_id = tracing::field::Empty,
+            span_id = tracing::field::Empty
+        ),
         _ => Span::none(),
     }
 }
@@ -92,6 +109,20 @@ mod tests {
             let _entered = span.entered();
         });
         assert!(names.lock().unwrap().iter().any(|name| name == "cmp_run"));
+        super::set_traces_enabled(false);
+    }
+
+    #[test]
+    fn kv_command_span_predeclares_trace_and_span_ids() {
+        super::set_traces_enabled(true);
+        let subscriber = Registry::default();
+        tracing::subscriber::with_default(subscriber, || {
+            let kind = "kv_command";
+            let span = super::optional_span(kind);
+            assert!(span.field("cmd").is_some());
+            assert!(span.field("trace_id").is_some());
+            assert!(span.field("span_id").is_some());
+        });
         super::set_traces_enabled(false);
     }
 }

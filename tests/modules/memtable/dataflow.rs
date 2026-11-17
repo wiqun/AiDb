@@ -1,11 +1,11 @@
-//! MemTable 模块级 dataflow — API → span / event
+//! MemTable 模块级 dataflow — API 状态与无热路径 Span 契约
 //! @component aidb-memtable
 
 use crate::common::dataflow::capture_spans_under_lock;
-use crate::common::observability::{capture_events_under_lock, tracing_test_lock};
+use crate::common::observability::tracing_test_lock;
 use aidb::engine::memtable::MemTable;
 
-/// 验证 MemTable API 的 Observability span 与 event 追踪日志顺序
+/// 验证 MemTable 热路径不产生 Span，且读写/删除/冻结状态正确
 #[test]
 fn test_mem_observability() {
     let _lock = tracing_test_lock();
@@ -28,24 +28,14 @@ fn test_mem_observability() {
     .spans_named("mem_freeze")
     .is_empty());
 
-    let events = capture_events_under_lock(|| {
-        let mt2 = MemTable::new();
-        mt2.put(b"k", b"v", 1).unwrap();
-        assert!(mt2.get_latest(b"k").unwrap().is_some());
-        assert!(mt2.get_latest(b"missing").unwrap().is_none());
-        mt2.delete(b"k2", 3).unwrap();
-        let _frozen = mt2.freeze(1);
-    });
-    for needle in [
-        "mem.put",
-        "mem.get.hit",
-        "mem.get.miss",
-        "mem.delete",
-        "mem.freeze",
-    ] {
-        assert!(
-            events.iter().any(|e| e.contains(needle)),
-            "missing event containing {needle:?}, got: {events:?}"
-        );
-    }
+    let mt2 = MemTable::new();
+    mt2.put(b"k", b"v", 1).unwrap();
+    assert!(mt2.get_latest(b"k").unwrap().is_some());
+    assert!(mt2.get_latest(b"missing").unwrap().is_none());
+    mt2.delete(b"k2", 3).unwrap();
+    let frozen = mt2.freeze(1);
+    assert_eq!(
+        frozen.get_latest(b"k").unwrap().as_deref(),
+        Some(b"v".as_slice())
+    );
 }

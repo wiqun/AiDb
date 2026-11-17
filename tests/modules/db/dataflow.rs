@@ -1,10 +1,12 @@
 //! DB 层跨模块 dataflow — put/get/flush/delete 的 span 树 (Mode A)
 //! @component aidb-engine
 
-use crate::common::dataflow::{capture_spans, capture_spans_and_events};
+use crate::common::dataflow::capture_spans;
 use crate::common::observability::tracing_test_lock;
 use aidb::config::Options;
+use aidb::statistics::DbOp;
 use aidb::DB;
+use std::sync::atomic::Ordering;
 use tempfile::tempdir;
 
 fn dataflow_opts() -> Options {
@@ -114,16 +116,17 @@ fn test_db_put_event_chain() {
     let dir = tempdir().unwrap();
     let db = DB::open(dir.path(), dataflow_opts()).unwrap();
 
-    let (tree, events) = capture_spans_and_events(|| {
+    let tree = capture_spans(|| {
         db.put(b"ev", b"1").unwrap();
     });
 
     assert!(tree.spans_named("db_put").is_empty());
-    let write_start = events.iter().position(|e| e.contains("wal.write.start"));
-    let write_done = events.iter().position(|e| e.contains("wal.write.complete"));
-    let mem_put = events.iter().position(|e| e.contains("mem.put"));
-    assert!(write_start.is_some() && write_done.is_some());
-    assert!(mem_put.is_some());
-    assert!(write_start.unwrap() < write_done.unwrap());
+    let stats = db.statistics();
+    assert_eq!(
+        stats.operations[DbOp::Put as usize].load(Ordering::Relaxed),
+        1
+    );
+    assert!(stats.wal_written_bytes.load(Ordering::Relaxed) > 0);
+    assert!(stats.logical_write_bytes.load(Ordering::Relaxed) > 0);
     db.close().unwrap();
 }
