@@ -24,19 +24,26 @@
 
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::statistics::Statistics;
 
 /// 压缩算法
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum CompressionType {
     #[default]
+    #[serde(alias = "None")]
     None,
+    #[serde(alias = "Snap")]
     Snap,
+    #[serde(alias = "Lz4")]
     Lz4,
 }
 
 /// DB 打开选项
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Options {
     // === 基本 ===
     /// 目录不存在时自动创建
@@ -123,6 +130,7 @@ pub struct Options {
     /// Compaction 信号通道容量 (默认 64)
     pub compaction_channel_size: usize,
     /// 引擎可观测性原子指标集合 (None 则在 open 时自动创建, 默认 None)
+    #[serde(skip)]
     pub statistics: Option<Arc<Statistics>>,
 }
 
@@ -292,6 +300,18 @@ impl Options {
             ..Self::default()
         }
     }
+
+    /// 按 preset 名称生成基底配置 (`default` / `high-write` / `high-read`).
+    pub fn from_preset(name: &str) -> crate::error::Result<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "default" => Ok(Self::default()),
+            "high-write" | "high_write" => Ok(Self::for_high_write_throughput()),
+            "high-read" | "high_read" => Ok(Self::for_high_read_throughput()),
+            _ => Err(crate::error::Error::InvalidArgument(format!(
+                "unknown aidb preset: {name}"
+            ))),
+        }
+    }
 }
 
 // ============================================================
@@ -299,7 +319,8 @@ impl Options {
 // ============================================================
 
 #[cfg(feature = "cluster")]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ClusterConfig {
     /// 数据 Group 数量 (默认 256)
     pub group_count: u64,
@@ -318,7 +339,8 @@ pub struct ClusterConfig {
 
 /// 在线迁移配置
 #[cfg(feature = "cluster")]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MigrationConfig {
     /// 每批最大迁移 key 数 (默认 1000)
     pub max_batch_size: usize,
@@ -529,5 +551,42 @@ mod tests {
         assert_eq!(cfg.replication_factor, 1);
         assert_eq!(cfg.max_log_entries, 100);
         assert_eq!(cfg.max_log_size_bytes, 1024 * 1024);
+    }
+
+    #[test]
+    fn options_from_preset_works_and_rejects_unknown() {
+        assert_eq!(
+            Options::from_preset("high-write").unwrap().memtable_size,
+            256 * 1024 * 1024
+        );
+        assert_eq!(
+            Options::from_preset("HIGH_READ").unwrap().block_cache_size,
+            512 * 1024 * 1024
+        );
+        assert!(Options::from_preset("unknown").is_err());
+    }
+
+    #[cfg(feature = "backup")]
+    #[test]
+    fn options_serde_partial_preserves_defaults() {
+        let opts: Options =
+            serde_json::from_str(r#"{"memtable_size": 1048576, "compression": "lz4"}"#).unwrap();
+        assert_eq!(opts.memtable_size, 1048576);
+        assert_eq!(opts.compression, CompressionType::Lz4);
+        assert_eq!(opts.block_size, Options::default().block_size);
+        let c: CompressionType = serde_json::from_str(r#""Snap""#).unwrap();
+        assert_eq!(c, CompressionType::Snap);
+    }
+
+    #[cfg(all(feature = "backup", feature = "cluster"))]
+    #[test]
+    fn cluster_and_log_committer_serde_roundtrip() {
+        let m: MigrationConfig = serde_json::from_str(r#"{"max_batch_size": 250}"#).unwrap();
+        assert_eq!(m.max_batch_size, 250);
+        assert_eq!(m.max_retries, 3);
+        let lc: crate::cluster::log_committer::LogCommitterConfig =
+            serde_json::from_str(r#"{"max_entries": 1024}"#).unwrap();
+        assert_eq!(lc.max_entries, 1024);
+        assert_eq!(lc.max_commands, 64);
     }
 }
