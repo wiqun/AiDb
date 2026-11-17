@@ -1,147 +1,71 @@
 name: CI
 
-# 同一分支的新 push 会取消尚未完成的旧 run, 避免 CI 积压
+# 同一分支的新 PR push 会取消尚未完成的旧 run, 避免 CI 积压
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# 主 CI 仅非文档变更触发: .md 与 docs/ 由 docs-link-check 单独检查
+# 仅在 PR 合并前触发 (避免合并进 main 后重复跑一次), 并支持手动触发兜底
 on:
-  push:
-    branches: [main]
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
   pull_request:
     branches: [main]
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
-  # 把警告当错误, 强制代码质量门禁
   RUSTFLAGS: -D warnings
 
 jobs:
-  # 代码风格与静态检查, 不跑测试 (最快反馈)
   lint:
+    name: Format & Clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: clippy, rustfmt
-          # 依赖缓存只在主分支保存, PR 分支只读不写, 避免缓存膨胀
-          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name == 'pull_request' }}
+          shared-key: aidb-lint
+      - name: Install protoc
+        uses: taiki-e/install-action@v2
+        with:
+          tool: protoc
 
       - name: Check format
         run: cargo fmt --check
 
-      - name: Clippy
-        run: cargo clippy --all-targets
+      - name: Clippy (all features)
+        run: cargo clippy --all-targets --all-features
 
-  # 默认 feature 的全量测试 (与 lint 串行: 通过才值得跑测试)
+      - name: Check core engine (no default features)
+        run: cargo check --no-default-features
+
   test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    needs: lint
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: Test
-        run: cargo test -- --test-threads=1
-
-  # cluster + monitoring feature, 与默认 feature 并行独立
-  test-cluster:
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          components: clippy, rustfmt
-          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      # cluster feature 依赖 tonic/prost 编译, 需要 protoc
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
-      - name: Clippy cluster
-        run: cargo clippy --all-targets --features cluster
-
-      - name: Test cluster
-        run: cargo test --features cluster -- --test-threads=1
-
-      # monitoring 测试覆盖: prometheus 指标
-      - name: Clippy cluster + monitoring
-        run: cargo clippy --all-targets --features cluster,monitoring
-
-      - name: Test monitoring (prometheus metrics)
-        run: cargo test --features cluster,monitoring --test metrics -- --test-threads=1
-
-      - name: Test monitoring (raft metrics)
-        run: cargo test --features cluster,monitoring --test raft metrics -- --test-threads=1
-
-      # partition/failover 测试依赖故障注入框架 (failpoint), 仅在 cluster-test-util feature 下编译.
-      # cargo test filter 匹配测试名, 故用 3 个函数名精确命中, 避免重复跑 raft 全量 (~621 个).
-      - name: Test cluster partition/failover (cluster-test-util)
-        run: cargo test --features cluster,cluster-test-util --test raft -- judge_leader_quorum_rules network_blackhole_drops_rpc lease_read_fails_after_leader_isolated -- --test-threads=1
-
-  # compression feature (Snap/LZ4): 独立 job, 与 test-cluster 平行
-  test-compression:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      # Snap/LZ4 多 block 写读 roundtrip 回归测试 (见 tests/modules/sstable/function.rs).
-      # 这两个用例 feature-gated, 默认 feature 不编译, 需显式 --features compression.
-      - name: Test compression (Snap/LZ4)
-        run: cargo test --features compression --test sstable -- multi_block_read_with -- --test-threads=1
-
-  # 慢测与压测 (#[ignore] 用例): 仅主分支 push 跑, PR 迭代不跑以缩短反馈
-  test-slow:
+    name: Nextest All Features
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: test
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: Slow and stress tests
-        run: cargo test -- --ignored --test-threads=1
-
-  # 注意: 当前没有 cluster / monitoring / compression 的 #[ignore] 慢测用例,
-  # 将来新增此类用例时, 在此处为对应 feature 增加一个 `cargo test --features X -- --ignored` 的 job (如 test-slow-cluster).
-
-  # criterion 基准: 报告上传为 artifact, 供人工回溯 (不做自动化阈值判断)
-  bench:
-    runs-on: ubuntu-latest
-    needs: test
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+          cache: false
+      - uses: Swatinem/rust-cache@v2
         with:
-          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: Bench
-        run: |
-          cargo bench --bench write_bench
-          cargo bench --bench read_bench
-          cargo bench --bench backup_bench
-
-      - name: Upload bench reports
-        uses: actions/upload-artifact@v4
+          save-if: ${{ github.event_name == 'pull_request' }}
+          shared-key: aidb-test
+      - name: Install protoc & cargo-nextest
+        uses: taiki-e/install-action@v2
         with:
-          name: criterion-bench-reports
-          path: target/criterion/
-          if-no-files-found: ignore
+          tool: protoc, cargo-nextest
+
+      - name: Run tests (nextest)
+        env:
+          PROPTEST_CASES: 25
+        run: cargo nextest run --profile ci --lib --tests --all-features

@@ -3,26 +3,33 @@ set -euo pipefail
 
 echo "=== pre-commit: $(basename "$PWD") ==="
 
+hook_dir="$(cd "$(dirname "$0")" && pwd)"
+
 # Step 1. 分支保护 (硬性): 禁止在基础分支直接提交
-bash "$(dirname "$0")/check-branch.sh" || exit 1
+bash "$hook_dir/check-branch.sh" || exit 1
 
 # Step 2. 文档链接检查 (硬性): staged .md 相对链接存在性
-bash "$(dirname "$0")/check-docs-links.sh" || exit 1
+bash "$hook_dir/check-docs-links.sh" || exit 1
 
-# Step 3. 代码格式
-cargo fmt --check || {
-  echo "ERROR: Format check failed. Run 'cargo fmt' to fix."
-  exit 1
-}
+staged=$(git diff --cached --name-only --diff-filter=ACM)
 
-# Step 4. 静态检查 (clippy, 全 feature)
-export RUSTFLAGS='-D warnings'
-cargo clippy --all-targets --all-features || {
-  echo "ERROR: Clippy found issues under --all-features."
-  exit 1
-}
+# Step 3. Rust 代码格式与静态检查 (仅当涉及 Rust/Cargo/Proto 变更时触发)
+if echo "$staged" | grep -qE '(\.rs$|Cargo\.(toml|lock)$|build\.rs$|\.proto$)'; then
+  cargo fmt --check || {
+    echo "ERROR: Format check failed. Run 'cargo fmt' to fix."
+    exit 1
+  }
 
-# Step 5. 安全检查 (audit + deny): 与 CI security.yml 对齐
-bash "$(dirname "$0")/check-security.sh" || exit 1
+  export RUSTFLAGS='-D warnings'
+  cargo clippy --all-targets --all-features || {
+    echo "ERROR: Clippy found issues under --all-features."
+    exit 1
+  }
+fi
+
+# Step 4. 安全检查 (audit + deny): 仅当依赖或合规清单变更时触发
+if echo "$staged" | grep -qE '(^|/)Cargo\.(toml|lock)$|(^|/)deny\.toml$'; then
+  bash "$hook_dir/check-security.sh" || exit 1
+fi
 
 echo "All pre-commit checks passed."

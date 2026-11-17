@@ -1,5 +1,4 @@
-# 依赖安全门禁: CVE 漏洞 + license/来源/重复版本检查
-# 与主 CI 并行互不阻塞; 定时触发让扫描不依赖代码变更
+# 依赖安全门禁: 仅在依赖或合规清单变更时于 PR 触发, 配合每日 cron 定时扫描
 name: Security Audit
 
 concurrency:
@@ -7,53 +6,46 @@ concurrency:
   cancel-in-progress: true
 
 on:
-  push:
-    branches: [main]
-    # 文档变更不影响 lockfile / CVE 面, 交给 docs-link-check; 每日 cron 仍会扫描
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
   pull_request:
     branches: [main]
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-  # 每天 UTC 0:00 (北京时间 8:00) 自动跑, 及时捕获依赖生态新发布的漏洞
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - 'deny.toml'
   schedule:
     - cron: "0 0 * * *"
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # cargo-audit: 对照 RustSec Advisory Database 检查已知 CVE
   audit:
     name: Cargo Audit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
-
+        with:
+          cache: false
       - name: Install cargo-audit
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit
-
       - name: Run cargo audit
         run: cargo audit
 
-  # cargo-deny: 按 deny.toml 做 license 白名单 / 重复版本 / 依赖来源合规
   deny:
     name: Cargo Deny
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
-
+        with:
+          cache: false
       - name: Install cargo-deny
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny
-
       - name: Run cargo deny check
         run: cargo deny check

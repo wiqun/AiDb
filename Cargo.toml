@@ -120,10 +120,6 @@ harness = false
 name = "backup"
 required-features = ["backup"]
 
-[[test]]
-name = "backup"
-required-features = ["backup"]
-
 [profile.release]
 lto            = true
 codegen-units  = 1

@@ -1,7 +1,5 @@
-//! @component aidb-engine
-//! Prometheus metrics 验收测试 (需要 `monitoring` feature)
-//!
-//!   cargo test --test metrics --features monitoring -- --test-threads=1
+//! 可观测性与契约集成测试统一入口
+//! @component aidb-observability
 
 #[cfg(feature = "monitoring")]
 #[path = "modules/metrics/prometheus.rs"]
@@ -48,3 +46,6 @@ mod otel_export_test;
 
 #[path = "modules/metrics/recovery_test.rs"]
 mod recovery_test;
+
+#[path = "modules/span_contract.rs"]
+mod span_contract;
