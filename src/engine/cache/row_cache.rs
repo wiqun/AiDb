@@ -89,6 +89,14 @@ pub struct RowCache {
     stats_evictions: AtomicU64,
 }
 
+impl std::fmt::Debug for RowCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RowCache")
+            .field("capacity", &self.capacity)
+            .finish()
+    }
+}
+
 impl RowCache {
     /// 创建指定容量 (字节) 的分片 RowCache (0 表示禁用)
     pub fn new(capacity: usize) -> Self {
@@ -198,6 +206,36 @@ impl RowCache {
             s.lru_queue.clear();
             s.total_bytes = 0;
         }
+    }
+
+    #[inline]
+    fn with_ns_key<R>(ns: u64, key: &[u8], f: impl FnOnce(&[u8]) -> R) -> R {
+        if ns == 0 {
+            return f(key);
+        }
+        if key.len() <= 248 {
+            let mut stack = [0u8; 256];
+            stack[..8].copy_from_slice(&ns.to_le_bytes());
+            stack[8..8 + key.len()].copy_from_slice(key);
+            f(&stack[..8 + key.len()])
+        } else {
+            let mut buf = Vec::with_capacity(8 + key.len());
+            buf.extend_from_slice(&ns.to_le_bytes());
+            buf.extend_from_slice(key);
+            f(&buf)
+        }
+    }
+
+    pub fn get_ns(&self, ns: u64, key: &[u8], max_seq: u64) -> Option<Bytes> {
+        Self::with_ns_key(ns, key, |k| self.get(k, max_seq))
+    }
+
+    pub fn insert_ns(&self, ns: u64, key: &[u8], value: Bytes, seq: u64) {
+        Self::with_ns_key(ns, key, |k| self.insert(k, value, seq))
+    }
+
+    pub fn invalidate_ns(&self, ns: u64, key: &[u8]) {
+        Self::with_ns_key(ns, key, |k| self.invalidate(k))
     }
 
     /// 获取缓存性能指标快照

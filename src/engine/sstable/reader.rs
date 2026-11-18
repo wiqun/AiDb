@@ -16,15 +16,17 @@
 //! - Bloom 仅索引 user_key; block 内仍按 `seq <= seek_seq` 过滤.
 //! - Bloom 缺失或解码失败 → warn 降级为无 filter, 不影响读正确性.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
-use std::sync::atomic::Ordering as AtomicOrdering;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
+use parking_lot::Mutex;
 
-use crate::engine::cache::BlockCache;
+use crate::engine::cache::{BlockCache, TableCache};
 use crate::engine::filter::{bloom::record_bloom_false_positive, BloomFilter, Filter};
 use crate::engine::memtable::{
     encode_internal_key, extract_sequence, extract_user_key, extract_value_type, range_covers,
@@ -34,7 +36,7 @@ use crate::error::{Error, Result};
 use crate::statistics::Statistics;
 
 use super::block::Block;
-use super::block_io::{read_block_cached, read_block_from_file};
+use super::block_io::{read_block_cached_with_id, read_block_from_file};
 use super::footer::{Footer, FOOTER_SIZE};
 use super::handle::BlockHandle;
 use super::index::{find_block_handle, load_index_entries, IndexBlock};
@@ -52,8 +54,24 @@ struct RangeTombstoneEntry {
     sequence: u64,
 }
 
+fn cache_id_for_dir(dir: &Path) -> u64 {
+    static NEXT_CACHE_ID: AtomicU64 = AtomicU64::new(1);
+    static DIR_IDS: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+    let map = DIR_IDS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock();
+    if let Some(&id) = guard.get(dir) {
+        return id;
+    }
+    let id = NEXT_CACHE_ID.fetch_add(1, AtomicOrdering::Relaxed);
+    guard.insert(dir.to_path_buf(), id);
+    id
+}
+
 pub struct SSTableReader {
-    file: Arc<File>,
+    file: Option<Arc<File>>,
+    path: PathBuf,
+    cache_id: u64,
+    table_cache: Option<Arc<TableCache>>,
     file_number: u64,
     level: usize,
     index_entries: Arc<Vec<(Vec<u8>, BlockHandle)>>,
@@ -79,17 +97,30 @@ impl SSTableReader {
         block_cache: Option<Arc<BlockCache>>,
         stats: Option<Arc<Statistics>>,
     ) -> Result<Self> {
-        let file = Arc::new(File::open(path)?);
-        let file_size = file.metadata()?.len();
-        if file_size < FOOTER_SIZE as u64 {
-            return Err(Error::Corruption("SSTable file too small".into()));
-        }
+        Self::open_with_caches(path, block_cache, None, stats)
+    }
 
+    pub fn open_with_caches(
+        path: &Path,
+        block_cache: Option<Arc<BlockCache>>,
+        table_cache: Option<Arc<TableCache>>,
+        stats: Option<Arc<Statistics>>,
+    ) -> Result<Self> {
         let (file_number, level) = path
             .file_name()
             .and_then(|n| n.to_str())
             .and_then(super::filename::parse_sstable_filename)
             .unwrap_or((0, 0));
+        let cache_id = path.parent().map(cache_id_for_dir).unwrap_or(0);
+        let file = if let Some(ref tc) = table_cache {
+            tc.get_or_open(cache_id, file_number, path)?
+        } else {
+            Arc::new(File::open(path)?)
+        };
+        let file_size = file.metadata()?.len();
+        if file_size < FOOTER_SIZE as u64 {
+            return Err(Error::Corruption("SSTable file too small".into()));
+        }
 
         let footer = read_footer(&file, file_size)?;
         let index_bytes = read_block_from_file(&file, &footer.index_handle)?;
@@ -101,8 +132,13 @@ impl SSTableReader {
         let bloom_filter = load_bloom_filter(&file, &meta_index);
         let properties = load_properties(&file, &meta_index);
 
-        let (smallest_key, largest_key) =
-            read_key_range(&file, file_number, &index_entries, block_cache.as_ref())?;
+        let (smallest_key, largest_key) = read_key_range(
+            cache_id,
+            &file,
+            file_number,
+            &index_entries,
+            block_cache.as_ref(),
+        )?;
         let (range_tombstones_vec, loaded_range_tombstones_from_meta) = if let Some(handle) =
             find_meta_block_handle(&meta_index, RANGE_TOMBSTONES_META_NAME)?
         {
@@ -123,9 +159,17 @@ impl SSTableReader {
             )
         };
         let range_tombstones = Arc::new(range_tombstones_vec);
+        let stored_file = if table_cache.is_some() {
+            None
+        } else {
+            Some(file)
+        };
 
         Ok(Self {
-            file,
+            file: stored_file,
+            path: path.to_path_buf(),
+            cache_id,
+            table_cache,
             file_number,
             level,
             index_entries,
@@ -139,6 +183,17 @@ impl SSTableReader {
             loaded_range_tombstones_from_meta,
             stats,
         })
+    }
+
+    #[inline]
+    fn acquire_file(&self) -> Result<Arc<File>> {
+        if let Some(ref f) = self.file {
+            return Ok(Arc::clone(f));
+        }
+        if let Some(ref tc) = self.table_cache {
+            return tc.get_or_open(self.cache_id, self.file_number, &self.path);
+        }
+        Ok(Arc::new(File::open(&self.path)?))
     }
 
     #[cfg(test)]
@@ -191,8 +246,10 @@ impl SSTableReader {
         };
 
         let handle = find_block_handle(&self.index_entries, seek_key)?;
-        let block_data = read_block_cached(
-            &self.file,
+        let file = self.acquire_file()?;
+        let block_data = read_block_cached_with_id(
+            self.cache_id,
+            &file,
             self.file_number,
             &handle,
             self.block_cache.as_ref(),
@@ -259,7 +316,15 @@ impl SSTableReader {
         } else {
             (None, None)
         };
-        let block_data = read_block_cached(&self.file, self.file_number, &handle, cache, stats)?;
+        let file = self.acquire_file()?;
+        let block_data = read_block_cached_with_id(
+            self.cache_id,
+            &file,
+            self.file_number,
+            &handle,
+            cache,
+            stats,
+        )?;
         let block = Block::new(block_data)?;
         let mut it = block.iter();
         it.seek(seek_key);
@@ -314,7 +379,15 @@ impl SSTableReader {
         } else {
             (None, None)
         };
-        let block_data = read_block_cached(&self.file, self.file_number, &handle, cache, stats)?;
+        let file = self.acquire_file()?;
+        let block_data = read_block_cached_with_id(
+            self.cache_id,
+            &file,
+            self.file_number,
+            &handle,
+            cache,
+            stats,
+        )?;
         let block = Block::new(block_data)?;
         let mut it = block.iter();
         it.seek(&seek_key);
@@ -383,8 +456,11 @@ impl SSTableReader {
     }
 
     pub fn iter(&self) -> SSTableIterator {
+        let file = self
+            .acquire_file()
+            .expect("SSTableReader::iter failed to open SSTable file");
         SSTableIterator::new(
-            Arc::clone(&self.file),
+            file,
             self.file_number,
             Arc::clone(&self.index_entries),
             self.block_cache.clone(),
@@ -394,8 +470,11 @@ impl SSTableReader {
 
     /// 未定位的迭代器, 调用方必须先 seek (见 `SSTableIterator::new_unpositioned`).
     pub(crate) fn iter_unpositioned(&self) -> SSTableIterator {
+        let file = self
+            .acquire_file()
+            .expect("SSTableReader::iter_unpositioned failed to open SSTable file");
         SSTableIterator::new_unpositioned(
-            Arc::clone(&self.file),
+            file,
             self.file_number,
             Arc::clone(&self.index_entries),
             self.block_cache.clone(),
@@ -404,8 +483,11 @@ impl SSTableReader {
     }
 
     pub fn iter_uncached(&self) -> SSTableIterator {
+        let file = self
+            .acquire_file()
+            .expect("SSTableReader::iter_uncached failed to open SSTable file");
         SSTableIterator::new(
-            Arc::clone(&self.file),
+            file,
             self.file_number,
             Arc::clone(&self.index_entries),
             None,
@@ -473,6 +555,7 @@ fn read_footer(file: &File, file_size: u64) -> Result<Footer> {
 }
 
 fn read_key_range(
+    cache_id: u64,
     file: &File,
     file_number: u64,
     entries: &[(Vec<u8>, BlockHandle)],
@@ -481,7 +564,14 @@ fn read_key_range(
     if entries.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
-    let first = read_block_cached(file, file_number, &entries[0].1, block_cache, None)?;
+    let first = read_block_cached_with_id(
+        cache_id,
+        file,
+        file_number,
+        &entries[0].1,
+        block_cache,
+        None,
+    )?;
     let first_it = Block::new(first)?.iter();
     let smallest = if first_it.valid() {
         first_it.key().to_vec()
@@ -489,7 +579,8 @@ fn read_key_range(
         Vec::new()
     };
 
-    let last = read_block_cached(
+    let last = read_block_cached_with_id(
+        cache_id,
         file,
         file_number,
         &entries[entries.len() - 1].1,

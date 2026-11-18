@@ -8,7 +8,7 @@ use bytes::Bytes;
 use crc32fast::Hasher as Crc32Hasher;
 
 use crate::config::CompressionType;
-use crate::engine::cache::{BlockCache, CacheKey};
+use crate::engine::cache::BlockCache;
 use crate::error::{Error, Result};
 use crate::statistics::Statistics;
 
@@ -56,17 +56,25 @@ pub fn read_block_cached(
     block_cache: Option<&Arc<BlockCache>>,
     stats: Option<&Arc<Statistics>>,
 ) -> Result<Bytes> {
-    let key = CacheKey {
-        file_number,
-        offset: handle.offset,
-    };
+    read_block_cached_with_id(0, file, file_number, handle, block_cache, stats)
+}
+
+/// 带 `cache_id` 隔离的 Data Block 读取, 供多 DB 共享 `BlockCache` 使用.
+pub fn read_block_cached_with_id(
+    cache_id: u64,
+    file: &std::fs::File,
+    file_number: u64,
+    handle: &BlockHandle,
+    block_cache: Option<&Arc<BlockCache>>,
+    stats: Option<&Arc<Statistics>>,
+) -> Result<Bytes> {
     // 触碰计数: hit 与 miss 双路径均计 1, 与 block_read_bytes (仅 miss 落盘字节) 互补,
     // 前者为经典读放大 RA 分子, 后者为读穿透字节比分子
     if let Some(s) = stats {
         s.block_seek_count.fetch_add(1, Ordering::Relaxed);
     }
     if let Some(cache) = block_cache {
-        if let Some(bytes) = cache.get(key.clone()) {
+        if let Some(bytes) = cache.get_scoped(cache_id, file_number, handle.offset) {
             return Ok(bytes);
         }
     }
@@ -77,7 +85,7 @@ pub fn read_block_cached(
     }
     let bytes = Bytes::from(data);
     if let Some(cache) = block_cache {
-        cache.insert(key, bytes.clone());
+        cache.insert_scoped(cache_id, file_number, handle.offset, bytes.clone());
     }
     Ok(bytes)
 }

@@ -25,7 +25,7 @@ impl DB {
         let max_seq = self.sequence.load(AtomicOrdering::SeqCst);
 
         // 1. 优先查 RowCache (命中时零拷贝借用返回 Shared(Bytes))
-        if let Some(val) = self.row_cache.get(key, max_seq) {
+        if let Some(val) = self.row_cache.get_ns(self.db_cache_id, key, max_seq) {
             let bytes = val.len();
             self.stats.note_logical_read(bytes);
             self.stats.operation_durations[DbOp::Get as usize]
@@ -40,7 +40,8 @@ impl DB {
         if let Some(v) = r {
             let committed = self.committed_sequence.load(AtomicOrdering::Acquire);
             let b = bytes::Bytes::from(v);
-            self.row_cache.insert(key, b.clone(), committed);
+            self.row_cache
+                .insert_ns(self.db_cache_id, key, b.clone(), committed);
             self.stats.operation_durations[DbOp::Get as usize]
                 .record(op_start.elapsed().as_micros() as u64);
             return Ok(Some(PinnableSlice::Shared(b)));

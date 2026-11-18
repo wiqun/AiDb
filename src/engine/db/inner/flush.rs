@@ -81,6 +81,9 @@ impl DB {
             self.flush_memtable_to_sstable(table.inner())?;
             let removed = self.immutable_memtables.write().remove(0);
             let removed_size = removed.approximate_size() as u64;
+            if let Some(ref wbm) = self.write_buffer_manager {
+                wbm.free_mem(removed_size as usize);
+            }
             let _ = self.stats.memtable_size_bytes[1].try_update(
                 AtomicOrdering::Relaxed,
                 AtomicOrdering::Relaxed,
@@ -134,9 +137,10 @@ impl DB {
         self.stats
             .flush_written_bytes
             .fetch_add(file_size, AtomicOrdering::Relaxed);
-        let reader = Arc::new(SSTableReader::open_with_stats(
+        let reader = Arc::new(SSTableReader::open_with_caches(
             &path,
             Some(Arc::clone(&self.block_cache)),
+            Some(Arc::clone(&self.table_cache)),
             Some(Arc::clone(&self.stats)),
         )?);
         {

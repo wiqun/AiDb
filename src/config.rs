@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::engine::cache::{BlockCache, RowCache, TableCache, WriteBufferManager};
 use crate::statistics::Statistics;
 
 /// 压缩算法
@@ -138,6 +139,18 @@ pub struct Options {
     /// 引擎可观测性原子指标集合 (None 则在 open 时自动创建, 默认 None)
     #[serde(skip)]
     pub statistics: Option<Arc<Statistics>>,
+    /// 可选跨 DB 共享的 BlockCache (默认 None: 每个 DB 独立创建)
+    #[serde(skip)]
+    pub shared_block_cache: Option<Arc<BlockCache>>,
+    /// 可选跨 DB 共享的 RowCache (默认 None: 每个 DB 独立创建)
+    #[serde(skip)]
+    pub shared_row_cache: Option<Arc<RowCache>>,
+    /// 可选跨 DB 共享的 WriteBufferManager (默认 None: 不限制跨 DB 汇总内存)
+    #[serde(skip)]
+    pub shared_write_buffer_manager: Option<Arc<WriteBufferManager>>,
+    /// 可选跨 DB 共享的 TableCache (默认 None: 按 `max_open_files` 独立创建)
+    #[serde(skip)]
+    pub shared_table_cache: Option<Arc<TableCache>>,
 }
 
 impl Default for Options {
@@ -189,6 +202,10 @@ impl Default for Options {
             min_sub_compactions: 2,
             compaction_channel_size: 64,
             statistics: None,
+            shared_block_cache: None,
+            shared_row_cache: None,
+            shared_write_buffer_manager: None,
+            shared_table_cache: None,
         }
     }
 }
@@ -242,6 +259,10 @@ impl Options {
             min_sub_compactions: 2,
             compaction_channel_size: 64,
             statistics: None,
+            shared_block_cache: None,
+            shared_row_cache: None,
+            shared_write_buffer_manager: None,
+            shared_table_cache: None,
         }
     }
 

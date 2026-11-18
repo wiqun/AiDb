@@ -359,12 +359,27 @@ pub fn load_sstables_from_version(
     block_cache: Option<Arc<crate::engine::cache::BlockCache>>,
     stats: Option<Arc<Statistics>>,
 ) -> Result<Vec<Vec<Arc<SSTableReader>>>> {
+    load_sstables_from_version_with_caches(db_path, version, block_cache, None, stats)
+}
+
+pub fn load_sstables_from_version_with_caches(
+    db_path: &Path,
+    version: &Version,
+    block_cache: Option<Arc<crate::engine::cache::BlockCache>>,
+    table_cache: Option<Arc<crate::engine::cache::TableCache>>,
+    stats: Option<Arc<Statistics>>,
+) -> Result<Vec<Vec<Arc<SSTableReader>>>> {
     let mut sstables = vec![Vec::new(); version.levels.len()];
     for (level, files) in version.levels.iter().enumerate() {
         let mut opened: Vec<(u64, Arc<SSTableReader>)> = Vec::new();
         for meta in files {
             let path = sstable_path(db_path, meta.file_number, level);
-            match SSTableReader::open_with_stats(&path, block_cache.clone(), stats.clone()) {
+            match SSTableReader::open_with_caches(
+                &path,
+                block_cache.clone(),
+                table_cache.clone(),
+                stats.clone(),
+            ) {
                 Ok(reader) => opened.push((meta.file_number, Arc::new(reader))),
                 Err(e) => {
                     tracing::warn!(

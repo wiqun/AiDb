@@ -54,12 +54,38 @@ impl MultiRaftNode {
         self.start_lifecycle_impl(Some(config))
     }
 
+    fn inject_shared_caches(cfg: &mut LifecycleConfig) {
+        use crate::engine::cache::{BlockCache, RowCache, TableCache, WriteBufferManager};
+        let opts = &mut cfg.options;
+        if opts.shared_block_cache.is_none() {
+            opts.shared_block_cache = Some(Arc::new(BlockCache::new_with_stats(
+                opts.block_cache_size,
+                opts.statistics.clone(),
+            )));
+        }
+        if opts.shared_row_cache.is_none() {
+            opts.shared_row_cache = Some(Arc::new(RowCache::new(opts.row_cache_size)));
+        }
+        if opts.shared_table_cache.is_none() {
+            opts.shared_table_cache = Some(Arc::new(TableCache::new(opts.max_open_files)));
+        }
+        if opts.shared_write_buffer_manager.is_none() {
+            let global_budget = opts
+                .memtable_size
+                .saturating_mul(opts.max_write_buffer_number.max(2))
+                .saturating_mul(4);
+            opts.shared_write_buffer_manager =
+                Some(Arc::new(WriteBufferManager::new(global_budget)));
+        }
+    }
+
     fn start_lifecycle_impl(
         &self,
         mut lifecycle_config: Option<LifecycleConfig>,
     ) -> watch::Receiver<bool> {
         if let Some(ref mut cfg) = lifecycle_config {
             self.inject_shared_statistics(cfg);
+            Self::inject_shared_caches(cfg);
         }
         let (tx, rx) = watch::channel(false);
         *self.shutdown_tx.lock() = Some(tx);

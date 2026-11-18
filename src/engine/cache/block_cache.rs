@@ -46,6 +46,31 @@ pub struct CacheKey {
     pub offset: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ScopedCacheKey {
+    cache_id: u64,
+    file_number: u64,
+    offset: u64,
+}
+
+impl From<CacheKey> for ScopedCacheKey {
+    #[inline]
+    fn from(k: CacheKey) -> Self {
+        Self {
+            cache_id: 0,
+            file_number: k.file_number,
+            offset: k.offset,
+        }
+    }
+}
+
+#[inline]
+fn scoped_shard_index(key: &ScopedCacheKey) -> usize {
+    let mut hasher = rustc_hash::FxHasher::default();
+    key.hash(&mut hasher);
+    (hasher.finish() as usize) & SHARD_MASK
+}
+
 /// Snapshot of cache statistics.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CacheStats {
@@ -75,22 +100,22 @@ pub fn shard_index(key: &CacheKey) -> usize {
 
 struct ShardInner {
     /// value (Bytes) + access_counter. 计数器用于检测 lru_queue 中的 stale entry.
-    cache: HashMap<CacheKey, (Bytes, u64)>,
+    cache: HashMap<ScopedCacheKey, (Bytes, u64)>,
     /// LRU 顺序: (key, 插入/访问时的 access_counter).
     /// 可能包含 stale entry (counter 不匹配), 在 eviction 时惰性跳过.
-    lru_queue: VecDeque<(CacheKey, u64)>,
+    lru_queue: VecDeque<(ScopedCacheKey, u64)>,
     current_size: usize,
     /// 单调递增计数器, 每次 get hit 或 insert 时递增.
     next_counter: u64,
     /// Per-key pin 计数. pin count > 0 时 entry 不被 evict.
     /// key 级引用计数, 与具体 entry 值解耦 (insert 覆盖时不清理).
-    pin_counts: HashMap<CacheKey, AtomicU64>,
+    pin_counts: HashMap<ScopedCacheKey, AtomicU64>,
 }
 
 impl ShardInner {
     /// Evict the LRU entry, skipping stale entries and pinned entries.
     /// Returns true if something was evicted.
-    fn evict_one(&mut self, evictions: &AtomicU64, look_for: Option<&CacheKey>) -> bool {
+    fn evict_one(&mut self, evictions: &AtomicU64, look_for: Option<&ScopedCacheKey>) -> bool {
         loop {
             let Some((key, counter)) = self.lru_queue.pop_front() else {
                 return false;
@@ -145,7 +170,7 @@ struct CacheShard {
 ///
 /// 对应 key 的 pin count 归零后, entry 被重新追加到 lru_queue 以恢复正常驱逐.
 pub struct PinGuard<'a> {
-    key: CacheKey,
+    key: ScopedCacheKey,
     cache: &'a BlockCache,
 }
 
@@ -167,6 +192,14 @@ pub struct BlockCache {
     insertions: AtomicU64,
     evictions: AtomicU64,
     stats: Option<Arc<Statistics>>,
+}
+
+impl std::fmt::Debug for BlockCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockCache")
+            .field("capacity", &self.capacity())
+            .finish()
+    }
 }
 
 impl BlockCache {
@@ -206,6 +239,16 @@ impl BlockCache {
     }
 
     pub fn get(&self, key: CacheKey) -> Option<Bytes> {
+        self.get_scoped(0, key.file_number, key.offset)
+    }
+
+    /// 按 `(cache_id, file_number, offset)` 查找缓存, 用于跨 DB 实例共享同一个 `BlockCache`.
+    pub fn get_scoped(&self, cache_id: u64, file_number: u64, offset: u64) -> Option<Bytes> {
+        let key = ScopedCacheKey {
+            cache_id,
+            file_number,
+            offset,
+        };
         self.lookups.fetch_add(1, Ordering::Relaxed);
         if self.capacity_per_shard == 0 {
             self.misses.fetch_add(1, Ordering::Relaxed);
@@ -215,7 +258,7 @@ impl BlockCache {
             return None;
         }
 
-        let idx = shard_index(&key);
+        let idx = scoped_shard_index(&key);
         let mut guard = self.shards[idx].inner.lock();
         if let Some((value, _)) = guard.cache.get_mut(&key) {
             let result = value.clone();
@@ -224,7 +267,7 @@ impl BlockCache {
             if let Some((_, ref mut stored_counter)) = guard.cache.get_mut(&key) {
                 *stored_counter = new_counter;
             }
-            guard.lru_queue.push_back((key.clone(), new_counter));
+            guard.lru_queue.push_back((key, new_counter));
 
             while let Some((ref qkey, qcounter)) = guard.lru_queue.pop_front() {
                 let stale = match guard.cache.get(qkey) {
@@ -232,7 +275,7 @@ impl BlockCache {
                     None => true,
                 };
                 if !stale {
-                    guard.lru_queue.push_front((qkey.clone(), qcounter));
+                    guard.lru_queue.push_front((*qkey, qcounter));
                     break;
                 }
             }
@@ -255,6 +298,16 @@ impl BlockCache {
     }
 
     pub fn insert(&self, key: CacheKey, value: Bytes) {
+        self.insert_scoped(0, key.file_number, key.offset, value);
+    }
+
+    /// 按 `(cache_id, file_number, offset)` 插入缓存, 用于跨 DB 实例共享同一个 `BlockCache`.
+    pub fn insert_scoped(&self, cache_id: u64, file_number: u64, offset: u64, value: Bytes) {
+        let key = ScopedCacheKey {
+            cache_id,
+            file_number,
+            offset,
+        };
         if self.capacity_per_shard == 0 {
             return;
         }
@@ -264,7 +317,7 @@ impl BlockCache {
         }
 
         let max_evictions = (self.capacity_per_shard / ASSUMED_BLOCK_SIZE).max(MIN_MAX_EVICTIONS);
-        let idx = shard_index(&key);
+        let idx = scoped_shard_index(&key);
         let mut guard = self.shards[idx].inner.lock();
 
         // 覆盖已有 key: 先清理旧 LRU entry (惰性, evict_one 会跳过 stale)
@@ -303,7 +356,7 @@ impl BlockCache {
             }
         }
 
-        let inserted = guard.cache.insert(key.clone(), (value, counter)).is_none();
+        let inserted = guard.cache.insert(key, (value, counter)).is_none();
         if inserted {
             guard.current_size += value_len;
         }
@@ -335,14 +388,15 @@ impl BlockCache {
     ///
     /// 若 key 不在 cache 中, 返回 None.
     pub fn pin(&self, key: CacheKey) -> Option<PinGuard<'_>> {
-        let idx = shard_index(&key);
+        let key: ScopedCacheKey = key.into();
+        let idx = scoped_shard_index(&key);
         let mut guard = self.shards[idx].inner.lock();
         if !guard.cache.contains_key(&key) {
             return None;
         }
         let counter = guard
             .pin_counts
-            .entry(key.clone())
+            .entry(key)
             .or_insert_with(|| AtomicU64::new(0));
         let prev = counter.fetch_add(1, Ordering::Relaxed);
         debug_assert!(prev < u64::MAX, "pin_count overflow for key {:?}", key);
@@ -351,8 +405,8 @@ impl BlockCache {
     }
 
     /// 手动解 pin (等同于 drop PinGuard). 公开以便无 PinGuard 场景使用.
-    fn unpin(&self, key: &CacheKey) {
-        let idx = shard_index(key);
+    fn unpin(&self, key: &ScopedCacheKey) {
+        let idx = scoped_shard_index(key);
         let mut guard = self.shards[idx].inner.lock();
         if let Some(counter) = guard.pin_counts.get(key) {
             let prev = counter.fetch_sub(1, Ordering::Relaxed);
@@ -361,7 +415,7 @@ impl BlockCache {
                 // 重新挂入 lru_queue: 使该 entry 恢复正常驱逐路径.
                 let stored_counter = guard.cache.get(key).map(|(_, c)| *c);
                 if let Some(sc) = stored_counter {
-                    guard.lru_queue.push_back((key.clone(), sc));
+                    guard.lru_queue.push_back((*key, sc));
                 }
             }
         }
@@ -695,5 +749,51 @@ mod tests {
         for k in &keys {
             assert!(cache.get(k.clone()).is_some(), "key {k:?} should exist");
         }
+    }
+
+    #[test]
+    fn shared_block_and_row_cache_isolate_two_dbs() {
+        use crate::config::Options;
+        use crate::engine::cache::RowCache;
+        use crate::DB;
+        use tempfile::tempdir;
+
+        let dir1 = tempdir().unwrap();
+        let dir2 = tempdir().unwrap();
+        let shared_bc = Arc::new(BlockCache::new(1024 * 1024));
+        let shared_rc = Arc::new(RowCache::new(1024 * 1024));
+
+        let mut opts1 = Options::for_testing();
+        opts1.shared_block_cache = Some(Arc::clone(&shared_bc));
+        opts1.shared_row_cache = Some(Arc::clone(&shared_rc));
+        let mut opts2 = opts1.clone();
+        opts2.shared_block_cache = Some(Arc::clone(&shared_bc));
+        opts2.shared_row_cache = Some(Arc::clone(&shared_rc));
+
+        let db1 = DB::open(dir1.path(), opts1).unwrap();
+        let db2 = DB::open(dir2.path(), opts2).unwrap();
+
+        db1.put(b"k1", b"val-from-db1").unwrap();
+        db2.put(b"k1", b"val-from-db2").unwrap();
+        db1.flush().unwrap();
+        db2.flush().unwrap();
+
+        assert_eq!(
+            db1.get(b"k1").unwrap().as_deref(),
+            Some(b"val-from-db1".as_slice())
+        );
+        assert_eq!(
+            db2.get(b"k1").unwrap().as_deref(),
+            Some(b"val-from-db2".as_slice())
+        );
+        // Second read hits RowCache / BlockCache and must remain isolated
+        assert_eq!(
+            db1.get(b"k1").unwrap().as_deref(),
+            Some(b"val-from-db1".as_slice())
+        );
+        assert_eq!(
+            db2.get(b"k1").unwrap().as_deref(),
+            Some(b"val-from-db2".as_slice())
+        );
     }
 }

@@ -206,9 +206,10 @@ impl DB {
 
             for result in &results {
                 if result.entry_count > 0 {
-                    let reader = Arc::new(SSTableReader::open_with_stats(
+                    let reader = Arc::new(SSTableReader::open_with_caches(
                         &result.output_path,
                         Some(Arc::clone(&self.block_cache)),
+                        Some(Arc::clone(&self.table_cache)),
                         Some(Arc::clone(&self.stats)),
                     )?);
                     if task.output_level == 0 {

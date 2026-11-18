@@ -562,16 +562,20 @@ impl DB {
 
     fn insert_batch_to_memtable(&self, batch: &WriteBatch, base_seq: u64) -> Result<()> {
         let mt = self.memtable.read();
+        let before_size = self
+            .write_buffer_manager
+            .as_ref()
+            .map(|_| mt.approximate_size());
         for (i, op) in batch.operations.iter().enumerate() {
             let seq = base_seq + i as u64;
             match op {
                 WriteOp::Put { key, value } => {
                     mt.put(key, value, seq)?;
-                    self.row_cache.invalidate(key);
+                    self.row_cache.invalidate_ns(self.db_cache_id, key);
                 }
                 WriteOp::Delete { key } => {
                     mt.delete(key, seq)?;
-                    self.row_cache.invalidate(key);
+                    self.row_cache.invalidate_ns(self.db_cache_id, key);
                 }
                 WriteOp::DeleteRange { start, end } => {
                     mt.put_range_delete(start, end, seq)?;
@@ -579,16 +583,30 @@ impl DB {
                 }
             }
         }
+        if let (Some(ref wbm), Some(before)) = (&self.write_buffer_manager, before_size) {
+            let delta = mt.approximate_size().saturating_sub(before);
+            wbm.reserve_mem(delta);
+        }
         Ok(())
     }
 
     fn maybe_freeze(&self) -> Result<()> {
-        if self.memtable.read().approximate_size() < self.options.memtable_size {
+        let wbm_flush = self
+            .write_buffer_manager
+            .as_ref()
+            .is_some_and(|wbm| wbm.should_flush());
+        let active_size = self.memtable.read().approximate_size();
+        if active_size < self.options.memtable_size && !(wbm_flush && active_size > 0) {
             return Ok(());
         }
         self.wait_for_memtable_slot()?;
         let mut mem = self.memtable.write();
-        if mem.approximate_size() < self.options.memtable_size {
+        let active_size = mem.approximate_size();
+        let wbm_flush = self
+            .write_buffer_manager
+            .as_ref()
+            .is_some_and(|wbm| wbm.should_flush());
+        if active_size < self.options.memtable_size && !(wbm_flush && active_size > 0) {
             return Ok(());
         }
         let flush_seq = self.sequence.load(AtomicOrdering::SeqCst);

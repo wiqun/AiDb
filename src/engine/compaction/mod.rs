@@ -18,8 +18,9 @@ pub use job::{CompactionJob, CompactionResult};
 pub use merge::MergeIterator;
 pub use picker::{CompactionPicker, CompactionTask};
 pub use version::{
-    current_exists, load_sstables_from_version, remove_orphan_sstables,
-    scan_version_edits_from_dir, FileMetaData, Version, VersionEdit, VersionSet,
+    current_exists, load_sstables_from_version, load_sstables_from_version_with_caches,
+    remove_orphan_sstables, scan_version_edits_from_dir, FileMetaData, Version, VersionEdit,
+    VersionSet,
 };
 
 pub fn target_size_for_level(level: usize, opts: &crate::config::Options) -> u64 {
