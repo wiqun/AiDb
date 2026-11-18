@@ -17,7 +17,7 @@ openraft::declare_raft_types!(
         Node = openraft::BasicNode,
         Term = u64,
         LeaderId = openraft::impls::leader_id_std::LeaderId<Self::Term, Self::NodeId>,
-        Entry = openraft::Entry<<Self::LeaderId as openraft::vote::RaftLeaderId>::Committed, Self::D, Self::NodeId, Self::Node>,
+        Entry = openraft::Entry<<Self::LeaderId as openraft::vote::RaftLeaderId>::Committed, openraft::EntryPayload<Self::D, openraft::Membership<Self::NodeId, Self::Node>>>,
         AsyncRuntime = openraft_rt_tokio::TokioRuntime,
 );
 
@@ -209,6 +209,8 @@ pub struct RaftNodeConfig {
     /// 是否启用 linearizable read (ReadIndex).
     /// 启用后每次 get() 触发 quorum 心跳 + applied index 等待.
     pub linearizable_read: bool,
+    pub enable_local_lease_read: bool,
+    pub enable_pre_vote: bool,
     pub max_entry_size: u64,
     pub rpc_timeout_ms: u64,
     pub grpc_max_message_size: u64,
@@ -228,6 +230,8 @@ impl Default for RaftNodeConfig {
             snapshot_logs_since_last: 50_000,
             snapshot_size_threshold: None,
             linearizable_read: false,
+            enable_local_lease_read: false,
+            enable_pre_vote: true,
             max_entry_size: 8 * 1024 * 1024,
             rpc_timeout_ms: 200,
             grpc_max_message_size: 64 * 1024 * 1024,
@@ -262,6 +266,9 @@ impl RaftNodeConfig {
             return Err(ClusterError::InvalidConfig(
                 "snapshot_size_threshold must be > 0".into(),
             ));
+        }
+        if let Some(ref lc) = self.log_committer_config {
+            lc.validate()?;
         }
         Ok(())
     }

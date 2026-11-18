@@ -1,8 +1,8 @@
 use super::{
-    raft_rpc, timeout, vote_from_wire, AppendEntriesRequest, AppendEntriesResponse, Arc,
-    ClusterError, DashMap, Duration, Error, NetworkError, NodeId, RPCError, RPCOption,
-    RaftNetworkV2, RaftServiceClient, Request, Response, Result, SnapshotResponse, TonicRequest,
-    TypeConfig, Unreachable, VoteRequest, VoteResponse,
+    raft_rpc, timeout, vote_from_wire, AppendEntriesRequest, Arc, ClusterError, DashMap, Duration,
+    Error, NetworkError, NodeId, RPCError, RPCOption, RaftNetworkV2, RaftServiceClient, Request,
+    Response, Result, SnapshotResponse, TonicRequest, TypeConfig, Unreachable, VoteRequest,
+    VoteResponse,
 };
 use crate::statistics::{RaftRpcDirection, RaftRpcType, Statistics};
 
@@ -374,13 +374,13 @@ impl RaftNetworkClient {
 }
 
 impl RaftNetworkV2<TypeConfig> for RaftNetworkClient {
-    type SnapshotData = std::io::Cursor<Vec<u8>>;
+    type SnapshotData = crate::cluster::storage::SnapshotFileData;
 
     async fn append_entries(
         &mut self,
         rpc: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
-    ) -> std::result::Result<AppendEntriesResponse<TypeConfig>, RPCError<TypeConfig>> {
+    ) -> std::result::Result<openraft::raft::AppendResult<TypeConfig>, RPCError<TypeConfig>> {
         #[cfg(feature = "cluster-test-util")]
         if crate::cluster::failpoint::blackhole_active(self.node_id, &self.target_addr) {
             return Err(RPCError::Network(NetworkError::<TypeConfig>::from_string(
@@ -419,6 +419,8 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkClient {
             leader_commit_leader_id: rpc.leader_commit.map(|_id| 0), // v0.10 CommittedLeaderId has no node_id
         };
 
+        let prev_log_id = rpc.prev_log_id;
+        let last_log_id = rpc.entries.last().map(|e| e.log_id).or(prev_log_id);
         let rpc_future = client.append_entries(TonicRequest::new(request));
         let t0 = std::time::Instant::now();
         let response = match timeout(req_timeout, rpc_future).await {
@@ -448,7 +450,7 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkClient {
 
         let resp = response.into_inner();
         if resp.success {
-            Ok(AppendEntriesResponse::Success)
+            Ok(Ok(last_log_id))
         } else if resp.vote_term > 0 || resp.vote_node_id > 0 {
             // HigherVote: the follower has seen a higher term. The leader must step down.
             tracing::info!(
@@ -458,9 +460,23 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkClient {
                 "received HigherVote from follower, leader must step down"
             );
             let vote = vote_from_wire(resp.vote_term, resp.vote_node_id, resp.vote_committed);
-            Ok(AppendEntriesResponse::HigherVote(vote))
+            Ok(Err(openraft::raft::AppendError::HigherVote(vote)))
         } else {
-            Ok(AppendEntriesResponse::Conflict)
+            let log_id = prev_log_id.unwrap_or_else(|| {
+                openraft::LogId::new(openraft::vote::leader_id_std::CommittedLeaderId::new(0), 0)
+            });
+            let hint = match (resp.conflict_index, resp.conflict_term) {
+                (Some(idx), Some(term)) if idx > 0 || term > 0 => {
+                    Some(openraft::raft::ConflictHint::new(vec![
+                        openraft::LogId::new(
+                            openraft::vote::leader_id_std::CommittedLeaderId::new(term),
+                            idx,
+                        ),
+                    ]))
+                }
+                _ => None,
+            };
+            Ok(Err(openraft::raft::AppendError::Conflict { log_id, hint }))
         }
     }
 
@@ -484,7 +500,6 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkClient {
                 "blackhole"
             )));
         }
-        drop(cancel); // Not using cancellation in this implementation
         let group_id = self.group_id;
         let meta = raft_rpc::SnapshotMeta {
             last_log_index: snapshot.meta.last_log_id.map(|id| id.index),
@@ -503,27 +518,64 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkClient {
                 .map(|id| format!("snap-{}", id.index))
                 .unwrap_or_default(),
         };
-
-        let data = snapshot.snapshot.into_inner();
-        let total = data.len() as u64;
-        let mut offset = 0usize;
-        let resp = loop {
-            let end = (offset + SNAPSHOT_CHUNK_BYTES).min(data.len());
+        let total = snapshot.snapshot.len();
+        let mut cancel = std::pin::pin!(cancel);
+        let resp = if let Some(path) = snapshot.snapshot.path() {
+            use tokio::io::AsyncReadExt;
+            let mut file = tokio::fs::File::open(path).await.map_err(|e| {
+                openraft::error::StreamingError::Network(NetworkError::<TypeConfig>::new(
+                    &Unreachable::<TypeConfig>::new(&e),
+                ))
+            })?;
+            let mut offset = 0u64;
+            let mut buf = vec![0u8; SNAPSHOT_CHUNK_BYTES];
+            loop {
+                let mut filled = 0usize;
+                while filled < buf.len() {
+                    let n = file.read(&mut buf[filled..]).await.map_err(|e| {
+                        openraft::error::StreamingError::Network(NetworkError::<TypeConfig>::new(
+                            &Unreachable::<TypeConfig>::new(&e),
+                        ))
+                    })?;
+                    if n == 0 {
+                        break;
+                    }
+                    filled += n;
+                }
+                let next_offset = offset + filled as u64;
+                let request = raft_rpc::InstallSnapshotRequest {
+                    group_id,
+                    vote_term: vote.leader_id.term,
+                    vote_node_id: vote.leader_id.voted_for,
+                    vote_committed: vote.committed,
+                    meta: Some(meta.clone()),
+                    snapshot_data: buf[..filled].to_vec(),
+                    snapshot_offset: offset,
+                    snapshot_total: total,
+                };
+                let r = tokio::select! {
+                    closed = &mut cancel => {
+                        return Err(openraft::error::StreamingError::Closed(closed));
+                    }
+                    res = self.install_snapshot_rpc(request) => res?,
+                };
+                if next_offset >= total || filled == 0 {
+                    break r;
+                }
+                offset = next_offset;
+            }
+        } else {
             let request = raft_rpc::InstallSnapshotRequest {
                 group_id,
                 vote_term: vote.leader_id.term,
                 vote_node_id: vote.leader_id.voted_for,
                 vote_committed: vote.committed,
-                meta: Some(meta.clone()),
-                snapshot_data: data[offset..end].to_vec(),
-                snapshot_offset: offset as u64,
-                snapshot_total: total,
+                meta: Some(meta),
+                snapshot_data: Vec::new(),
+                snapshot_offset: 0,
+                snapshot_total: 0,
             };
-            let r = self.install_snapshot_rpc(request).await?;
-            if end == data.len() {
-                break r;
-            }
-            offset = end;
+            self.install_snapshot_rpc(request).await?
         };
         Ok(SnapshotResponse {
             vote: vote_from_wire(resp.vote_term, resp.vote_node_id, resp.vote_committed),
@@ -584,10 +636,215 @@ impl RaftNetworkV2<TypeConfig> for RaftNetworkClient {
         };
 
         let resp = response.into_inner();
+        let last_log_id = match (resp.last_log_index, resp.last_log_term) {
+            (Some(idx), Some(term)) => Some(openraft::LogId::new(
+                openraft::vote::leader_id_std::CommittedLeaderId::new(term),
+                idx,
+            )),
+            _ => None,
+        };
         Ok(VoteResponse {
             vote: vote_from_wire(resp.vote_term, resp.vote_node_id, resp.vote_committed),
             vote_granted: resp.vote_granted,
-            last_log_id: None,
+            last_log_id,
+        })
+    }
+
+    async fn pre_vote(
+        &mut self,
+        rpc: VoteRequest<TypeConfig>,
+        _option: RPCOption,
+    ) -> std::result::Result<VoteResponse<TypeConfig>, RPCError<TypeConfig>> {
+        #[cfg(feature = "cluster-test-util")]
+        if crate::cluster::failpoint::blackhole_active(self.node_id, &self.target_addr) {
+            return Err(RPCError::Network(NetworkError::<TypeConfig>::from_string(
+                "blackhole",
+            )));
+        }
+        if let Some(stats) = &self.stats {
+            stats.raft_rpc[RaftRpcType::Vote as usize][RaftRpcDirection::Outgoing as usize]
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let req_timeout = self.request_timeout;
+        let group_id = self.group_id;
+        let client = match self.get_client().await {
+            Ok(c) => c,
+            Err(e) => {
+                self.invalidate_channel();
+                return Err(RPCError::Network(e));
+            }
+        };
+
+        let request = raft_rpc::VoteRequest {
+            group_id,
+            vote_term: rpc.vote.leader_id.term,
+            vote_node_id: rpc.vote.leader_id.voted_for,
+            vote_committed: rpc.vote.committed,
+            last_log_index: rpc.last_log_id.map(|id| id.index).unwrap_or(0),
+            last_log_term: rpc.last_log_id.map(|id| id.leader_id.term).unwrap_or(0),
+            last_log_leader_id: rpc.last_log_id.map(|_id| 0).unwrap_or(0),
+        };
+
+        let rpc_future = client.pre_vote(TonicRequest::new(request));
+        let response = match timeout(req_timeout, rpc_future).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                self.invalidate_on_unavailable(&e);
+                return Err(RPCError::Network(NetworkError::<TypeConfig>::new(&e)));
+            }
+            Err(_) => {
+                let io_err = std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("PreVote timeout after {}ms", req_timeout.as_millis()),
+                );
+                return Err(RPCError::Network(NetworkError::<TypeConfig>::new(
+                    &Unreachable::<TypeConfig>::new(&io_err),
+                )));
+            }
+        };
+
+        let resp = response.into_inner();
+        let last_log_id = match (resp.last_log_index, resp.last_log_term) {
+            (Some(idx), Some(term)) => Some(openraft::LogId::new(
+                openraft::vote::leader_id_std::CommittedLeaderId::new(term),
+                idx,
+            )),
+            _ => None,
+        };
+        Ok(VoteResponse {
+            vote: vote_from_wire(resp.vote_term, resp.vote_node_id, resp.vote_committed),
+            vote_granted: resp.vote_granted,
+            last_log_id,
+        })
+    }
+
+    fn stream_append<'s, S>(
+        &'s mut self,
+        input: S,
+        _option: RPCOption,
+    ) -> futures_util::future::BoxFuture<
+        's,
+        std::result::Result<
+            futures_util::stream::BoxStream<
+                's,
+                std::result::Result<openraft::raft::AppendResult<TypeConfig>, RPCError<TypeConfig>>,
+            >,
+            RPCError<TypeConfig>,
+        >,
+    >
+    where
+        S: futures_util::Stream<Item = AppendEntriesRequest<TypeConfig>>
+            + openraft::OptionalSend
+            + Unpin
+            + 'static,
+    {
+        use futures_util::StreamExt;
+        Box::pin(async move {
+            #[cfg(feature = "cluster-test-util")]
+            if crate::cluster::failpoint::blackhole_active(self.node_id, &self.target_addr) {
+                return Err(RPCError::Network(NetworkError::<TypeConfig>::from_string(
+                    "blackhole",
+                )));
+            }
+            let group_id = self.group_id;
+            let payload_cache = self.payload_cache.clone();
+            let client = match self.get_client().await {
+                Ok(c) => c,
+                Err(e) => {
+                    self.invalidate_channel();
+                    return Err(RPCError::Network(e));
+                }
+            };
+
+            let (tx, rx) = tokio::sync::mpsc::channel::<raft_rpc::AppendEntriesRequest>(64);
+            let mut input = input;
+            tokio::spawn(async move {
+                while let Some(rpc) = input.next().await {
+                    let Ok(entries) = encode_log_entries(&rpc.entries, payload_cache.as_deref())
+                    else {
+                        break;
+                    };
+                    let wire = raft_rpc::AppendEntriesRequest {
+                        group_id,
+                        vote_term: rpc.vote.leader_id.term,
+                        vote_node_id: rpc.vote.leader_id.voted_for,
+                        vote_committed: rpc.vote.committed,
+                        prev_log_index: rpc.prev_log_id.map(|id| id.index),
+                        prev_log_term: rpc.prev_log_id.map(|id| id.leader_id.term),
+                        prev_log_leader_id: rpc.prev_log_id.map(|_| 0),
+                        entries,
+                        leader_commit_index: rpc.leader_commit.map(|id| id.index),
+                        leader_commit_term: rpc.leader_commit.map(|id| id.leader_id.term),
+                        leader_commit_leader_id: rpc.leader_commit.map(|_| 0),
+                    };
+                    if tx.send(wire).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            let resp_stream = client
+                .stream_append_entries(tokio_stream::wrappers::ReceiverStream::new(rx))
+                .await
+                .map_err(|e| {
+                    self.invalidate_on_unavailable(&e);
+                    RPCError::Network(NetworkError::<TypeConfig>::new(
+                        &Unreachable::<TypeConfig>::new(&e),
+                    ))
+                })?
+                .into_inner();
+
+            let mapped = resp_stream.map(|item| {
+                let resp = item.map_err(|e| {
+                    RPCError::Network(NetworkError::<TypeConfig>::new(
+                        &Unreachable::<TypeConfig>::new(&e),
+                    ))
+                })?;
+                if resp.success {
+                    let ack = match (resp.ack_index, resp.ack_term) {
+                        (Some(idx), Some(term)) => Some(openraft::LogId::new(
+                            openraft::vote::leader_id_std::CommittedLeaderId::new(term),
+                            idx,
+                        )),
+                        _ => None,
+                    };
+                    Ok(Ok(ack))
+                } else if resp.vote_term > 0 || resp.vote_node_id > 0 {
+                    let vote =
+                        vote_from_wire(resp.vote_term, resp.vote_node_id, resp.vote_committed);
+                    Ok(Err(openraft::raft::AppendError::HigherVote(vote)))
+                } else {
+                    let log_id = openraft::LogId::new(
+                        openraft::vote::leader_id_std::CommittedLeaderId::new(
+                            resp.conflict_term.unwrap_or(0),
+                        ),
+                        resp.conflict_index.unwrap_or(0),
+                    );
+                    let log_ids: Vec<_> = resp
+                        .hint_indices
+                        .into_iter()
+                        .zip(resp.hint_terms)
+                        .map(|(idx, term)| {
+                            openraft::LogId::new(
+                                openraft::vote::leader_id_std::CommittedLeaderId::new(term),
+                                idx,
+                            )
+                        })
+                        .collect();
+                    let hint =
+                        (!log_ids.is_empty()).then(|| openraft::raft::ConflictHint::new(log_ids));
+                    Ok(Err(openraft::raft::AppendError::Conflict { log_id, hint }))
+                }
+            });
+
+            Ok(Box::pin(mapped)
+                as futures_util::stream::BoxStream<
+                    's,
+                    std::result::Result<
+                        openraft::raft::AppendResult<TypeConfig>,
+                        RPCError<TypeConfig>,
+                    >,
+                >)
         })
     }
 }

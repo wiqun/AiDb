@@ -1,8 +1,7 @@
 use super::raft_rpc::raft_service_server::RaftService;
 use super::{
-    raft_rpc, vote_from_wire, AppendEntriesRequest, AppendEntriesResponse, Arc, ClusterError,
-    Error, HashMap, NodeId, OpenRaftNode, OpenRaftStorage, Request, RwLock, TonicRequest,
-    TypeConfig, VoteRequest,
+    raft_rpc, vote_from_wire, AppendEntriesRequest, Arc, ClusterError, Error, HashMap,
+    OpenRaftNode, OpenRaftStorage, Request, RwLock, TonicRequest, TypeConfig, VoteRequest,
 };
 use crate::statistics::{RaftRpcDirection, RaftRpcType, Statistics};
 
@@ -89,7 +88,7 @@ pub(super) fn decode_log_entries(
 ) -> std::result::Result<Vec<crate::cluster::types::LogEntry>, tonic::Status> {
     let mut entries = Vec::with_capacity(raw_entries.len());
     for entry in raw_entries {
-        let payload: openraft::EntryPayload<Request, NodeId, openraft::BasicNode> =
+        let payload: openraft::alias::EntryPayloadOf<TypeConfig> =
             rmp_serde::from_slice(&entry.payload)
                 .map_err(|e| tonic::Status::internal(format!("deserialize entry: {e}")))?;
         entries.push(crate::cluster::types::LogEntry {
@@ -120,56 +119,171 @@ impl RaftServiceImpl {
 
 pub(crate) struct SnapshotAssembly {
     snapshot_id: String,
-    total: usize,
-    buf: Vec<u8>,
+    total: u64,
+    received: u64,
+    path: std::path::PathBuf,
+    writer: Option<std::io::BufWriter<std::fs::File>>,
 }
 
-/// 把一片快照拼进 `slot`. 返回 `Some` 表示整包已经齐, 可以安装.
+impl Drop for SnapshotAssembly {
+    fn drop(&mut self) {
+        self.writer.take();
+        if !self.path.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// 把一片快照流式写入临时文件. 返回 `Some` 表示整包已经齐, 可以安装.
 pub(crate) fn push_snapshot_chunk(
     slot: &mut Option<SnapshotAssembly>,
     snapshot_id: &str,
     total: u64,
     offset: u64,
     data: Vec<u8>,
-) -> std::result::Result<Option<Vec<u8>>, String> {
+) -> std::result::Result<Option<crate::cluster::storage::SnapshotFileData>, String> {
+    use std::io::Write;
     if total == 0 {
-        return Ok(Some(data));
+        return crate::cluster::storage::SnapshotFileData::from_bytes_temp(&data)
+            .map(Some)
+            .map_err(|e| e.to_string());
     }
-    let total = usize::try_from(total).map_err(|_| "snapshot total overflow".to_string())?;
-    let offset = usize::try_from(offset).map_err(|_| "snapshot offset overflow".to_string())?;
-    if offset > total || data.len() > total - offset {
+    let chunk_len = data.len() as u64;
+    if offset > total || chunk_len > total - offset {
         return Err(format!(
             "snapshot chunk out of range offset={offset} len={} total={total}",
             data.len()
         ));
     }
-    if offset == 0 && data.len() == total {
+    if offset == 0 && chunk_len == total {
         *slot = None;
-        return Ok(Some(data));
+        return crate::cluster::storage::SnapshotFileData::from_bytes_temp(&data)
+            .map(Some)
+            .map_err(|e| e.to_string());
     }
     if offset == 0 {
+        let seq = NEXT_RECV_SNAP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("aidb_snap_recv_{}_{}.bin", std::process::id(), seq));
+        let file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+        let mut writer = std::io::BufWriter::new(file);
+        writer.write_all(&data).map_err(|e| e.to_string())?;
         *slot = Some(SnapshotAssembly {
             snapshot_id: snapshot_id.to_string(),
             total,
-            buf: data,
+            received: chunk_len,
+            path,
+            writer: Some(writer),
         });
         return Ok(None);
     }
     let Some(cur) = slot.as_mut() else {
         return Err("snapshot chunk without a start".to_string());
     };
-    if cur.snapshot_id != snapshot_id || cur.total != total || cur.buf.len() != offset {
+    if cur.snapshot_id != snapshot_id || cur.total != total || cur.received != offset {
         return Err("snapshot chunk does not continue the in-flight snapshot".to_string());
     }
-    cur.buf.extend_from_slice(&data);
-    if cur.buf.len() == cur.total {
-        return Ok(Some(slot.take().expect("slot 刚确认存在").buf));
+    let writer = cur
+        .writer
+        .as_mut()
+        .ok_or_else(|| "snapshot writer closed".to_string())?;
+    writer.write_all(&data).map_err(|e| e.to_string())?;
+    cur.received += chunk_len;
+    if cur.received == cur.total {
+        let mut done = slot.take().expect("slot 刚确认存在");
+        if let Some(mut w) = done.writer.take() {
+            w.flush().map_err(|e| e.to_string())?;
+        }
+        let path = std::mem::take(&mut done.path);
+        return Ok(Some(
+            crate::cluster::storage::SnapshotFileData::from_temp_path(
+                path,
+                cur_total_or(done.total),
+            ),
+        ));
     }
     Ok(None)
 }
 
+fn cur_total_or(total: u64) -> u64 {
+    total
+}
+
+static NEXT_RECV_SNAP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn decode_vote_request(req: &raft_rpc::VoteRequest) -> VoteRequest<TypeConfig> {
+    let last_log_id = if req.last_log_index > 0 {
+        Some(openraft::LogId::new(
+            openraft::vote::leader_id_std::CommittedLeaderId::new(req.last_log_term),
+            req.last_log_index,
+        ))
+    } else {
+        None
+    };
+    VoteRequest::new(
+        vote_from_wire(req.vote_term, req.vote_node_id, req.vote_committed),
+        last_log_id,
+    )
+}
+
+fn encode_vote_response(
+    vote_resp: openraft::raft::VoteResponse<TypeConfig>,
+) -> raft_rpc::VoteResponse {
+    raft_rpc::VoteResponse {
+        vote_term: vote_resp.vote.leader_id.term,
+        vote_node_id: vote_resp.vote.leader_id.voted_for,
+        vote_committed: vote_resp.vote.committed,
+        vote_granted: vote_resp.vote_granted,
+        is_in_membership: true,
+        last_log_index: vote_resp.last_log_id.map(|id| id.index),
+        last_log_term: vote_resp.last_log_id.map(|id| id.leader_id.term),
+    }
+}
+
+fn decode_append_request(
+    req: raft_rpc::AppendEntriesRequest,
+) -> std::result::Result<(u64, AppendEntriesRequest<TypeConfig>), tonic::Status> {
+    let group_id = req.group_id;
+    let entries = decode_log_entries(req.entries)?;
+    let prev_log_id = match (
+        req.prev_log_index,
+        req.prev_log_term,
+        req.prev_log_leader_id,
+    ) {
+        (Some(index), Some(term), Some(_)) => Some(openraft::LogId::new(
+            openraft::vote::leader_id_std::CommittedLeaderId::new(term),
+            index,
+        )),
+        _ => None,
+    };
+    let leader_commit = match (
+        req.leader_commit_index,
+        req.leader_commit_term,
+        req.leader_commit_leader_id,
+    ) {
+        (Some(index), Some(term), Some(_)) => Some(openraft::LogId::new(
+            openraft::vote::leader_id_std::CommittedLeaderId::new(term),
+            index,
+        )),
+        _ => None,
+    };
+    Ok((
+        group_id,
+        AppendEntriesRequest {
+            vote: vote_from_wire(req.vote_term, req.vote_node_id, req.vote_committed),
+            prev_log_id,
+            entries,
+            leader_commit,
+        },
+    ))
+}
+
 #[tonic::async_trait]
 impl RaftService for RaftServiceImpl {
+    type StreamAppendEntriesStream = tokio_stream::wrappers::ReceiverStream<
+        std::result::Result<raft_rpc::StreamAppendResponse, tonic::Status>,
+    >;
+
     async fn vote(
         &self,
         request: TonicRequest<raft_rpc::VoteRequest>,
@@ -179,21 +293,7 @@ impl RaftService for RaftServiceImpl {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let req = request.into_inner();
-        let last_log_id = if req.last_log_index > 0 {
-            Some(openraft::LogId::new(
-                openraft::vote::leader_id_std::CommittedLeaderId::new(req.last_log_term),
-                req.last_log_index,
-            ))
-        } else {
-            None
-        };
-
-        let vote_req = VoteRequest {
-            vote: vote_from_wire(req.vote_term, req.vote_node_id, req.vote_committed),
-            last_log_id,
-            leadership_transfer: false,
-        };
-
+        let vote_req = decode_vote_request(&req);
         let raft = self
             .dispatcher
             .get_raft(req.group_id)
@@ -202,14 +302,28 @@ impl RaftService for RaftServiceImpl {
             .vote(vote_req)
             .await
             .map_err(|e| tonic::Status::internal(format!("Vote failed: {e}")))?;
+        Ok(tonic::Response::new(encode_vote_response(vote_resp)))
+    }
 
-        Ok(tonic::Response::new(raft_rpc::VoteResponse {
-            vote_term: vote_resp.vote.leader_id.term,
-            vote_node_id: vote_resp.vote.leader_id.voted_for,
-            vote_committed: vote_resp.vote.committed,
-            vote_granted: vote_resp.vote_granted,
-            is_in_membership: true,
-        }))
+    async fn pre_vote(
+        &self,
+        request: TonicRequest<raft_rpc::VoteRequest>,
+    ) -> std::result::Result<tonic::Response<raft_rpc::VoteResponse>, tonic::Status> {
+        if let Some(stats) = &self.dispatcher.stats {
+            stats.raft_rpc[RaftRpcType::Vote as usize][RaftRpcDirection::Incoming as usize]
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let req = request.into_inner();
+        let vote_req = decode_vote_request(&req);
+        let raft = self
+            .dispatcher
+            .get_raft(req.group_id)
+            .ok_or_else(|| tonic::Status::not_found(format!("group {} not found", req.group_id)))?;
+        let vote_resp = raft
+            .pre_vote(vote_req)
+            .await
+            .map_err(|e| tonic::Status::internal(format!("PreVote failed: {e}")))?;
+        Ok(tonic::Response::new(encode_vote_response(vote_resp)))
     }
 
     async fn append_entries(
@@ -279,25 +393,30 @@ impl RaftService for RaftServiceImpl {
             .map_err(|e| tonic::Status::internal(format!("AppendEntries failed: {e}")))?;
 
         let response = match append_resp {
-            AppendEntriesResponse::Success | AppendEntriesResponse::PartialSuccess(_) => {
+            Ok(_) => raft_rpc::AppendEntriesResponse {
+                vote_term: 0,
+                vote_node_id: 0,
+                vote_committed: false,
+                success: true,
+                conflict_index: None,
+                conflict_term: None,
+            },
+            Err(openraft::raft::AppendError::Conflict { log_id, hint }) => {
+                let first_hint = hint.as_ref().and_then(|h| h.log_ids.first()).copied();
+                let (conflict_index, conflict_term) = match first_hint {
+                    Some(id) => (Some(id.index), Some(id.leader_id.term)),
+                    None => (Some(log_id.index), Some(log_id.leader_id.term)),
+                };
                 raft_rpc::AppendEntriesResponse {
                     vote_term: 0,
                     vote_node_id: 0,
                     vote_committed: false,
-                    success: true,
-                    conflict_index: None,
-                    conflict_term: None,
+                    success: false,
+                    conflict_index,
+                    conflict_term,
                 }
             }
-            AppendEntriesResponse::Conflict => raft_rpc::AppendEntriesResponse {
-                vote_term: 0,
-                vote_node_id: 0,
-                vote_committed: false,
-                success: false,
-                conflict_index: Some(0),
-                conflict_term: Some(0),
-            },
-            AppendEntriesResponse::HigherVote(vote) => raft_rpc::AppendEntriesResponse {
+            Err(openraft::raft::AppendError::HigherVote(vote)) => raft_rpc::AppendEntriesResponse {
                 vote_term: vote.leader_id.term,
                 vote_node_id: vote.leader_id.voted_for,
                 vote_committed: vote.committed,
@@ -308,6 +427,125 @@ impl RaftService for RaftServiceImpl {
         };
 
         Ok(tonic::Response::new(response))
+    }
+
+    async fn stream_append_entries(
+        &self,
+        request: TonicRequest<tonic::Streaming<raft_rpc::AppendEntriesRequest>>,
+    ) -> std::result::Result<tonic::Response<Self::StreamAppendEntriesStream>, tonic::Status> {
+        use futures_util::StreamExt;
+        let mut inbound = request.into_inner();
+        let first = match inbound.message().await? {
+            Some(msg) => msg,
+            None => {
+                let (_tx, rx) = tokio::sync::mpsc::channel(1);
+                return Ok(tonic::Response::new(
+                    tokio_stream::wrappers::ReceiverStream::new(rx),
+                ));
+            }
+        };
+        let (group_id, first_req) = decode_append_request(first)?;
+        let raft = self
+            .dispatcher
+            .get_raft(group_id)
+            .ok_or_else(|| tonic::Status::not_found(format!("group {group_id} not found")))?;
+
+        let (req_tx, req_rx) = tokio::sync::mpsc::channel(64);
+        let (resp_tx, resp_rx) = tokio::sync::mpsc::channel(64);
+        let stats = self.dispatcher.stats.clone();
+
+        tokio::spawn(async move {
+            let mut count = first_req.entries.len() as u64;
+            if req_tx.send(first_req).await.is_err() {
+                return;
+            }
+            crate::cluster::contact::note_leader_append(group_id);
+            while let Ok(Some(msg)) = inbound.message().await {
+                count += msg.entries.len() as u64;
+                if let Ok((_, decoded)) = decode_append_request(msg) {
+                    if req_tx.send(decoded).await.is_err() {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            if let Some(s) = &stats {
+                s.raft_log_entries
+                    .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+
+        tokio::spawn(async move {
+            let mut out =
+                Box::pin(raft.stream_append(tokio_stream::wrappers::ReceiverStream::new(req_rx)));
+            while let Some(res) = out.next().await {
+                let wire = match res {
+                    Ok(Ok(ack)) => raft_rpc::StreamAppendResponse {
+                        vote_term: 0,
+                        vote_node_id: 0,
+                        vote_committed: false,
+                        success: true,
+                        ack_index: ack.map(|id| id.index),
+                        ack_term: ack.map(|id| id.leader_id.term),
+                        conflict_index: None,
+                        conflict_term: None,
+                        hint_indices: Vec::new(),
+                        hint_terms: Vec::new(),
+                    },
+                    Ok(Err(openraft::raft::AppendError::Conflict { log_id, hint })) => {
+                        let (hint_indices, hint_terms) = match hint {
+                            Some(h) => (
+                                h.log_ids.iter().map(|id| id.index).collect(),
+                                h.log_ids.iter().map(|id| id.leader_id.term).collect(),
+                            ),
+                            None => (Vec::new(), Vec::new()),
+                        };
+                        raft_rpc::StreamAppendResponse {
+                            vote_term: 0,
+                            vote_node_id: 0,
+                            vote_committed: false,
+                            success: false,
+                            ack_index: None,
+                            ack_term: None,
+                            conflict_index: Some(log_id.index),
+                            conflict_term: Some(log_id.leader_id.term),
+                            hint_indices,
+                            hint_terms,
+                        }
+                    }
+                    Ok(Err(openraft::raft::AppendError::HigherVote(vote))) => {
+                        raft_rpc::StreamAppendResponse {
+                            vote_term: vote.leader_id.term,
+                            vote_node_id: vote.leader_id.voted_for,
+                            vote_committed: vote.committed,
+                            success: false,
+                            ack_index: None,
+                            ack_term: None,
+                            conflict_index: None,
+                            conflict_term: None,
+                            hint_indices: Vec::new(),
+                            hint_terms: Vec::new(),
+                        }
+                    }
+                    Err(e) => {
+                        let _ = resp_tx
+                            .send(Err(tonic::Status::internal(format!(
+                                "StreamAppend failed: {e}"
+                            ))))
+                            .await;
+                        break;
+                    }
+                };
+                if resp_tx.send(Ok(wire)).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok(tonic::Response::new(
+            tokio_stream::wrappers::ReceiverStream::new(resp_rx),
+        ))
     }
 
     async fn install_snapshot(
@@ -337,12 +575,9 @@ impl RaftService for RaftServiceImpl {
             _ => None,
         };
 
-        let last_membership: openraft::StoredMembership<
-            openraft::vote::leader_id_std::CommittedLeaderId<u64>,
-            NodeId,
-            openraft::BasicNode,
-        > = postcard::from_bytes(&meta.last_membership)
-            .map_err(|e| tonic::Status::internal(format!("membership decode: {e}")))?;
+        let last_membership: openraft::alias::StoredMembershipOf<TypeConfig> =
+            postcard::from_bytes(&meta.last_membership)
+                .map_err(|e| tonic::Status::internal(format!("membership decode: {e}")))?;
 
         let snapshot_meta = openraft::SnapshotMeta {
             last_log_id,
@@ -387,7 +622,7 @@ impl RaftService for RaftServiceImpl {
         };
         let snapshot = openraft::Snapshot {
             meta: snapshot_meta,
-            snapshot: std::io::Cursor::new(snapshot_data),
+            snapshot: snapshot_data,
         };
 
         let raft = self
@@ -492,6 +727,22 @@ impl RaftService for RaftServiceImpl {
             Err(e) => Err(map_node_error_to_status(e)),
         }
     }
+
+    async fn transfer_leader(
+        &self,
+        request: TonicRequest<raft_rpc::TransferLeaderRequest>,
+    ) -> std::result::Result<tonic::Response<raft_rpc::TransferLeaderResponse>, tonic::Status> {
+        let req = request.into_inner();
+        let raft = self
+            .dispatcher
+            .get_raft(req.group_id)
+            .ok_or_else(|| tonic::Status::not_found(format!("group {} not found", req.group_id)))?;
+        raft.trigger()
+            .transfer_leader(req.target_node_id)
+            .await
+            .map_err(|e| tonic::Status::internal(format!("TransferLeader failed: {e}")))?;
+        Ok(tonic::Response::new(raft_rpc::TransferLeaderResponse {}))
+    }
 }
 
 /// 将 `OpenRaftNode::get`/`get_migration_tip` 的错误映射为 `tonic::Status`.
@@ -517,7 +768,8 @@ mod tests {
         let first = push_snapshot_chunk(&mut slot, "snap-1", 5, 0, b"ab".to_vec()).unwrap();
         assert!(first.is_none());
         let second = push_snapshot_chunk(&mut slot, "snap-1", 5, 2, b"cde".to_vec()).unwrap();
-        assert_eq!(second.unwrap(), b"abcde");
+        let snap = second.unwrap();
+        assert_eq!(std::fs::read(snap.path().unwrap()).unwrap(), b"abcde");
         assert!(slot.is_none());
     }
 
@@ -533,6 +785,7 @@ mod tests {
     fn whole_snapshot_does_not_need_assembly() {
         let mut slot = None;
         let got = push_snapshot_chunk(&mut slot, "snap-1", 0, 0, b"whole".to_vec()).unwrap();
-        assert_eq!(got.unwrap(), b"whole");
+        let snap = got.unwrap();
+        assert_eq!(std::fs::read(snap.path().unwrap()).unwrap(), b"whole");
     }
 }

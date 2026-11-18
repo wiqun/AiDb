@@ -28,10 +28,10 @@ pub(crate) mod keys;
 mod log;
 mod snapshot;
 
+pub use snapshot::SnapshotFileData;
+
 use std::fmt::Debug;
-use std::io::Cursor;
 use std::ops::RangeBounds;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,9 +58,9 @@ type LIdOf = LogId<CLId>;
 /// VoteOf<TypeConfig> using std mode LeaderId.
 type VOf = Vote<openraft::vote::leader_id_std::LeaderId<u64, u64>>;
 /// Snapshot meta with std committed leader id.
-type SMOf = SnapshotMeta<CLId, u64, openraft::BasicNode>;
+type SMOf = SnapshotMeta<CLId, openraft::Membership<u64, openraft::BasicNode>>;
 /// Stored membership with std committed leader id.
-type MOf = StoredMembership<CLId, u64, openraft::BasicNode>;
+type MOf = StoredMembership<CLId, openraft::Membership<u64, openraft::BasicNode>>;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct StorageState {
@@ -133,7 +133,7 @@ impl RaftPhaseMarks {
     }
 }
 
-pub(crate) type BuiltSnapshotSlot = Arc<RwLock<Option<(SMOf, Vec<u8>)>>>;
+pub(crate) type BuiltSnapshotSlot = Arc<RwLock<Option<(SMOf, SnapshotFileData)>>>;
 pub(crate) type PendingLogOverlaySlot = Arc<
     parking_lot::Mutex<
         crate::cluster::pending_log::PendingLogOverlay<
@@ -148,7 +148,6 @@ pub struct OpenRaftStorage {
     pub(crate) state: Arc<RwLock<StorageState>>,
     pub(crate) group_id: u64,
     pub(crate) meta_state: Option<Arc<MetaStateMachine>>,
-    pub(crate) snapshot_temp_path: Arc<RwLock<Option<PathBuf>>>,
     pub(crate) committer: Option<LogCommitterHandle>,
     pub(crate) phases: Arc<RaftPhaseMarks>,
     /// 本机最近一次 `build_snapshot` 的元数据和字节.
@@ -195,7 +194,6 @@ impl OpenRaftStorage {
             state: Arc::new(RwLock::new(StorageState::default())),
             group_id,
             meta_state,
-            snapshot_temp_path: Arc::new(RwLock::new(None)),
             committer,
             phases: Arc::new(RaftPhaseMarks::default()),
             built_snapshot: Arc::new(RwLock::new(None)),
@@ -277,6 +275,13 @@ impl RaftLogStorage<TypeConfig> for OpenRaftStorage {
         if let Some(ref committer) = self.committer {
             let last_log_id = entries_vec.last().map(|e| e.log_id);
             // 写入 PendingLogOverlay, 使其立即可读 (move 进 Arc, 零 entry 深拷贝).
+            let estimated_bytes: usize = entries_vec
+                .iter()
+                .map(|e| match &e.payload {
+                    openraft::EntryPayload::Normal(req) => req.estimated_serialized_size() + 32,
+                    _ => 64,
+                })
+                .sum();
             {
                 let mut ov = committer.overlay.lock();
                 for entry in entries_vec {
@@ -286,7 +291,7 @@ impl RaftLogStorage<TypeConfig> for OpenRaftStorage {
 
             // 入队后返回. io_completed 由 LogCommitter 在 db.write 返回后调用.
             let started = std::time::Instant::now();
-            committer.submit_append(first_index, count, callback)?;
+            committer.submit_append_with_bytes(first_index, count, estimated_bytes, callback)?;
             self.phases
                 .note_append(self.group_id, count, started.elapsed());
 
@@ -393,7 +398,7 @@ impl RaftLogStorage<TypeConfig> for OpenRaftStorage {
 }
 
 impl RaftStateMachine<TypeConfig> for OpenRaftStorage {
-    type SnapshotData = std::io::Cursor<Vec<u8>>;
+    type SnapshotData = SnapshotFileData;
     type SnapshotBuilder = snapshot::OpenRaftSnapshotBuilder;
 
     async fn applied_state(&mut self) -> std::result::Result<(Option<LIdOf>, MOf), std::io::Error> {
@@ -430,12 +435,16 @@ impl RaftStateMachine<TypeConfig> for OpenRaftStorage {
             return Ok(());
         }
 
+        let count = batch_entries.len() as u64;
+        let storage = self.clone();
         let started = std::time::Instant::now();
-        let responses = self
-            .apply_entries_internal(&batch_entries)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let responses =
+            tokio::task::spawn_blocking(move || storage.apply_entries_internal(&batch_entries))
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))?
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
         self.phases
-            .note_apply(self.group_id, batch_entries.len() as u64, started.elapsed());
+            .note_apply(self.group_id, count, started.elapsed());
 
         for (response, responder_opt) in responses.into_iter().zip(responders) {
             if let Some(responder) = responder_opt {
@@ -461,41 +470,9 @@ impl RaftStateMachine<TypeConfig> for OpenRaftStorage {
         meta: &SMOf,
         snapshot: Self::SnapshotData,
     ) -> std::result::Result<(), std::io::Error> {
-        let data = snapshot.into_inner();
+        self.install_snapshot_atomic_from_file(meta, &snapshot)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-        // 初始化临时文件路径 (openraft >= alpha.33 不再调用 begin_receiving_snapshot,
-        // 接收/安装流程统一在 install_snapshot 内完成临时文件初始化).
-        let db_path = self.db.read().path().to_path_buf();
-        let temp_path = db_path.join(format!(".snapshot_temp_{}", self.group_id));
-        let _ = std::fs::remove_file(&temp_path);
-        *self.snapshot_temp_path.write() = Some(temp_path);
-
-        // Write to temp file first for crash safety
-        if let Some(ref temp_path) = *self.snapshot_temp_path.read() {
-            if let Err(e) = std::fs::write(temp_path, &data) {
-                let _ = std::fs::remove_file(temp_path);
-                return Err(std::io::Error::other(e.to_string()));
-            }
-            // fsync the parent directory to ensure metadata durability
-            if let Some(parent) = temp_path.parent() {
-                if let Ok(dir) = std::fs::File::open(parent) {
-                    let _ = dir.sync_all();
-                }
-            }
-        }
-
-        // Apply the snapshot data atomically
-        self.install_snapshot_atomic(meta, &data).map_err(|e| {
-            // Clean up temp on install failure
-            if let Some(ref temp_path) = *self.snapshot_temp_path.read() {
-                let _ = std::fs::remove_file(temp_path);
-            }
-            *self.snapshot_temp_path.write() = None;
-            std::io::Error::other(e.to_string())
-        })?;
-
-        // Clear PendingLogOverlay and in-memory state after snapshot install
-        // (DB was fully replaced so all in-memory caches are stale).
         {
             let mut state = self.state.write();
             *state = StorageState::default();
@@ -503,15 +480,8 @@ impl RaftStateMachine<TypeConfig> for OpenRaftStorage {
         if let Some(ref committer) = self.committer {
             committer.overlay.lock().clear();
         }
-        // Reload state from the new DB
         self.load_state()
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-
-        // Clean up temp file after successful install
-        if let Some(ref temp_path) = *self.snapshot_temp_path.read() {
-            let _ = std::fs::remove_file(temp_path);
-        }
-        *self.snapshot_temp_path.write() = None;
 
         Ok(())
     }
@@ -520,20 +490,18 @@ impl RaftStateMachine<TypeConfig> for OpenRaftStorage {
     async fn get_current_snapshot(
         &mut self,
     ) -> std::result::Result<
-        Option<Snapshot<CLId, u64, openraft::BasicNode, Cursor<Vec<u8>>>>,
+        Option<Snapshot<CLId, openraft::Membership<u64, openraft::BasicNode>, SnapshotFileData>>,
         std::io::Error,
     > {
-        // 日常清理只记位点 (`snapshot_meta`), 整库 bundle 在这里才按需生成.
         let Some(purge_point) = self.state.read().snapshot_meta.clone() else {
             return Ok(None);
         };
-        // 缓存的 bundle 位点不低于 purge 位点即可复用: 落后副本只需要 purge 位点之后的日志.
         let purge_index = purge_point.last_log_id.map(|id| id.index);
-        if let Some((meta, bytes)) = self.built_snapshot.read().clone() {
+        if let Some((meta, snap)) = self.built_snapshot.read().clone() {
             if meta.last_log_id.map(|id| id.index) >= purge_index {
                 return Ok(Some(Snapshot {
                     meta,
-                    snapshot: Cursor::new(bytes),
+                    snapshot: snap,
                 }));
             }
         }

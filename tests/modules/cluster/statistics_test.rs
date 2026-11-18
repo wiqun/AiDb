@@ -52,11 +52,7 @@ async fn test_network_client_atomic_stats() {
         "append_entries outgoing RPC attempt should be recorded"
     );
 
-    let vote_req = VoteRequest {
-        vote: openraft::Vote::new(1, 1),
-        last_log_id: None,
-        leadership_transfer: false,
-    };
+    let vote_req = VoteRequest::new(openraft::Vote::new(1, 1), None);
 
     let _ = client
         .vote(vote_req, RPCOption::new(Duration::from_millis(50)))

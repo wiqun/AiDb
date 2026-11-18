@@ -14,6 +14,8 @@ pub struct RaftNetworkClientFactory {
     /// gRPC channel 连接池 — 按 node_id 缓存, 避免每次 RPC 都重新 TCP + HTTP/2 握手.
     /// Docker 容器 DNS 解析 (aikv-N) 每次 50-100ms, 复用 channel 可消除此开销.
     channels: Arc<DashMap<NodeId, RaftServiceClient<tonic::transport::Channel>>>,
+    heartbeat_channels: Arc<DashMap<NodeId, RaftServiceClient<tonic::transport::Channel>>>,
+    snapshot_channels: Arc<DashMap<NodeId, RaftServiceClient<tonic::transport::Channel>>>,
     payload_cache: Arc<super::client::PayloadCache>,
     stats: Option<Arc<Statistics>>,
 }
@@ -37,6 +39,8 @@ impl RaftNetworkClientFactory {
             max_message_size,
             nodes: Arc::new(RwLock::new(HashMap::new())),
             channels: Arc::new(DashMap::new()),
+            heartbeat_channels: Arc::new(DashMap::new()),
+            snapshot_channels: Arc::new(DashMap::new()),
             payload_cache: Arc::new(super::client::PayloadCache::new()),
             stats,
         }
@@ -59,6 +63,8 @@ impl RaftNetworkClientFactory {
             max_message_size: self.max_message_size,
             nodes: Arc::clone(&self.nodes),
             channels: Arc::clone(&self.channels),
+            heartbeat_channels: Arc::clone(&self.heartbeat_channels),
+            snapshot_channels: Arc::clone(&self.snapshot_channels),
             // 每个 Raft group 有独立的 log_index 空间, 因此按 group 建独立缓存.
             payload_cache: Arc::new(super::client::PayloadCache::new()),
             stats: self.stats.clone(),
@@ -69,11 +75,15 @@ impl RaftNetworkClientFactory {
         self.nodes.write().insert(node_id, address);
         // 地址变更时清除旧 channel, 下次 RPC 自动重连
         self.channels.remove(&node_id);
+        self.heartbeat_channels.remove(&node_id);
+        self.snapshot_channels.remove(&node_id);
     }
 
     pub fn remove_node(&self, node_id: NodeId) {
         self.nodes.write().remove(&node_id);
         self.channels.remove(&node_id);
+        self.heartbeat_channels.remove(&node_id);
+        self.snapshot_channels.remove(&node_id);
     }
 
     pub fn list_nodes(&self) -> Vec<(NodeId, String)> {
@@ -84,20 +94,17 @@ impl RaftNetworkClientFactory {
             .collect()
     }
 
-    /// 获取或创建 gRPC channel — 缓存复用避免频繁 TCP 握手.
     async fn get_or_create_channel(
         &self,
+        pool: &DashMap<NodeId, RaftServiceClient<tonic::transport::Channel>>,
         target: NodeId,
         addr: &str,
         max_message_size: usize,
     ) -> std::result::Result<RaftServiceClient<tonic::transport::Channel>, NetworkError<TypeConfig>>
     {
-        // DashMap 内置分片锁, get/insert 无全局锁竞争
-        if let Some(client) = self.channels.get(&target) {
+        if let Some(client) = pool.get(&target) {
             return Ok(client.clone());
         }
-        // Slow path: connect + cache (多个并发 miss 可能重复 connect,
-        // 后 insert 覆盖前 insert; tonic Channel 基于 Arc, 旧的 clone 不受影响)
         let normalized = normalize_grpc_addr(addr);
         tracing::debug!(%target, %normalized, "gRPC: establishing new channel for peer");
         let req_timeout = Duration::from_millis(self.rpc_timeout_ms);
@@ -105,30 +112,16 @@ impl RaftNetworkClientFactory {
             .await?
             .max_decoding_message_size(max_message_size)
             .max_encoding_message_size(max_message_size);
-        self.channels.insert(target, client.clone());
+        pool.insert(target, client.clone());
         Ok(client)
     }
-}
 
-/// Ensure a gRPC address has a proper URI scheme (http://) for tonic.
-/// Tonic's `Channel::from_shared` requires a valid URI; bare addresses
-/// like `127.0.0.1:20349` are rejected.
-fn normalize_grpc_addr(addr: &str) -> String {
-    if addr.is_empty() {
-        return String::new();
-    }
-    if addr.contains("://") {
-        addr.to_string()
-    } else {
-        format!("http://{}", addr)
-    }
-}
-
-impl RaftNetworkFactory<TypeConfig> for RaftNetworkClientFactory {
-    type Network = RaftNetworkClient;
-
-    async fn new_client(&mut self, target: NodeId, node: &openraft::BasicNode) -> Self::Network {
-        // 解析目标地址: 未变化时仅读锁命中，避免每轮 RPC 都抢写锁。
+    async fn build_client_with_pool(
+        &mut self,
+        target: NodeId,
+        node: &openraft::BasicNode,
+        pool: Arc<DashMap<NodeId, RaftServiceClient<tonic::transport::Channel>>>,
+    ) -> RaftNetworkClient {
         let raw_addr = if !node.addr.is_empty() {
             let unchanged = self
                 .nodes
@@ -151,10 +144,8 @@ impl RaftNetworkFactory<TypeConfig> for RaftNetworkClientFactory {
         };
 
         let target_addr = normalize_grpc_addr(&raw_addr);
-
-        // 从连接池获取或创建 channel, 避免每次 RPC 都重新 TCP + HTTP/2 握手
         let channel = match self
-            .get_or_create_channel(target, &raw_addr, self.max_message_size as usize)
+            .get_or_create_channel(&pool, target, &raw_addr, self.max_message_size as usize)
             .await
         {
             Ok(ch) => Some(ch),
@@ -172,14 +163,55 @@ impl RaftNetworkFactory<TypeConfig> for RaftNetworkClientFactory {
             self.rpc_timeout_ms,
             self.max_message_size,
             channel,
-            Some(self.channels.clone()),
+            Some(pool),
             self.stats.clone(),
         )
         .with_payload_cache(Arc::clone(&self.payload_cache))
     }
 }
 
-pub(super) async fn connect_raft_client(
+/// Ensure a gRPC address has a proper URI scheme (http://) for tonic.
+/// Tonic's `Channel::from_shared` requires a valid URI; bare addresses
+/// like `127.0.0.1:20349` are rejected.
+pub(crate) fn normalize_grpc_addr(addr: &str) -> String {
+    if addr.is_empty() {
+        return String::new();
+    }
+    if addr.contains("://") {
+        addr.to_string()
+    } else {
+        format!("http://{}", addr)
+    }
+}
+
+impl RaftNetworkFactory<TypeConfig> for RaftNetworkClientFactory {
+    type Network = RaftNetworkClient;
+
+    async fn new_client(&mut self, target: NodeId, node: &openraft::BasicNode) -> Self::Network {
+        let pool = Arc::clone(&self.channels);
+        self.build_client_with_pool(target, node, pool).await
+    }
+
+    async fn new_heartbeat_client(
+        &mut self,
+        target: NodeId,
+        node: &openraft::BasicNode,
+    ) -> Self::Network {
+        let pool = Arc::clone(&self.heartbeat_channels);
+        self.build_client_with_pool(target, node, pool).await
+    }
+
+    async fn new_snapshot_client(
+        &mut self,
+        target: NodeId,
+        node: &openraft::BasicNode,
+    ) -> Self::Network {
+        let pool = Arc::clone(&self.snapshot_channels);
+        self.build_client_with_pool(target, node, pool).await
+    }
+}
+
+pub(crate) async fn connect_raft_client(
     addr: &str,
     req_timeout: Duration,
 ) -> std::result::Result<RaftServiceClient<tonic::transport::Channel>, NetworkError<TypeConfig>> {

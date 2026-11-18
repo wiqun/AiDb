@@ -39,9 +39,7 @@ pub(super) use tonic::Request as TonicRequest;
 pub(super) use openraft::{
     error::{NetworkError, RPCError, Unreachable},
     network::RPCOption,
-    raft::{
-        AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, VoteRequest, VoteResponse,
-    },
+    raft::{AppendEntriesRequest, SnapshotResponse, VoteRequest, VoteResponse},
     RaftNetworkFactory, RaftNetworkV2,
 };
 
@@ -78,7 +76,7 @@ where
 }
 
 mod client;
-mod factory;
+pub(crate) mod factory;
 mod incoming;
 mod server;
 #[cfg(test)]
