@@ -66,6 +66,15 @@ impl RangeTombstoneTracker {
         self.items.retain(|item| item.end.as_slice() > user_key);
     }
 
+    /// 收集当前仍然覆盖 `>= user_key` 的活跃范围墓碑 `(sequence, end)`，用于切分新 SST 时延续.
+    pub(super) fn active_past(&self, user_key: &[u8]) -> Vec<(u64, Vec<u8>)> {
+        self.items
+            .iter()
+            .filter(|item| item.end.as_slice() > user_key)
+            .map(|item| (item.sequence, item.end.clone()))
+            .collect()
+    }
+
     /// 判断 `(user_key, sequence)` 这个点版本是否可以被墓碑裁掉.
     ///
     /// 只有**所有活跃快照都能看到**的那条墓碑才允许裁: 快照位点都不小于

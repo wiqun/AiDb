@@ -101,6 +101,11 @@ impl SSTableBuilder {
         }
     }
 
+    /// 估算当前已写入与缓冲的 SSTable 字节数 (用于 Compaction 目标大小切分).
+    pub fn estimated_file_size(&self) -> u64 {
+        self.data_block_offset + self.data_block_builder.current_size() as u64
+    }
+
     pub fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         if key.is_empty() {
             return Err(Error::InvalidArgument("empty SSTable key".into()));

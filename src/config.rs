@@ -100,6 +100,12 @@ pub struct Options {
     pub max_bytes_for_level_base: usize,
     /// 每层大小倍率 (默认 10)
     pub max_bytes_for_level_multiplier: usize,
+    /// Compaction 输出单个 SST 目标大小 (默认 64 MiB)
+    pub target_file_size_base: u64,
+    /// Compaction 单次与祖父层重叠最大字节数 (默认 25 * target_file_size_base = 1600 MiB)
+    pub max_compaction_bytes: u64,
+    /// 动态计算每层目标大小 (默认 true; 空库 L0 直接落入最底层)
+    pub level_compaction_dynamic_level_bytes: bool,
     /// Compaction 后台线程数 (默认 1, 建议 1-4)
     pub compaction_threads: usize,
     /// Subcompaction 分裂阈值 (bytes, 0=禁用, 默认 64MB)
@@ -165,6 +171,9 @@ impl Default for Options {
             level0_stop_writes_trigger: 16,
             max_bytes_for_level_base: 256 * 1024 * 1024,
             max_bytes_for_level_multiplier: 10,
+            target_file_size_base: 64 * 1024 * 1024,
+            max_compaction_bytes: 25 * 64 * 1024 * 1024,
+            level_compaction_dynamic_level_bytes: true,
             compaction_threads: 1,
             subcompaction_min_size: 64 * 1024 * 1024,
             max_manifest_size: 64 * 1024 * 1024,
@@ -215,6 +224,9 @@ impl Options {
             level0_stop_writes_trigger: 8,
             max_bytes_for_level_base: 10 * 1024 * 1024,
             max_bytes_for_level_multiplier: 10,
+            target_file_size_base: 64 * 1024 * 1024,
+            max_compaction_bytes: 25 * 64 * 1024 * 1024,
+            level_compaction_dynamic_level_bytes: false,
             compaction_threads: 1,
             subcompaction_min_size: 0,
             max_manifest_size: 1024 * 1024,
@@ -285,6 +297,16 @@ impl Options {
         if self.min_sub_compactions > self.max_sub_compactions {
             return Err(Error::InvalidArgument(
                 "min_sub_compactions must be <= max_sub_compactions".into(),
+            ));
+        }
+        if self.target_file_size_base == 0 {
+            return Err(Error::InvalidArgument(
+                "target_file_size_base must be > 0".into(),
+            ));
+        }
+        if self.max_compaction_bytes < self.target_file_size_base {
+            return Err(Error::InvalidArgument(
+                "max_compaction_bytes must be >= target_file_size_base".into(),
             ));
         }
         Ok(())

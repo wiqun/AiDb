@@ -21,6 +21,7 @@ pub struct CompactionTask {
     pub level: usize,
     pub output_level: usize,
     pub expanded_inputs: Vec<Arc<SSTableReader>>,
+    pub grandparents: Vec<Arc<SSTableReader>>,
     pub is_trivial_move: bool,
 }
 
@@ -29,6 +30,7 @@ pub struct CompactionPicker {
     max_bytes_for_level_base: u64,
     max_bytes_for_level_multiplier: u64,
     max_levels: usize,
+    dynamic_level_bytes: bool,
 }
 
 impl CompactionPicker {
@@ -36,13 +38,34 @@ impl CompactionPicker {
         Self {
             level0_compaction_trigger: options.level0_compaction_trigger,
             max_bytes_for_level_base: options.max_bytes_for_level_base as u64,
-            max_bytes_for_level_multiplier: options.max_bytes_for_level_multiplier as u64,
+            max_bytes_for_level_multiplier: options.max_bytes_for_level_multiplier.max(1) as u64,
             max_levels: options.max_levels,
+            dynamic_level_bytes: options.level_compaction_dynamic_level_bytes,
         }
     }
 
     pub fn level0_compaction_trigger(&self) -> usize {
         self.level0_compaction_trigger
+    }
+
+    /// 计算动态层目标模式下的 L0 目标层 (`base_level`).
+    /// 未启用 `level_compaction_dynamic_level_bytes` 时恒返回 `1`.
+    pub fn base_level(&self, levels: &[Vec<Arc<SSTableReader>>]) -> usize {
+        let bottom = self.max_levels.min(levels.len()).saturating_sub(1);
+        if !self.dynamic_level_bytes || bottom <= 1 {
+            return 1;
+        }
+        let Some(deepest) = (1..=bottom).rfind(|&l| !levels[l].is_empty()) else {
+            return bottom;
+        };
+        let mut cur = Self::calculate_level_size(&levels[deepest]);
+        let mut base = deepest;
+        while base > 1 && cur / self.max_bytes_for_level_multiplier > self.max_bytes_for_level_base
+        {
+            cur /= self.max_bytes_for_level_multiplier;
+            base -= 1;
+        }
+        base
     }
 
     pub fn target_size_for_level(&self, level: usize) -> u64 {
@@ -53,6 +76,20 @@ impl CompactionPicker {
             * self
                 .max_bytes_for_level_multiplier
                 .pow(level.saturating_sub(1) as u32)
+    }
+
+    fn dynamic_target_size(&self, levels: &[Vec<Arc<SSTableReader>>], level: usize) -> u64 {
+        if !self.dynamic_level_bytes {
+            return self.target_size_for_level(level);
+        }
+        let base = self.base_level(levels);
+        if level < base {
+            return 0;
+        }
+        self.max_bytes_for_level_base.saturating_mul(
+            self.max_bytes_for_level_multiplier
+                .pow((level - base) as u32),
+        )
     }
 
     pub fn calculate_level_size(level: &[Arc<SSTableReader>]) -> u64 {
@@ -76,9 +113,17 @@ impl CompactionPicker {
             if level >= levels.len() {
                 break;
             }
-            let target = self.target_size_for_level(level);
+            let target = self.dynamic_target_size(levels, level);
             let size = Self::calculate_level_size(&levels[level]);
-            let score = size as f64 / target as f64;
+            let score = if target == 0 {
+                if size > 0 {
+                    f64::MAX / 2.0
+                } else {
+                    0.0
+                }
+            } else {
+                size as f64 / target as f64
+            };
             debug_assert!(score.is_finite(), "score must be finite for u64 inputs");
             if score > best_score {
                 best_score = score;
@@ -96,17 +141,41 @@ impl CompactionPicker {
             return None;
         }
         let inputs = levels[0].clone();
+        let output_level = self.base_level(levels);
         let (in_start, in_end) = combined_range(&inputs);
-        let mut expanded = overlap_in_level(levels, 1, in_start, in_end);
-        if levels.len() > 1 {
-            append_tombstone_overlaps(&levels[1], &inputs, &mut expanded);
+        let mut expanded = overlap_in_level(levels, output_level, in_start, in_end);
+        if levels.len() > output_level {
+            append_tombstone_overlaps(&levels[output_level], &inputs, &mut expanded);
         }
+        let (out_start, out_end) = if expanded.is_empty() {
+            (in_start, in_end)
+        } else {
+            let mut all = inputs.clone();
+            all.extend(expanded.iter().cloned());
+            // Use combined bounds across inputs + expanded
+            let s = all
+                .iter()
+                .map(|f| f.smallest_key())
+                .min()
+                .unwrap_or(in_start);
+            let e = all.iter().map(|f| f.largest_key()).max().unwrap_or(in_end);
+            return Some(CompactionTask {
+                grandparents: collect_grandparents(levels, output_level + 1, s, e),
+                inputs,
+                level: 0,
+                output_level,
+                expanded_inputs: expanded,
+                is_trivial_move: false,
+            });
+        };
+        let grandparents = collect_grandparents(levels, output_level + 1, out_start, out_end);
         let is_trivial_move = expanded.is_empty() && inputs.len() == 1;
         Some(CompactionTask {
             inputs,
             level: 0,
-            output_level: 1,
+            output_level,
             expanded_inputs: expanded,
+            grandparents,
             is_trivial_move,
         })
     }
@@ -127,6 +196,12 @@ impl CompactionPicker {
         if expanded.is_empty() {
             // Trivial move: no overlap with target level, promote without rewriting
             return Some(CompactionTask {
+                grandparents: collect_grandparents(
+                    levels,
+                    level + 2,
+                    seed.smallest_key(),
+                    seed.largest_key(),
+                ),
                 inputs,
                 level,
                 output_level: level + 1,
@@ -153,11 +228,26 @@ impl CompactionPicker {
         expanded = overlap_in_level(levels, level + 1, in_start, in_end);
         append_tombstone_overlaps(&levels[level + 1], &inputs, &mut expanded);
 
+        let all_start = inputs
+            .iter()
+            .chain(expanded.iter())
+            .map(|f| f.smallest_key())
+            .min()
+            .unwrap_or(in_start);
+        let all_end = inputs
+            .iter()
+            .chain(expanded.iter())
+            .map(|f| f.largest_key())
+            .max()
+            .unwrap_or(in_end);
+        let grandparents = collect_grandparents(levels, level + 2, all_start, all_end);
+
         Some(CompactionTask {
             inputs,
             level,
             output_level: level + 1,
             expanded_inputs: expanded,
+            grandparents,
             is_trivial_move: false,
         })
     }
@@ -191,6 +281,17 @@ fn overlap_in_level(
         .filter(|f| key_ranges_overlap_by_meta_raw(start, end, f.smallest_key(), f.largest_key()))
         .cloned()
         .collect()
+}
+
+fn collect_grandparents(
+    levels: &[Vec<Arc<SSTableReader>>],
+    gp_level: usize,
+    start: &[u8],
+    end: &[u8],
+) -> Vec<Arc<SSTableReader>> {
+    let mut gps = overlap_in_level(levels, gp_level, start, end);
+    gps.sort_by(|a, b| a.smallest_key().cmp(b.smallest_key()));
+    gps
 }
 
 fn append_tombstone_overlaps(
@@ -639,5 +740,33 @@ mod tests {
             .unwrap();
         builder.finish().unwrap();
         Arc::new(SSTableReader::open(&path, None).unwrap())
+    }
+
+    #[test]
+    fn dynamic_level_bytes_routes_l0_to_bottom_or_base_level() {
+        let dir = tempdir().unwrap();
+        let mut opts = Options::for_testing();
+        opts.level0_compaction_trigger = 2;
+        opts.max_bytes_for_level_base = 1000;
+        opts.max_bytes_for_level_multiplier = 10;
+        opts.max_levels = 7;
+        opts.level_compaction_dynamic_level_bytes = true;
+        let picker = CompactionPicker::from_options(&opts);
+        let mut levels = empty_levels(7);
+        levels[0].push(file(dir.path(), 1, 0, b"a"));
+        levels[0].push(file(dir.path(), 2, 0, b"b"));
+        // Empty L1..L6 -> base_level must be L6
+        assert_eq!(picker.base_level(&levels), 6);
+        let task = picker.pick_compaction(&levels).expect("l0 compaction");
+        assert_eq!(task.level, 0);
+        assert_eq!(task.output_level, 6);
+
+        // When L6 exceeds base (e.g. 50_000 bytes), L5 target = 50_000 / 10 = 5_000 > 1000,
+        // L4 target = 500 <= 1000 -> base_level becomes L5.
+        levels[6].push(big_file(dir.path(), 3, 6, b"b", 50_000));
+        assert_eq!(picker.base_level(&levels), 5);
+        let task2 = picker.pick_compaction(&levels).expect("l0 compaction");
+        assert_eq!(task2.output_level, 5);
+        assert!(!task2.grandparents.is_empty());
     }
 }

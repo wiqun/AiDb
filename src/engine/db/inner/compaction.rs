@@ -155,7 +155,8 @@ impl DB {
         let start = surviving_start_level(task.level, task.output_level);
         let surviving = deeper_and_sibling_user_ranges(&levels, start, &consumed);
         let reader = DbPointReader { db: self };
-        let results = CompactionJob::new(
+        let alloc = || self.version_set.read().allocate_file_number();
+        let job = CompactionJob::new(
             task.inputs.clone(),
             task.expanded_inputs.clone(),
             task.output_level,
@@ -168,7 +169,16 @@ impl DB {
         .with_snapshot_threshold(min_snap_seq)
         .with_surviving_user_ranges(surviving)
         .with_filter(self.compaction_filter.read().clone())
-        .run_with_reader(&file_numbers, Some(&reader))?;
+        .with_target_file_size(self.options.target_file_size_base)
+        .with_max_compaction_bytes(self.options.max_compaction_bytes)
+        .with_grandparents(task.grandparents.clone());
+
+        let results = if file_numbers.len() <= 1 {
+            let first_fnum = file_numbers.first().copied().unwrap_or_else(alloc);
+            job.run_with_allocator(first_fnum, &alloc, Some(&reader))?
+        } else {
+            job.run_with_reader(&file_numbers, Some(&reader))?
+        };
 
         let written_bytes: u64 = results.iter().map(|r| r.file_size).sum();
         self.stats
