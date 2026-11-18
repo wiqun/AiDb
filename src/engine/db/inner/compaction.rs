@@ -77,10 +77,93 @@ impl DB {
         self.stats.compaction_durations[CompactionPhase::Pick as usize]
             .record(pick_start.elapsed().as_micros() as u64);
 
-        // Claim files to prevent overlapping compactions from different threads
         if !self.try_claim_files(&task) {
             return Ok(true);
         }
+        self.execute_claimed_task(task)
+    }
+
+    /// 对指定 `[start, end)` user key 范围强制执行一轮自顶向下压实 (含 `CompactionFilter` 过滤).
+    ///
+    /// `start` 为包含下界 (`None` 表示从头), `end` 为不包含上界 (`None` 表示到尾).
+    pub fn compact_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<()> {
+        if self.checkpoint_in_progress.load(AtomicOrdering::Acquire) {
+            return Ok(());
+        }
+        self.flush()?;
+        let max_levels = self.options.max_levels;
+        for level in 0..max_levels {
+            for attempt in 0..5 {
+                let levels: Vec<Vec<Arc<SSTableReader>>> =
+                    self.sstables.read().iter().cloned().collect();
+                if level >= levels.len() {
+                    break;
+                }
+                let inputs: Vec<Arc<SSTableReader>> = levels[level]
+                    .iter()
+                    .filter(|sst| sst_overlaps_user_range(sst, start, end))
+                    .cloned()
+                    .collect();
+                if inputs.is_empty() {
+                    break;
+                }
+                let output_level = if level == 0 {
+                    let base = self.compaction_picker.base_level(&levels);
+                    base.min(levels.len().saturating_sub(1))
+                } else if level + 1 < levels.len() {
+                    level + 1
+                } else {
+                    level
+                };
+                let expanded_inputs = if output_level != level {
+                    collect_overlapping_outputs(&inputs, &levels[output_level])
+                } else {
+                    Vec::new()
+                };
+                let task = CompactionTask {
+                    inputs,
+                    level,
+                    output_level,
+                    expanded_inputs,
+                    grandparents: Vec::new(),
+                    is_trivial_move: false,
+                };
+                if self.try_claim_files(&task) {
+                    let _ = self.execute_claimed_task(task)?;
+                    break;
+                }
+                if attempt < 4 {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn execute_claimed_task(&self, task: CompactionTask) -> Result<bool> {
+        struct ClaimGuard<'a> {
+            db: &'a DB,
+            file_numbers: Vec<u64>,
+        }
+        impl Drop for ClaimGuard<'_> {
+            fn drop(&mut self) {
+                let mut guard = self.db.compacting.lock();
+                for num in &self.file_numbers {
+                    guard.remove(num);
+                }
+            }
+        }
+        let file_numbers: Vec<u64> = task
+            .inputs
+            .iter()
+            .chain(task.expanded_inputs.iter())
+            .map(|f| f.file_number())
+            .collect();
+        let _claim_guard = ClaimGuard {
+            db: self,
+            file_numbers,
+        };
+        let levels: Vec<Vec<Arc<SSTableReader>>> = self.sstables.read().iter().cloned().collect();
 
         let level = task.level;
         let output_level = task.output_level;
@@ -407,7 +490,6 @@ impl DB {
         let pending = self.pending_compaction_bytes();
         update_sstable_metrics(&self.sstables.read(), &self.stats, pending);
 
-        self.release_files(&task);
         Ok(true)
     }
 
@@ -445,6 +527,66 @@ pub(super) fn compaction_background_loop(
 
 pub(crate) fn surviving_start_level(source_level: usize, _output_level: usize) -> usize {
     source_level
+}
+
+fn sst_overlaps_user_range(sst: &SSTableReader, start: Option<&[u8]>, end: Option<&[u8]>) -> bool {
+    let Ok(sst_min) = user_key_from_internal(sst.smallest_key()) else {
+        return true;
+    };
+    let Ok(sst_max) = user_key_from_internal(sst.largest_key()) else {
+        return true;
+    };
+    if let Some(s) = start {
+        if sst_max < s {
+            return false;
+        }
+    }
+    if let Some(e) = end {
+        if sst_min >= e {
+            return false;
+        }
+    }
+    true
+}
+
+fn collect_overlapping_outputs(
+    inputs: &[Arc<SSTableReader>],
+    output_files: &[Arc<SSTableReader>],
+) -> Vec<Arc<SSTableReader>> {
+    let mut min_user: Option<&[u8]> = None;
+    let mut max_user: Option<&[u8]> = None;
+    for sst in inputs {
+        let Ok(s) = user_key_from_internal(sst.smallest_key()) else {
+            return output_files.to_vec();
+        };
+        let Ok(l) = user_key_from_internal(sst.largest_key()) else {
+            return output_files.to_vec();
+        };
+        min_user = Some(match min_user {
+            Some(cur) if cur <= s => cur,
+            _ => s,
+        });
+        max_user = Some(match max_user {
+            Some(cur) if cur >= l => cur,
+            _ => l,
+        });
+    }
+    let (Some(u_min), Some(u_max)) = (min_user, max_user) else {
+        return Vec::new();
+    };
+    output_files
+        .iter()
+        .filter(|out| {
+            let Ok(os) = user_key_from_internal(out.smallest_key()) else {
+                return true;
+            };
+            let Ok(ol) = user_key_from_internal(out.largest_key()) else {
+                return true;
+            };
+            os <= u_max && u_min <= ol
+        })
+        .cloned()
+        .collect()
 }
 
 pub(crate) fn deeper_and_sibling_user_ranges(
