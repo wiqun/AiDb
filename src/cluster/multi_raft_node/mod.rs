@@ -281,6 +281,22 @@ impl MultiRaftNode {
     pub fn local_group_ids(&self) -> Vec<u64> {
         self.groups.read().keys().copied().collect()
     }
+
+    /// 对本地承载的全部 Raft Group DB 触发一次全范围压实 (包含 `CompactionFilter` 过滤).
+    pub async fn compact_all_groups(&self) -> crate::Result<()> {
+        let dbs: Vec<Arc<crate::DB>> = {
+            let guard = self.storages.read();
+            guard.values().map(|s| Arc::clone(&*s.db())).collect()
+        };
+        for db in dbs {
+            tokio::task::spawn_blocking(move || db.compact_range(None, None))
+                .await
+                .map_err(|e| {
+                    crate::Error::InvalidState(format!("compact_range join failed: {e}"))
+                })??;
+        }
+        Ok(())
+    }
 }
 
 /// Noop MetaRaftProvider for cases where lifecycle is not yet wired.

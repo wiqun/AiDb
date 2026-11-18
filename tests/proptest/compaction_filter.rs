@@ -215,3 +215,33 @@ fn filter_with_reader_drops_orphans_during_db_compaction() {
     }
     db.close().unwrap();
 }
+
+/// 期望: 即使未达到自动 compaction 触发阈值, 显式调用 `compact_range` 也能执行压实并运行 `CompactionFilter`.
+#[test]
+fn compact_range_applies_compaction_filter_without_l0_trigger() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(DB::open(dir.path(), test_opts()).unwrap());
+    db.set_compaction_filter(Some(Arc::new(OrphanFilter)));
+
+    db.put(b"h1", b"x").unwrap();
+    for i in 0..10u8 {
+        db.put(&[b"s1/".as_slice(), &[i]].concat(), b"v").unwrap();
+        db.put(&[b"s2/".as_slice(), &[i]].concat(), b"v").unwrap();
+    }
+    // 仅 flush 一次 (1 个 L0 文件, 未达 level0_compaction_trigger)
+    db.flush().unwrap();
+
+    db.compact_range(None, None).unwrap();
+
+    for i in 0..10u8 {
+        assert!(db
+            .get(&[b"s1/".as_slice(), &[i]].concat())
+            .unwrap()
+            .is_some());
+        assert!(db
+            .get(&[b"s2/".as_slice(), &[i]].concat())
+            .unwrap()
+            .is_none());
+    }
+    db.close().unwrap();
+}
