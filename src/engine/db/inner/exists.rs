@@ -108,18 +108,26 @@ impl DB {
         max_seq: u64,
         record_stats: bool,
     ) -> Result<bool> {
-        encode_internal_key_buffered(key, max_seq, ValueType::TypePut, |seek_key| {
+        let candidates: Vec<Arc<SSTableReader>> = {
             let tables = self.sstables.read();
+            let mut list = Vec::with_capacity(tables[0].len() + tables.len().saturating_sub(1));
             for reader in &tables[0] {
-                if let Some(ty) = reader.value_type_opt(seek_key, record_stats)? {
-                    return Ok(matches!(ty, ValueType::TypePut));
-                }
+                list.push(Arc::clone(reader));
             }
             for level in tables.iter().skip(1) {
                 if let Some(reader) = find_sstable_for_key(level, key) {
-                    if let Some(ty) = reader.value_type_opt(seek_key, record_stats)? {
-                        return Ok(matches!(ty, ValueType::TypePut));
-                    }
+                    list.push(Arc::clone(reader));
+                }
+            }
+            list
+        };
+        if candidates.is_empty() {
+            return Ok(false);
+        }
+        encode_internal_key_buffered(key, max_seq, ValueType::TypePut, |seek_key| {
+            for reader in &candidates {
+                if let Some(ty) = reader.value_type_opt(seek_key, record_stats)? {
+                    return Ok(matches!(ty, ValueType::TypePut));
                 }
             }
             Ok(false)

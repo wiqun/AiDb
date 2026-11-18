@@ -20,7 +20,9 @@ use std::path::{Path, PathBuf};
 
 use crate::config::CompressionType;
 use crate::engine::filter::{BloomFilter, Filter};
-use crate::engine::memtable::{compare_internal_key, extract_user_key};
+use crate::engine::memtable::{
+    compare_internal_key, extract_sequence, extract_user_key, extract_value_type, ValueType,
+};
 use crate::error::{Error, Result};
 
 use super::block::BlockBuilder;
@@ -28,7 +30,9 @@ use super::block_io::write_block;
 use super::footer::Footer;
 use super::handle::BlockHandle;
 use super::index::{IndexBlockBuilder, IndexEntry};
-use super::meta::{index_entry_for_bloom, write_raw_block};
+use super::meta::{
+    encode_range_tombstones, index_entry_for_bloom, write_raw_block, RANGE_TOMBSTONES_META_NAME,
+};
 use super::properties::SstProperties;
 
 const MIN_BLOCK_SIZE: usize = 256;
@@ -52,6 +56,7 @@ pub struct SSTableBuilder {
     enable_bloom: bool,
     bloom_fp_rate: f64,
     bloom_filter: Option<BloomFilter>,
+    range_tombstones: Vec<(Vec<u8>, Vec<u8>, u64)>,
 }
 
 impl SSTableBuilder {
@@ -92,6 +97,7 @@ impl SSTableBuilder {
             enable_bloom,
             bloom_fp_rate: bloom_false_positive_rate,
             bloom_filter: None,
+            range_tombstones: Vec::new(),
         })
     }
 
@@ -99,6 +105,11 @@ impl SSTableBuilder {
         if self.enable_bloom && self.bloom_filter.is_none() {
             self.bloom_filter = Some(BloomFilter::new(num_keys, self.bloom_fp_rate));
         }
+    }
+
+    /// 估算当前已写入与缓冲的 SSTable 字节数 (用于 Compaction 目标大小切分).
+    pub fn estimated_file_size(&self) -> u64 {
+        self.data_block_offset + self.data_block_builder.current_size() as u64
     }
 
     pub fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -140,6 +151,12 @@ impl SSTableBuilder {
             self.bloom_filter.as_mut().unwrap().add(user_key);
         }
 
+        if matches!(extract_value_type(key), Ok(ValueType::TypeRangeDelete)) {
+            let seq = extract_sequence(key)?;
+            self.range_tombstones
+                .push((extract_user_key(key).to_vec(), value.to_vec(), seq));
+        }
+
         self.num_entries += 1;
         Ok(())
     }
@@ -169,7 +186,16 @@ impl SSTableBuilder {
         Ok(())
     }
 
-    pub fn finish(mut self) -> Result<u64> {
+    pub fn finish(self) -> Result<u64> {
+        self.finish_inner(true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn finish_without_range_tombstones_meta_for_test(self) -> Result<u64> {
+        self.finish_inner(false)
+    }
+
+    fn finish_inner(mut self, write_range_tombstones_meta: bool) -> Result<u64> {
         if self.num_entries == 0 {
             return Err(Error::InvalidArgument("empty sstable".into()));
         }
@@ -205,6 +231,17 @@ impl SSTableBuilder {
             meta_index_builder.add_entry(&IndexEntry {
                 key: super::meta::PROPERTIES_META_NAME.to_vec(),
                 handle: props_handle,
+            })?;
+        }
+
+        // Range Tombstones Meta Block (Phase 5: O(1) open, backward-compatible via meta_index)
+        if write_range_tombstones_meta {
+            let encoded = encode_range_tombstones(&self.range_tombstones);
+            let rt_handle =
+                write_raw_block(&mut self.writer, &mut self.data_block_offset, &encoded)?;
+            meta_index_builder.add_entry(&IndexEntry {
+                key: RANGE_TOMBSTONES_META_NAME.to_vec(),
+                handle: rt_handle,
             })?;
         }
 

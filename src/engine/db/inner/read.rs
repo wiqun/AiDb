@@ -25,7 +25,7 @@ impl DB {
         let max_seq = self.sequence.load(AtomicOrdering::SeqCst);
 
         // 1. 优先查 RowCache (命中时零拷贝借用返回 Shared(Bytes))
-        if let Some(val) = self.row_cache.get(key, max_seq) {
+        if let Some(val) = self.row_cache.get_ns(self.db_cache_id, key, max_seq) {
             let bytes = val.len();
             self.stats.note_logical_read(bytes);
             self.stats.operation_durations[DbOp::Get as usize]
@@ -40,7 +40,8 @@ impl DB {
         if let Some(v) = r {
             let committed = self.committed_sequence.load(AtomicOrdering::Acquire);
             let b = bytes::Bytes::from(v);
-            self.row_cache.insert(key, b.clone(), committed);
+            self.row_cache
+                .insert_ns(self.db_cache_id, key, b.clone(), committed);
             self.stats.operation_durations[DbOp::Get as usize]
                 .record(op_start.elapsed().as_micros() as u64);
             return Ok(Some(PinnableSlice::Shared(b)));
@@ -53,6 +54,179 @@ impl DB {
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         Ok(self.get_pinned(key)?.map(|p| p.into_vec()))
+    }
+
+    /// 批量点查多个 key: 一次获取各层读锁, 并在释放 `sstables.read()` 后并发/顺序读盘.
+    pub fn multi_get(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>> {
+        let op_start = std::time::Instant::now();
+        self.check_not_closed()?;
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        for k in keys {
+            Self::validate_user_key(k)?;
+        }
+        self.stats.operations[DbOp::Get as usize]
+            .fetch_add(keys.len() as u64, AtomicOrdering::Relaxed);
+        let max_seq = self.sequence.load(AtomicOrdering::SeqCst);
+        let committed = self.committed_sequence.load(AtomicOrdering::Acquire);
+
+        // None = 待继续查找; Some(None) = 已确认不存在/已删除; Some(Some(v)) = 已命中
+        let mut results: Vec<Option<Option<Vec<u8>>>> = vec![None; keys.len()];
+        let mut pending: Vec<usize> = Vec::with_capacity(keys.len());
+
+        // 1. RowCache 批量探测 + 罕见 range tombstone 短路
+        for (idx, key) in keys.iter().enumerate() {
+            if let Some(val) = self.row_cache.get_ns(self.db_cache_id, key, max_seq) {
+                self.stats.note_logical_read(val.len());
+                results[idx] = Some(Some(val.to_vec()));
+            } else if self.covered_by_range_tombstone(key, max_seq)? {
+                let val = self.get_at_sequence_with_range_tombstones(key, max_seq)?;
+                if let Some(ref v) = val {
+                    self.stats.note_logical_read(v.len());
+                    self.row_cache.insert_ns(
+                        self.db_cache_id,
+                        key,
+                        bytes::Bytes::from(v.clone()),
+                        committed,
+                    );
+                }
+                results[idx] = Some(val);
+            } else {
+                pending.push(idx);
+            }
+        }
+
+        // 2. 单次持有 active MemTable 读锁批量查询
+        if !pending.is_empty() {
+            let mem = self.memtable.read();
+            let mut next_pending = Vec::with_capacity(pending.len());
+            for idx in pending {
+                let mut decided = None;
+                encode_internal_key_buffered(keys[idx], max_seq, ValueType::TypePut, |seek_key| {
+                    if let Ok(Some((value, ty))) = mem.search(seek_key) {
+                        decided = Some(match ty {
+                            ValueType::TypePut => Some(value.as_ref().to_vec()),
+                            ValueType::TypeDelete | ValueType::TypeRangeDelete => None,
+                        });
+                    }
+                });
+                if let Some(val) = decided {
+                    if let Some(ref v) = val {
+                        self.stats.note_logical_read(v.len());
+                        self.row_cache.insert_ns(
+                            self.db_cache_id,
+                            keys[idx],
+                            bytes::Bytes::from(v.clone()),
+                            committed,
+                        );
+                    }
+                    results[idx] = Some(val);
+                } else {
+                    next_pending.push(idx);
+                }
+            }
+            pending = next_pending;
+        } else {
+            pending.clear();
+        }
+
+        // 3. 单次持有 Immutable MemTables 读锁批量查询
+        if !pending.is_empty() {
+            let imms = self.immutable_memtables.read();
+            let mut next_pending = Vec::with_capacity(pending.len());
+            for idx in pending {
+                let mut decided = None;
+                encode_internal_key_buffered(keys[idx], max_seq, ValueType::TypePut, |seek_key| {
+                    for imm in imms.iter().rev() {
+                        if let Ok(Some((value, ty))) = imm.search(seek_key) {
+                            decided = Some(match ty {
+                                ValueType::TypePut => Some(value.as_ref().to_vec()),
+                                ValueType::TypeDelete | ValueType::TypeRangeDelete => None,
+                            });
+                            break;
+                        }
+                    }
+                });
+                if let Some(val) = decided {
+                    if let Some(ref v) = val {
+                        self.stats.note_logical_read(v.len());
+                        self.row_cache.insert_ns(
+                            self.db_cache_id,
+                            keys[idx],
+                            bytes::Bytes::from(v.clone()),
+                            committed,
+                        );
+                    }
+                    results[idx] = Some(val);
+                } else {
+                    next_pending.push(idx);
+                }
+            }
+            pending = next_pending;
+        }
+
+        // 4. 单次持有 sstables 读锁收集候选文件, 释放锁后再读盘并回填 RowCache
+        if !pending.is_empty() {
+            let (l0_readers, per_key_l1_plus): (
+                Vec<Arc<SSTableReader>>,
+                Vec<Vec<Arc<SSTableReader>>>,
+            ) = {
+                let tables = self.sstables.read();
+                let l0 = tables[0].clone();
+                let l1_plus = pending
+                    .iter()
+                    .map(|&idx| {
+                        let key = keys[idx];
+                        let mut cands = Vec::with_capacity(tables.len().saturating_sub(1));
+                        for level in tables.iter().skip(1) {
+                            if let Some(r) = find_sstable_for_key(level, key) {
+                                cands.push(Arc::clone(r));
+                            }
+                        }
+                        cands
+                    })
+                    .collect();
+                (l0, l1_plus)
+            };
+
+            for (pos, idx) in pending.into_iter().enumerate() {
+                let key = keys[idx];
+                let mut val: Option<Vec<u8>> = None;
+                let mut found_tombstone = false;
+                encode_internal_key_buffered(key, max_seq, ValueType::TypePut, |seek_key| {
+                    for reader in l0_readers.iter().chain(per_key_l1_plus[pos].iter()) {
+                        if let Ok(Some((v, ty))) = reader.get(seek_key) {
+                            match ty {
+                                ValueType::TypePut => val = Some(v),
+                                ValueType::TypeDelete | ValueType::TypeRangeDelete => {
+                                    found_tombstone = true;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                });
+                if found_tombstone {
+                    results[idx] = Some(None);
+                } else {
+                    if let Some(ref v) = val {
+                        self.stats.note_logical_read(v.len());
+                        self.row_cache.insert_ns(
+                            self.db_cache_id,
+                            key,
+                            bytes::Bytes::from(v.clone()),
+                            committed,
+                        );
+                    }
+                    results[idx] = Some(val);
+                }
+            }
+        }
+
+        self.stats.operation_durations[DbOp::Get as usize]
+            .record(op_start.elapsed().as_micros() as u64);
+        Ok(results.into_iter().map(|r| r.unwrap_or(None)).collect())
     }
 
     pub(crate) fn get_at_sequence(&self, key: &[u8], max_seq: u64) -> Result<Option<Vec<u8>>> {
@@ -166,26 +340,31 @@ impl DB {
     }
 
     fn get_from_sstables(&self, key: &[u8], max_seq: u64) -> Result<Option<Vec<u8>>> {
-        encode_internal_key_buffered(key, max_seq, ValueType::TypePut, |seek_key| {
+        let candidates: Vec<Arc<SSTableReader>> = {
             let tables = self.sstables.read();
-            // L0 文件按由新到旧排列在 tables[0] (0 = 最新落盘), 顺序遍历
+            let mut list = Vec::with_capacity(tables[0].len() + tables.len().saturating_sub(1));
+            // L0 文件按由新到旧排列在 tables[0] (0 = 最新落盘), 顺序加入候选
             for reader in &tables[0] {
+                list.push(Arc::clone(reader));
+            }
+            // L1+ 逐层二分命中至多 1 个文件
+            for level in tables.iter().skip(1) {
+                if let Some(reader) = find_sstable_for_key(level, key) {
+                    list.push(Arc::clone(reader));
+                }
+            }
+            list
+        };
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        encode_internal_key_buffered(key, max_seq, ValueType::TypePut, |seek_key| {
+            for reader in &candidates {
                 if let Some((value, ty)) = reader.get(seek_key)? {
                     return Ok(match ty {
                         ValueType::TypePut => Some(value),
                         ValueType::TypeDelete | ValueType::TypeRangeDelete => None,
                     });
-                }
-            }
-            // L1+ 逐层查找
-            for level in tables.iter().skip(1) {
-                if let Some(reader) = find_sstable_for_key(level, key) {
-                    if let Some((value, ty)) = reader.get(seek_key)? {
-                        return Ok(match ty {
-                            ValueType::TypePut => Some(value),
-                            ValueType::TypeDelete | ValueType::TypeRangeDelete => None,
-                        });
-                    }
                 }
             }
             Ok(None)
@@ -425,7 +604,11 @@ pub(super) fn find_sstable_for_key<'a>(
     level: &'a [Arc<SSTableReader>],
     user_key: &[u8],
 ) -> Option<&'a Arc<SSTableReader>> {
-    level.iter().find(|reader| {
+    let idx = level.partition_point(|reader| {
+        let largest = reader.largest_key();
+        largest.len() >= 8 && &largest[..largest.len() - 8] < user_key
+    });
+    level.get(idx).filter(|reader| {
         user_key_in_sstable_range(user_key, reader.smallest_key(), reader.largest_key())
     })
 }
@@ -648,18 +831,71 @@ mod tests {
     }
 
     #[test]
-    fn unsorted_level_still_finds_both_keys() {
+    fn sorted_level1_binary_search_finds_out_of_order_added_files() {
         let dir = tempdir().unwrap();
         let db = DB::open(dir.path(), Options::for_testing()).unwrap();
         db.sequence.store(3, Ordering::SeqCst);
         let file_m = one_entry(dir.path(), 1, b"m", 1, ValueType::TypePut, b"m");
         let file_a = one_entry(dir.path(), 2, b"a", 1, ValueType::TypePut, b"a");
-        let mut levels = vec![Vec::new(); db.options.max_levels];
-        levels[1].push(file_m);
-        levels[1].push(file_a);
-        db.replace_sstables_for_test(levels);
+        // Verify Version::apply keeps level 1+ sorted by smallest user_key
+        let v = crate::engine::compaction::Version::new(db.options.max_levels)
+            .apply(&crate::engine::compaction::VersionEdit::AddFile {
+                level: 1,
+                file_number: file_m.file_number(),
+                file_size: file_m.file_size(),
+                smallest_key: file_m.smallest_key().to_vec(),
+                largest_key: file_m.largest_key().to_vec(),
+            })
+            .apply(&crate::engine::compaction::VersionEdit::AddFile {
+                level: 1,
+                file_number: file_a.file_number(),
+                file_size: file_a.file_size(),
+                smallest_key: file_a.smallest_key().to_vec(),
+                largest_key: file_a.largest_key().to_vec(),
+            });
+        assert_eq!(v.levels[1][0].file_number, 2);
+        assert_eq!(v.levels[1][1].file_number, 1);
+
+        let loaded =
+            crate::engine::compaction::load_sstables_from_version(dir.path(), &v, None, None)
+                .unwrap();
+        assert_eq!(loaded[1][0].file_number(), 2);
+        assert_eq!(loaded[1][1].file_number(), 1);
+        db.replace_sstables_for_test(loaded);
         assert_eq!(db.get(b"a").unwrap().as_deref(), Some(b"a".as_slice()));
         assert_eq!(db.get(b"m").unwrap().as_deref(), Some(b"m".as_slice()));
+        assert_eq!(db.get(b"z").unwrap(), None);
+    }
+
+    #[test]
+    fn multi_get_reads_across_row_cache_memtable_imm_and_sstables() {
+        let dir = tempdir().unwrap();
+        let db = DB::open(dir.path(), Options::for_testing()).unwrap();
+        // SSTable keys
+        db.put(b"k_sst", b"v_sst").unwrap();
+        db.put(b"k_del", b"v_old").unwrap();
+        db.flush().unwrap();
+        // MemTable keys (and overwrite + delete)
+        db.put(b"k_mem", b"v_mem").unwrap();
+        db.delete(b"k_del").unwrap();
+        // Warm RowCache for k_sst
+        assert_eq!(
+            db.get(b"k_sst").unwrap().as_deref(),
+            Some(b"v_sst".as_slice())
+        );
+
+        let res = db
+            .multi_get(&[
+                b"k_sst".as_slice(),
+                b"k_mem".as_slice(),
+                b"k_del".as_slice(),
+                b"k_missing".as_slice(),
+            ])
+            .unwrap();
+        assert_eq!(
+            res,
+            vec![Some(b"v_sst".to_vec()), Some(b"v_mem".to_vec()), None, None,]
+        );
     }
 
     #[cfg(feature = "cluster")]

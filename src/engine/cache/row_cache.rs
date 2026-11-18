@@ -4,6 +4,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -23,8 +24,8 @@ fn shard_index(key: &[u8]) -> usize {
 }
 
 struct ShardInner {
-    cache: HashMap<Vec<u8>, (Bytes, u64, u64)>, // (value, seq, counter)
-    lru_queue: VecDeque<(Vec<u8>, u64)>,        // (key, counter)
+    cache: HashMap<Arc<[u8]>, (Bytes, u64, u64)>, // (value, seq, counter)
+    lru_queue: VecDeque<(Arc<[u8]>, u64)>,        // (key, counter)
     next_counter: u64,
     total_bytes: usize,
     max_bytes: usize,
@@ -88,6 +89,14 @@ pub struct RowCache {
     stats_evictions: AtomicU64,
 }
 
+impl std::fmt::Debug for RowCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RowCache")
+            .field("capacity", &self.capacity)
+            .finish()
+    }
+}
+
 impl RowCache {
     /// 创建指定容量 (字节) 的分片 RowCache (0 表示禁用)
     pub fn new(capacity: usize) -> Self {
@@ -121,9 +130,9 @@ impl RowCache {
         let idx = shard_index(key);
         let mut shard = self.shards[idx].lock();
 
-        let hit = if let Some((val, seq, _)) = shard.cache.get(key) {
+        let hit = if let Some((k, (val, seq, _))) = shard.cache.get_key_value(key) {
             if *seq <= max_seq {
-                Some(val.clone())
+                Some((Arc::clone(k), val.clone()))
             } else {
                 None
             }
@@ -131,14 +140,14 @@ impl RowCache {
             None
         };
 
-        if let Some(val) = hit {
+        if let Some((arc_key, val)) = hit {
             self.stats_hits.fetch_add(1, Ordering::Relaxed);
             shard.next_counter += 1;
             let c = shard.next_counter;
             if let Some((_, _, counter)) = shard.cache.get_mut(key) {
                 *counter = c;
             }
-            shard.lru_queue.push_back((key.to_vec(), c));
+            shard.lru_queue.push_back((arc_key, c));
             shard.maybe_compact_queue();
             return Some(val);
         }
@@ -168,8 +177,9 @@ impl RowCache {
         shard.total_bytes += entry_size;
         shard.next_counter += 1;
         let c = shard.next_counter;
-        shard.cache.insert(key.to_vec(), (value, seq, c));
-        shard.lru_queue.push_back((key.to_vec(), c));
+        let arc_key: Arc<[u8]> = Arc::from(key);
+        shard.cache.insert(Arc::clone(&arc_key), (value, seq, c));
+        shard.lru_queue.push_back((arc_key, c));
         shard.evict_excess(&self.stats_evictions);
         shard.maybe_compact_queue();
         self.stats_insertions.fetch_add(1, Ordering::Relaxed);
@@ -198,6 +208,36 @@ impl RowCache {
         }
     }
 
+    #[inline]
+    fn with_ns_key<R>(ns: u64, key: &[u8], f: impl FnOnce(&[u8]) -> R) -> R {
+        if ns == 0 {
+            return f(key);
+        }
+        if key.len() <= 248 {
+            let mut stack = [0u8; 256];
+            stack[..8].copy_from_slice(&ns.to_le_bytes());
+            stack[8..8 + key.len()].copy_from_slice(key);
+            f(&stack[..8 + key.len()])
+        } else {
+            let mut buf = Vec::with_capacity(8 + key.len());
+            buf.extend_from_slice(&ns.to_le_bytes());
+            buf.extend_from_slice(key);
+            f(&buf)
+        }
+    }
+
+    pub fn get_ns(&self, ns: u64, key: &[u8], max_seq: u64) -> Option<Bytes> {
+        Self::with_ns_key(ns, key, |k| self.get(k, max_seq))
+    }
+
+    pub fn insert_ns(&self, ns: u64, key: &[u8], value: Bytes, seq: u64) {
+        Self::with_ns_key(ns, key, |k| self.insert(k, value, seq))
+    }
+
+    pub fn invalidate_ns(&self, ns: u64, key: &[u8]) {
+        Self::with_ns_key(ns, key, |k| self.invalidate(k))
+    }
+
     /// 获取缓存性能指标快照
     pub fn stats(&self) -> CacheStats {
         CacheStats {
@@ -207,5 +247,32 @@ impl RowCache {
             insertions: self.stats_insertions.load(Ordering::Relaxed),
             evictions: self.stats_evictions.load(Ordering::Relaxed),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn row_cache_hit_reuses_arc_key_without_reallocation() {
+        let rc = RowCache::new(1024 * 1024);
+        rc.insert(b"hot-key", Bytes::from_static(b"hot-val"), 10);
+        let idx = shard_index(b"hot-key");
+        let ptr_before = {
+            let shard = rc.shards[idx].lock();
+            let (k, _) = shard.cache.get_key_value(b"hot-key".as_slice()).unwrap();
+            Arc::as_ptr(k) as *const u8
+        };
+        assert_eq!(
+            rc.get(b"hot-key", 10).as_deref(),
+            Some(b"hot-val".as_slice())
+        );
+        let ptr_after = {
+            let shard = rc.shards[idx].lock();
+            shard.lru_queue.back().unwrap().0.as_ptr()
+        };
+        assert_eq!(ptr_before, ptr_after);
     }
 }

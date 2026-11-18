@@ -155,7 +155,8 @@ impl DB {
         let start = surviving_start_level(task.level, task.output_level);
         let surviving = deeper_and_sibling_user_ranges(&levels, start, &consumed);
         let reader = DbPointReader { db: self };
-        let results = CompactionJob::new(
+        let alloc = || self.version_set.read().allocate_file_number();
+        let job = CompactionJob::new(
             task.inputs.clone(),
             task.expanded_inputs.clone(),
             task.output_level,
@@ -168,7 +169,16 @@ impl DB {
         .with_snapshot_threshold(min_snap_seq)
         .with_surviving_user_ranges(surviving)
         .with_filter(self.compaction_filter.read().clone())
-        .run_with_reader(&file_numbers, Some(&reader))?;
+        .with_target_file_size(self.options.target_file_size_base)
+        .with_max_compaction_bytes(self.options.max_compaction_bytes)
+        .with_grandparents(task.grandparents.clone());
+
+        let results = if file_numbers.len() <= 1 {
+            let first_fnum = file_numbers.first().copied().unwrap_or_else(alloc);
+            job.run_with_allocator(first_fnum, &alloc, Some(&reader))?
+        } else {
+            job.run_with_reader(&file_numbers, Some(&reader))?
+        };
 
         let written_bytes: u64 = results.iter().map(|r| r.file_size).sum();
         self.stats
@@ -196,15 +206,20 @@ impl DB {
 
             for result in &results {
                 if result.entry_count > 0 {
-                    let reader = Arc::new(SSTableReader::open_with_stats(
+                    let reader = Arc::new(SSTableReader::open_with_caches(
                         &result.output_path,
                         Some(Arc::clone(&self.block_cache)),
+                        Some(Arc::clone(&self.table_cache)),
                         Some(Arc::clone(&self.stats)),
                     )?);
                     if task.output_level == 0 {
                         sst_guard[task.output_level].insert(0, reader);
                     } else {
                         sst_guard[task.output_level].push(reader);
+                        sst_guard[task.output_level].sort_by(|a, b| {
+                            crate::engine::memtable::extract_user_key(a.smallest_key())
+                                .cmp(crate::engine::memtable::extract_user_key(b.smallest_key()))
+                        });
                     }
                     vs_guard.apply_edit(&VersionEdit::AddFile {
                         level: task.output_level,

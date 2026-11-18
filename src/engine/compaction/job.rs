@@ -50,6 +50,12 @@ pub struct CompactionJob {
     pub compaction_filter: Option<Arc<dyn CompactionFilter>>,
     /// 这次不会重写的文件的 user key 闭区间.
     surviving_user_ranges: Vec<UserKeyRange>,
+    /// 输出单个 SST 目标大小 (默认 64 MiB).
+    target_file_size: u64,
+    /// 与祖父层最大允许重叠字节数 (默认 25 * 64 MiB).
+    max_compaction_bytes: u64,
+    /// 与输出范围重叠的祖父层文件 (按 smallest_key 升序).
+    grandparents: Vec<Arc<SSTableReader>>,
 }
 
 pub struct CompactionResult {
@@ -91,7 +97,28 @@ impl CompactionJob {
             min_snapshot_sequence: u64::MAX, // 默认无活跃快照
             compaction_filter: None,
             surviving_user_ranges: Vec::new(),
+            target_file_size: 64 * 1024 * 1024,
+            max_compaction_bytes: 25 * 64 * 1024 * 1024,
+            grandparents: Vec::new(),
         }
+    }
+
+    /// 设置输出单个 SST 目标字节数.
+    pub fn with_target_file_size(mut self, target_file_size: u64) -> Self {
+        self.target_file_size = target_file_size.max(1);
+        self
+    }
+
+    /// 设置祖父层最大允许重叠字节数 (`ShouldStopBefore` 阈值).
+    pub fn with_max_compaction_bytes(mut self, max_compaction_bytes: u64) -> Self {
+        self.max_compaction_bytes = max_compaction_bytes.max(1);
+        self
+    }
+
+    /// 设置祖父层重叠文件列表 (按 smallest_key 升序).
+    pub fn with_grandparents(mut self, grandparents: Vec<Arc<SSTableReader>>) -> Self {
+        self.grandparents = grandparents;
+        self
     }
 
     /// 这次 compaction 之后仍然存在的文件范围. 默认空, 空则删除标记不留下.
@@ -259,38 +286,73 @@ impl CompactionJob {
     ) -> Result<Vec<CompactionResult>> {
         if file_numbers.len() <= 1 {
             let fnum = file_numbers.first().copied().unwrap_or(0);
-            return Ok(vec![self.run_single(fnum, reader)?]);
+            return self.run_single_with_allocator(fnum, None, reader);
         }
         self.run_split(file_numbers, reader)
     }
 
-    /// 单线程完整 compaction. 合并 count_dedup_entries 的计数遍历和写入遍历, 减少一次完整 I/O.
-    fn run_single(
+    /// 支持按 `target_file_size` 与 `max_compaction_bytes` 动态切分输出文件的单线程执行入口.
+    pub fn run_with_allocator(
         &self,
-        file_number: u64,
+        first_file_number: u64,
+        alloc_file_number: &(dyn Fn() -> u64 + Sync),
         reader: Option<&dyn CompactionPointReader>,
-    ) -> Result<CompactionResult> {
-        let ctx = self.filter_ctx(reader);
-        let output_path = sstable_path(&self.db_path, file_number, self.output_level);
+    ) -> Result<Vec<CompactionResult>> {
+        self.run_single_with_allocator(first_file_number, Some(alloc_file_number), reader)
+    }
 
-        // 粗估条目数以设置 Bloom filter (不做精确计数, 避免双遍历)
-        let estimated_keys: usize = self
+    /// 单线程完整 compaction. 支持在 user_key 切换边界按 `target_file_size` 和祖父层重叠切分多个 SST.
+    fn run_single_with_allocator(
+        &self,
+        first_file_number: u64,
+        alloc_file_number: Option<&(dyn Fn() -> u64 + Sync)>,
+        reader: Option<&dyn CompactionPointReader>,
+    ) -> Result<Vec<CompactionResult>> {
+        let ctx = self.filter_ctx(reader);
+
+        let total_input_bytes: u64 = self
             .all_inputs()
             .iter()
-            .map(|r| r.file_size() as usize / 100)
+            .map(|r| r.file_size())
+            .sum::<u64>()
+            .max(1);
+        let raw_estimated_keys: usize = self
+            .all_inputs()
+            .iter()
+            .map(|r| {
+                r.properties()
+                    .map(|p| p.num_entries as usize)
+                    .unwrap_or_else(|| (r.file_size() as usize / 32).max(1))
+            })
             .sum::<usize>()
             .max(1);
+        let estimated_keys = if total_input_bytes > self.target_file_size {
+            ((raw_estimated_keys as u128 * self.target_file_size as u128)
+                / total_input_bytes as u128)
+                .max(1) as usize
+        } else {
+            raw_estimated_keys
+        };
 
-        let mut builder = SSTableBuilder::new(
-            &output_path,
-            self.block_size,
-            self.block_restart_interval,
-            self.compression,
-            self.bloom_false_positive_rate,
-        )?;
-        if self.bloom_false_positive_rate > 0.0 {
-            builder.set_expected_keys(estimated_keys);
-        }
+        let new_builder = |file_number: u64| -> Result<(PathBuf, SSTableBuilder)> {
+            let path = sstable_path(&self.db_path, file_number, self.output_level);
+            let mut b = SSTableBuilder::new(
+                &path,
+                self.block_size,
+                self.block_restart_interval,
+                self.compression,
+                self.bloom_false_positive_rate,
+            )?;
+            if self.bloom_false_positive_rate > 0.0 {
+                b.set_expected_keys(estimated_keys);
+            }
+            Ok((path, b))
+        };
+
+        let mut cur_file_number = first_file_number;
+        let (mut output_path, mut builder) = new_builder(cur_file_number)?;
+        let mut results: Vec<CompactionResult> = Vec::new();
+        let mut gp_tracker = GrandparentTracker::new(&self.grandparents, self.max_compaction_bytes);
 
         let mut merge_iter = MergeIterator::new(self.all_inputs())?;
         let mut filter_removed: Vec<Vec<u8>> = Vec::new();
@@ -300,6 +362,7 @@ impl CompactionJob {
         let mut largest_key: Option<Vec<u8>> = None;
         let mut tracker = SnapshotDedupTracker::default();
         let mut range_tracker = RangeTombstoneTracker::default();
+        let mut pending_fragments: Vec<(u64, Vec<u8>)> = Vec::new();
 
         while let Some((key, value)) = merge_iter.next_entry()? {
             let user_key = user_key_from_internal(&key)?;
@@ -308,7 +371,43 @@ impl CompactionJob {
 
             if last_user_key.as_deref() != Some(user_key) {
                 range_tracker.advance_past(user_key);
+
+                if entry_count > 0 {
+                    if let Some(alloc) = alloc_file_number {
+                        let size_split = builder.estimated_file_size() >= self.target_file_size;
+                        let gp_split = gp_tracker.should_stop_before(user_key);
+                        if size_split || gp_split {
+                            let file_size = builder.finish()?;
+                            results.push(CompactionResult {
+                                file_number: cur_file_number,
+                                entry_count,
+                                output_path,
+                                smallest_key: smallest_key.take().unwrap_or_default(),
+                                largest_key: largest_key.take().unwrap_or_default(),
+                                file_size,
+                                filter_removed_user_keys: std::mem::take(&mut filter_removed),
+                            });
+                            pending_fragments = range_tracker.active_past(user_key);
+                            cur_file_number = alloc();
+                            (output_path, builder) = new_builder(cur_file_number)?;
+                            entry_count = 0;
+                            gp_tracker.reset_overlap();
+                        }
+                    }
+                } else {
+                    gp_tracker.observe_first_key(user_key);
+                }
             }
+
+            flush_spanning_fragments(
+                &mut builder,
+                &mut pending_fragments,
+                Some(user_key),
+                Some(&key),
+                &mut entry_count,
+                &mut smallest_key,
+                &mut largest_key,
+            )?;
 
             if last_user_key.as_deref() == Some(user_key) {
                 if !tracker.already_crossed() {
@@ -380,27 +479,31 @@ impl CompactionJob {
 
         if entry_count == 0 {
             builder.abandon()?;
-            return Ok(CompactionResult {
-                file_number: 0,
-                entry_count: 0,
-                output_path,
-                smallest_key: vec![],
-                largest_key: vec![],
-                file_size: 0,
-                filter_removed_user_keys: filter_removed,
-            });
+            if results.is_empty() {
+                results.push(CompactionResult {
+                    file_number: 0,
+                    entry_count: 0,
+                    output_path,
+                    smallest_key: vec![],
+                    largest_key: vec![],
+                    file_size: 0,
+                    filter_removed_user_keys: filter_removed,
+                });
+            }
+            return Ok(results);
         }
 
         let file_size = builder.finish()?;
-        Ok(CompactionResult {
-            file_number,
+        results.push(CompactionResult {
+            file_number: cur_file_number,
             entry_count,
             output_path,
             smallest_key: smallest_key.unwrap_or_default(),
             largest_key: largest_key.unwrap_or_default(),
             file_size,
             filter_removed_user_keys: filter_removed,
-        })
+        });
+        Ok(results)
     }
 
     /// 分裂 compaction: 将输入按 key 范围分成多个子任务并行执行.
@@ -482,6 +585,69 @@ impl CompactionJob {
         });
 
         results.into_iter().collect()
+    }
+}
+
+struct GrandparentTracker<'a> {
+    grandparents: &'a [Arc<SSTableReader>],
+    index: usize,
+    seen_key: bool,
+    overlapped_bytes: u64,
+    max_compaction_bytes: u64,
+}
+
+impl<'a> GrandparentTracker<'a> {
+    fn new(grandparents: &'a [Arc<SSTableReader>], max_compaction_bytes: u64) -> Self {
+        Self {
+            grandparents,
+            index: 0,
+            seen_key: false,
+            overlapped_bytes: 0,
+            max_compaction_bytes,
+        }
+    }
+
+    fn observe_first_key(&mut self, user_key: &[u8]) {
+        self.advance_past(user_key);
+        self.seen_key = true;
+    }
+
+    fn reset_overlap(&mut self) {
+        self.overlapped_bytes = 0;
+        self.seen_key = false;
+    }
+
+    fn advance_past(&mut self, user_key: &[u8]) {
+        while self.index < self.grandparents.len() {
+            let gp = &self.grandparents[self.index];
+            let gp_largest = crate::engine::memtable::extract_user_key(gp.largest_key());
+            if gp_largest < user_key {
+                self.index += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn should_stop_before(&mut self, user_key: &[u8]) -> bool {
+        if self.grandparents.is_empty() {
+            return false;
+        }
+        self.advance_past(user_key);
+        while self.index < self.grandparents.len() {
+            let gp = &self.grandparents[self.index];
+            let gp_smallest = crate::engine::memtable::extract_user_key(gp.smallest_key());
+            if gp_smallest <= user_key {
+                if self.seen_key {
+                    self.overlapped_bytes = self.overlapped_bytes.saturating_add(gp.file_size());
+                }
+                self.index += 1;
+            } else {
+                break;
+            }
+        }
+        self.seen_key = true;
+        self.overlapped_bytes > self.max_compaction_bytes
     }
 }
 
@@ -1468,5 +1634,130 @@ mod tests {
         let seek = encode_internal_key(b"k", u64::MAX, ValueType::TypePut);
         let (_, ty) = reader.get(&seek).unwrap().expect("tombstone");
         assert_eq!(ty, ValueType::TypeDelete);
+    }
+
+    #[test]
+    fn compaction_job_splits_output_at_target_file_size_without_splitting_user_key_versions() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let dir = tempdir().unwrap();
+        let val = vec![b'x'; 256];
+        // key "a" has 3 snapshot-protected versions -> ~800B total, must stay in one file even if target is 512B
+        // key "b" and "c" push total size well past 512B -> must split at user_key boundaries
+        let input = sst(
+            dir.path(),
+            1,
+            0,
+            &[
+                (b"a", 30, ValueType::TypePut, &val),
+                (b"a", 20, ValueType::TypePut, &val),
+                (b"a", 10, ValueType::TypePut, &val),
+                (b"b", 30, ValueType::TypePut, &val),
+                (b"c", 30, ValueType::TypePut, &val),
+                (b"d", 30, ValueType::TypePut, &val),
+            ],
+        );
+        let next_num = AtomicU64::new(100);
+        let job = CompactionJob::new(
+            vec![input],
+            vec![],
+            1,
+            dir.path().to_path_buf(),
+            512,
+            16,
+            CompressionType::None,
+            0.0,
+        )
+        .with_snapshot_threshold(5)
+        .with_target_file_size(512);
+
+        let results = job
+            .run_with_allocator(1, &|| next_num.fetch_add(1, Ordering::Relaxed), None)
+            .unwrap();
+        assert!(
+            results.len() >= 2,
+            "expected multiple output SSTs, got {}",
+            results.len()
+        );
+        // All 3 versions of "a" must stay in the first file (never split across files)
+        let first_reader = SSTableReader::open(&results[0].output_path, None).unwrap();
+        assert_eq!(
+            first_reader
+                .get(&encode_internal_key(b"a", 30, ValueType::TypePut))
+                .unwrap()
+                .unwrap()
+                .0,
+            val
+        );
+        assert_eq!(
+            first_reader
+                .get(&encode_internal_key(b"a", 10, ValueType::TypePut))
+                .unwrap()
+                .unwrap()
+                .0,
+            val
+        );
+        // Second file must NOT contain "a"
+        let second_reader = SSTableReader::open(&results[1].output_path, None).unwrap();
+        assert!(second_reader
+            .get(&encode_internal_key(b"a", 30, ValueType::TypePut))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn compaction_job_splits_carry_active_range_tombstone_and_stop_on_grandparent_overlap() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let dir = tempdir().unwrap();
+        let val = vec![b'y'; 200];
+        let input = sst(
+            dir.path(),
+            1,
+            0,
+            &[
+                (b"a", 10, ValueType::TypeRangeDelete, b"z"),
+                (b"b", 5, ValueType::TypePut, &val),
+                (b"m", 5, ValueType::TypePut, &val),
+                (b"y", 5, ValueType::TypePut, &val),
+            ],
+        );
+        let gp1 = sst(dir.path(), 2, 2, &[(b"b", 1, ValueType::TypePut, &val)]);
+        let gp2 = sst(dir.path(), 3, 2, &[(b"m", 1, ValueType::TypePut, &val)]);
+        let next_num = AtomicU64::new(200);
+        let job = CompactionJob::new(
+            vec![input],
+            vec![],
+            1,
+            dir.path().to_path_buf(),
+            512,
+            16,
+            CompressionType::None,
+            0.0,
+        )
+        .with_snapshot_threshold(5)
+        .with_target_file_size(1024 * 1024)
+        .with_max_compaction_bytes(100)
+        .with_grandparents(vec![gp1, gp2]);
+
+        let results = job
+            .run_with_allocator(1, &|| next_num.fetch_add(1, Ordering::Relaxed), None)
+            .unwrap();
+        assert!(
+            results.len() >= 2,
+            "expected grandparent overlap to trigger split, got {}",
+            results.len()
+        );
+        // Verify active range tombstone [..., z) was carried into the final split SST
+        let last_reader = SSTableReader::open(&results.last().unwrap().output_path, None).unwrap();
+        let tombstones = last_reader.collect_range_tombstones();
+        assert!(
+            tombstones
+                .iter()
+                .any(|(start, end, seq)| start.as_slice() <= b"y".as_slice()
+                    && b"y".as_slice() < end.as_slice()
+                    && *seq == 10),
+            "expected carried range tombstone covering y at seq 10, got {tombstones:?}"
+        );
     }
 }

@@ -58,9 +58,11 @@ pub(super) use super::replay::replay_entries;
 pub(super) use super::snapshot::{Snapshot, SnapshotList};
 pub(super) use super::write_batch::{WriteBatch, WriteOp};
 pub(super) use crate::config::Options;
-pub(super) use crate::engine::cache::{BlockCache, CacheStats, RowCache};
+pub(super) use crate::engine::cache::{
+    BlockCache, CacheStats, RowCache, TableCache, WriteBufferManager,
+};
 pub(super) use crate::engine::compaction::{
-    current_exists, load_sstables_from_version, remove_orphan_sstables,
+    current_exists, load_sstables_from_version_with_caches, remove_orphan_sstables,
     scan_version_edits_from_dir, CompactionFilter, CompactionJob, CompactionPicker,
     CompactionRemovalListener, CompactionTask, VersionEdit, VersionSet,
 };
@@ -117,8 +119,11 @@ pub struct DB {
     /// 最新 Put 被 filter Remove 时的监听器 (filter 保持无副作用).
     compaction_removal_listener: RwLock<Option<Arc<dyn CompactionRemovalListener>>>,
     checkpoint_in_progress: AtomicBool,
+    db_cache_id: u64,
     block_cache: Arc<BlockCache>,
     pub(crate) row_cache: Arc<RowCache>,
+    table_cache: Arc<TableCache>,
+    write_buffer_manager: Option<Arc<WriteBufferManager>>,
     pub(crate) snapshots: Arc<SnapshotList>,
     /// Group commit: last synced sequence number (monotonic)
     group_commit_synced_seq: AtomicU64,
@@ -224,10 +229,23 @@ impl DB {
 
         let next_wal = scan_next_wal_file_number(&path);
         let max_levels = options.max_levels;
-        let block_cache = Arc::new(BlockCache::new_with_stats(
-            options.block_cache_size,
-            Some(Arc::clone(&stats)),
-        ));
+        static NEXT_DB_CACHE_ID: AtomicU64 = AtomicU64::new(1);
+        let db_cache_id = NEXT_DB_CACHE_ID.fetch_add(1, AtomicOrdering::Relaxed);
+        let block_cache = options.shared_block_cache.clone().unwrap_or_else(|| {
+            Arc::new(BlockCache::new_with_stats(
+                options.block_cache_size,
+                Some(Arc::clone(&stats)),
+            ))
+        });
+        let row_cache = options
+            .shared_row_cache
+            .clone()
+            .unwrap_or_else(|| Arc::new(RowCache::new(options.row_cache_size)));
+        let table_cache = options
+            .shared_table_cache
+            .clone()
+            .unwrap_or_else(|| Arc::new(TableCache::new(options.max_open_files)));
+        let write_buffer_manager = options.shared_write_buffer_manager.clone();
         let cache_for_open = Some(Arc::clone(&block_cache));
 
         // 阶段 1: WAL 回放计时与物理字节累加
@@ -276,10 +294,11 @@ impl DB {
 
         // 阶段 3: SSTable Reader 打开与元数据加载计时
         let sstable_open_start = std::time::Instant::now();
-        let sstables = load_sstables_from_version(
+        let sstables = load_sstables_from_version_with_caches(
             &path,
             version_set.current(),
             cache_for_open,
+            Some(Arc::clone(&table_cache)),
             Some(Arc::clone(&stats)),
         )?;
         let sstable_open_duration = sstable_open_start.elapsed().as_micros() as u64;
@@ -342,8 +361,11 @@ impl DB {
             compaction_filter: RwLock::new(None),
             compaction_removal_listener: RwLock::new(None),
             checkpoint_in_progress: AtomicBool::new(false),
+            db_cache_id,
             block_cache,
-            row_cache: Arc::new(RowCache::new(options.row_cache_size)),
+            row_cache,
+            table_cache,
+            write_buffer_manager,
             snapshots: SnapshotList::new(),
             group_commit_synced_seq: AtomicU64::new(0),
             l0_sstable_count: AtomicUsize::new(l0_sstable_count_init),

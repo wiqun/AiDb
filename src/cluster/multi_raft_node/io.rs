@@ -178,6 +178,19 @@ impl MultiRaftNode {
         }
     }
 
+    /// 本地 group 批量线性点查 (`DB::multi_get`).
+    pub async fn multi_get_local(
+        &self,
+        group_id: u64,
+        keys: &[Vec<u8>],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        let group = self.groups.read().get(&group_id).cloned();
+        match group {
+            Some(node) => node.multi_get(keys.to_vec()).await,
+            None => Err(ClusterError::Raft(format!("group {} not found locally", group_id)).into()),
+        }
+    }
+
     /// FIX-0056-A1"读导向"点 3: `get_key_from_group` 的跨节点合并读 fallback.
     ///
     /// Group 在本地时直接走本地 leader-check / linearizable 读. 否则 RPC 到
