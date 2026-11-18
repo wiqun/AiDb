@@ -522,6 +522,18 @@ impl OpenRaftStorage {
             .map_err(|e| Error::Cluster(map_db_err(e)))
     }
 
+    pub fn multi_get_state_machine_values(
+        &self,
+        user_keys: &[Vec<u8>],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        let encoded: Vec<Vec<u8>> = user_keys.iter().map(|k| sm_key(self.group_id, k)).collect();
+        let refs: Vec<&[u8]> = encoded.iter().map(|k| k.as_slice()).collect();
+        self.db
+            .read()
+            .multi_get(&refs)
+            .map_err(|e| Error::Cluster(map_db_err(e)))
+    }
+
     pub fn get_state_machine_bytes(&self, user_key: &[u8]) -> Result<Option<bytes::Bytes>> {
         let key = sm_key(self.group_id, user_key);
         let db = self.db.read();

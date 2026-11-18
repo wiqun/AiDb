@@ -810,6 +810,14 @@ impl OpenRaftNode {
             .map_err(|e| Error::Cluster(ClusterError::Internal(e.to_string())))?
     }
 
+    pub async fn multi_get(&self, keys: Vec<Vec<u8>>) -> Result<Vec<Option<Vec<u8>>>> {
+        self.ensure_leader_for_linear_read().await?;
+        let storage = self.storage.clone();
+        tokio::task::spawn_blocking(move || storage.multi_get_state_machine_values(&keys))
+            .await
+            .map_err(|e| Error::Cluster(ClusterError::Internal(e.to_string())))?
+    }
+
     /// FIX-0056-A1: 读取本 group 在 `epoch` 下的迁移 oplog tip. 供
     /// `SlotMigrationManager::drain_oplog_tip_stable` 判断"tip 是否已稳定"
     /// (mark_ready 前置). tip 缺失视为 0.

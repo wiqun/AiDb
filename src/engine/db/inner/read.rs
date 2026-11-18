@@ -56,6 +56,179 @@ impl DB {
         Ok(self.get_pinned(key)?.map(|p| p.into_vec()))
     }
 
+    /// 批量点查多个 key: 一次获取各层读锁, 并在释放 `sstables.read()` 后并发/顺序读盘.
+    pub fn multi_get(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>> {
+        let op_start = std::time::Instant::now();
+        self.check_not_closed()?;
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        for k in keys {
+            Self::validate_user_key(k)?;
+        }
+        self.stats.operations[DbOp::Get as usize]
+            .fetch_add(keys.len() as u64, AtomicOrdering::Relaxed);
+        let max_seq = self.sequence.load(AtomicOrdering::SeqCst);
+        let committed = self.committed_sequence.load(AtomicOrdering::Acquire);
+
+        // None = 待继续查找; Some(None) = 已确认不存在/已删除; Some(Some(v)) = 已命中
+        let mut results: Vec<Option<Option<Vec<u8>>>> = vec![None; keys.len()];
+        let mut pending: Vec<usize> = Vec::with_capacity(keys.len());
+
+        // 1. RowCache 批量探测 + 罕见 range tombstone 短路
+        for (idx, key) in keys.iter().enumerate() {
+            if let Some(val) = self.row_cache.get_ns(self.db_cache_id, key, max_seq) {
+                self.stats.note_logical_read(val.len());
+                results[idx] = Some(Some(val.to_vec()));
+            } else if self.covered_by_range_tombstone(key, max_seq)? {
+                let val = self.get_at_sequence_with_range_tombstones(key, max_seq)?;
+                if let Some(ref v) = val {
+                    self.stats.note_logical_read(v.len());
+                    self.row_cache.insert_ns(
+                        self.db_cache_id,
+                        key,
+                        bytes::Bytes::from(v.clone()),
+                        committed,
+                    );
+                }
+                results[idx] = Some(val);
+            } else {
+                pending.push(idx);
+            }
+        }
+
+        // 2. 单次持有 active MemTable 读锁批量查询
+        if !pending.is_empty() {
+            let mem = self.memtable.read();
+            let mut next_pending = Vec::with_capacity(pending.len());
+            for idx in pending {
+                let mut decided = None;
+                encode_internal_key_buffered(keys[idx], max_seq, ValueType::TypePut, |seek_key| {
+                    if let Ok(Some((value, ty))) = mem.search(seek_key) {
+                        decided = Some(match ty {
+                            ValueType::TypePut => Some(value.as_ref().to_vec()),
+                            ValueType::TypeDelete | ValueType::TypeRangeDelete => None,
+                        });
+                    }
+                });
+                if let Some(val) = decided {
+                    if let Some(ref v) = val {
+                        self.stats.note_logical_read(v.len());
+                        self.row_cache.insert_ns(
+                            self.db_cache_id,
+                            keys[idx],
+                            bytes::Bytes::from(v.clone()),
+                            committed,
+                        );
+                    }
+                    results[idx] = Some(val);
+                } else {
+                    next_pending.push(idx);
+                }
+            }
+            pending = next_pending;
+        } else {
+            pending.clear();
+        }
+
+        // 3. 单次持有 Immutable MemTables 读锁批量查询
+        if !pending.is_empty() {
+            let imms = self.immutable_memtables.read();
+            let mut next_pending = Vec::with_capacity(pending.len());
+            for idx in pending {
+                let mut decided = None;
+                encode_internal_key_buffered(keys[idx], max_seq, ValueType::TypePut, |seek_key| {
+                    for imm in imms.iter().rev() {
+                        if let Ok(Some((value, ty))) = imm.search(seek_key) {
+                            decided = Some(match ty {
+                                ValueType::TypePut => Some(value.as_ref().to_vec()),
+                                ValueType::TypeDelete | ValueType::TypeRangeDelete => None,
+                            });
+                            break;
+                        }
+                    }
+                });
+                if let Some(val) = decided {
+                    if let Some(ref v) = val {
+                        self.stats.note_logical_read(v.len());
+                        self.row_cache.insert_ns(
+                            self.db_cache_id,
+                            keys[idx],
+                            bytes::Bytes::from(v.clone()),
+                            committed,
+                        );
+                    }
+                    results[idx] = Some(val);
+                } else {
+                    next_pending.push(idx);
+                }
+            }
+            pending = next_pending;
+        }
+
+        // 4. 单次持有 sstables 读锁收集候选文件, 释放锁后再读盘并回填 RowCache
+        if !pending.is_empty() {
+            let (l0_readers, per_key_l1_plus): (
+                Vec<Arc<SSTableReader>>,
+                Vec<Vec<Arc<SSTableReader>>>,
+            ) = {
+                let tables = self.sstables.read();
+                let l0 = tables[0].clone();
+                let l1_plus = pending
+                    .iter()
+                    .map(|&idx| {
+                        let key = keys[idx];
+                        let mut cands = Vec::with_capacity(tables.len().saturating_sub(1));
+                        for level in tables.iter().skip(1) {
+                            if let Some(r) = find_sstable_for_key(level, key) {
+                                cands.push(Arc::clone(r));
+                            }
+                        }
+                        cands
+                    })
+                    .collect();
+                (l0, l1_plus)
+            };
+
+            for (pos, idx) in pending.into_iter().enumerate() {
+                let key = keys[idx];
+                let mut val: Option<Vec<u8>> = None;
+                let mut found_tombstone = false;
+                encode_internal_key_buffered(key, max_seq, ValueType::TypePut, |seek_key| {
+                    for reader in l0_readers.iter().chain(per_key_l1_plus[pos].iter()) {
+                        if let Ok(Some((v, ty))) = reader.get(seek_key) {
+                            match ty {
+                                ValueType::TypePut => val = Some(v),
+                                ValueType::TypeDelete | ValueType::TypeRangeDelete => {
+                                    found_tombstone = true;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                });
+                if found_tombstone {
+                    results[idx] = Some(None);
+                } else {
+                    if let Some(ref v) = val {
+                        self.stats.note_logical_read(v.len());
+                        self.row_cache.insert_ns(
+                            self.db_cache_id,
+                            key,
+                            bytes::Bytes::from(v.clone()),
+                            committed,
+                        );
+                    }
+                    results[idx] = Some(val);
+                }
+            }
+        }
+
+        self.stats.operation_durations[DbOp::Get as usize]
+            .record(op_start.elapsed().as_micros() as u64);
+        Ok(results.into_iter().map(|r| r.unwrap_or(None)).collect())
+    }
+
     pub(crate) fn get_at_sequence(&self, key: &[u8], max_seq: u64) -> Result<Option<Vec<u8>>> {
         let r = self.get_at_sequence_uncounted(key, max_seq)?;
         let bytes = r.as_ref().map(|v| v.len()).unwrap_or(0);
@@ -692,6 +865,37 @@ mod tests {
         assert_eq!(db.get(b"a").unwrap().as_deref(), Some(b"a".as_slice()));
         assert_eq!(db.get(b"m").unwrap().as_deref(), Some(b"m".as_slice()));
         assert_eq!(db.get(b"z").unwrap(), None);
+    }
+
+    #[test]
+    fn multi_get_reads_across_row_cache_memtable_imm_and_sstables() {
+        let dir = tempdir().unwrap();
+        let db = DB::open(dir.path(), Options::for_testing()).unwrap();
+        // SSTable keys
+        db.put(b"k_sst", b"v_sst").unwrap();
+        db.put(b"k_del", b"v_old").unwrap();
+        db.flush().unwrap();
+        // MemTable keys (and overwrite + delete)
+        db.put(b"k_mem", b"v_mem").unwrap();
+        db.delete(b"k_del").unwrap();
+        // Warm RowCache for k_sst
+        assert_eq!(
+            db.get(b"k_sst").unwrap().as_deref(),
+            Some(b"v_sst".as_slice())
+        );
+
+        let res = db
+            .multi_get(&[
+                b"k_sst".as_slice(),
+                b"k_mem".as_slice(),
+                b"k_del".as_slice(),
+                b"k_missing".as_slice(),
+            ])
+            .unwrap();
+        assert_eq!(
+            res,
+            vec![Some(b"v_sst".to_vec()), Some(b"v_mem".to_vec()), None, None,]
+        );
     }
 
     #[cfg(feature = "cluster")]
