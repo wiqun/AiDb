@@ -88,6 +88,12 @@ impl Version {
                         smallest_key: smallest_key.clone(),
                         largest_key: largest_key.clone(),
                     });
+                    if *level >= 1 {
+                        v.levels[*level].sort_by(|a, b| {
+                            crate::engine::memtable::extract_user_key(&a.smallest_key)
+                                .cmp(crate::engine::memtable::extract_user_key(&b.smallest_key))
+                        });
+                    }
                 }
             }
             VersionEdit::DeleteFile { level, file_number } => {
@@ -379,6 +385,10 @@ pub fn load_sstables_from_version(
             for (_, r) in opened {
                 sstables[level].push(r);
             }
+            sstables[level].sort_by(|a, b| {
+                crate::engine::memtable::extract_user_key(a.smallest_key())
+                    .cmp(crate::engine::memtable::extract_user_key(b.smallest_key()))
+            });
         }
     }
     Ok(sstables)

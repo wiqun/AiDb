@@ -166,26 +166,31 @@ impl DB {
     }
 
     fn get_from_sstables(&self, key: &[u8], max_seq: u64) -> Result<Option<Vec<u8>>> {
-        encode_internal_key_buffered(key, max_seq, ValueType::TypePut, |seek_key| {
+        let candidates: Vec<Arc<SSTableReader>> = {
             let tables = self.sstables.read();
-            // L0 文件按由新到旧排列在 tables[0] (0 = 最新落盘), 顺序遍历
+            let mut list = Vec::with_capacity(tables[0].len() + tables.len().saturating_sub(1));
+            // L0 文件按由新到旧排列在 tables[0] (0 = 最新落盘), 顺序加入候选
             for reader in &tables[0] {
+                list.push(Arc::clone(reader));
+            }
+            // L1+ 逐层二分命中至多 1 个文件
+            for level in tables.iter().skip(1) {
+                if let Some(reader) = find_sstable_for_key(level, key) {
+                    list.push(Arc::clone(reader));
+                }
+            }
+            list
+        };
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        encode_internal_key_buffered(key, max_seq, ValueType::TypePut, |seek_key| {
+            for reader in &candidates {
                 if let Some((value, ty)) = reader.get(seek_key)? {
                     return Ok(match ty {
                         ValueType::TypePut => Some(value),
                         ValueType::TypeDelete | ValueType::TypeRangeDelete => None,
                     });
-                }
-            }
-            // L1+ 逐层查找
-            for level in tables.iter().skip(1) {
-                if let Some(reader) = find_sstable_for_key(level, key) {
-                    if let Some((value, ty)) = reader.get(seek_key)? {
-                        return Ok(match ty {
-                            ValueType::TypePut => Some(value),
-                            ValueType::TypeDelete | ValueType::TypeRangeDelete => None,
-                        });
-                    }
                 }
             }
             Ok(None)
@@ -425,7 +430,11 @@ pub(super) fn find_sstable_for_key<'a>(
     level: &'a [Arc<SSTableReader>],
     user_key: &[u8],
 ) -> Option<&'a Arc<SSTableReader>> {
-    level.iter().find(|reader| {
+    let idx = level.partition_point(|reader| {
+        let largest = reader.largest_key();
+        largest.len() >= 8 && &largest[..largest.len() - 8] < user_key
+    });
+    level.get(idx).filter(|reader| {
         user_key_in_sstable_range(user_key, reader.smallest_key(), reader.largest_key())
     })
 }
@@ -648,18 +657,40 @@ mod tests {
     }
 
     #[test]
-    fn unsorted_level_still_finds_both_keys() {
+    fn sorted_level1_binary_search_finds_out_of_order_added_files() {
         let dir = tempdir().unwrap();
         let db = DB::open(dir.path(), Options::for_testing()).unwrap();
         db.sequence.store(3, Ordering::SeqCst);
         let file_m = one_entry(dir.path(), 1, b"m", 1, ValueType::TypePut, b"m");
         let file_a = one_entry(dir.path(), 2, b"a", 1, ValueType::TypePut, b"a");
-        let mut levels = vec![Vec::new(); db.options.max_levels];
-        levels[1].push(file_m);
-        levels[1].push(file_a);
-        db.replace_sstables_for_test(levels);
+        // Verify Version::apply keeps level 1+ sorted by smallest user_key
+        let v = crate::engine::compaction::Version::new(db.options.max_levels)
+            .apply(&crate::engine::compaction::VersionEdit::AddFile {
+                level: 1,
+                file_number: file_m.file_number(),
+                file_size: file_m.file_size(),
+                smallest_key: file_m.smallest_key().to_vec(),
+                largest_key: file_m.largest_key().to_vec(),
+            })
+            .apply(&crate::engine::compaction::VersionEdit::AddFile {
+                level: 1,
+                file_number: file_a.file_number(),
+                file_size: file_a.file_size(),
+                smallest_key: file_a.smallest_key().to_vec(),
+                largest_key: file_a.largest_key().to_vec(),
+            });
+        assert_eq!(v.levels[1][0].file_number, 2);
+        assert_eq!(v.levels[1][1].file_number, 1);
+
+        let loaded =
+            crate::engine::compaction::load_sstables_from_version(dir.path(), &v, None, None)
+                .unwrap();
+        assert_eq!(loaded[1][0].file_number(), 2);
+        assert_eq!(loaded[1][1].file_number(), 1);
+        db.replace_sstables_for_test(loaded);
         assert_eq!(db.get(b"a").unwrap().as_deref(), Some(b"a".as_slice()));
         assert_eq!(db.get(b"m").unwrap().as_deref(), Some(b"m".as_slice()));
+        assert_eq!(db.get(b"z").unwrap(), None);
     }
 
     #[cfg(feature = "cluster")]

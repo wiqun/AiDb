@@ -215,6 +215,10 @@ impl DB {
                         sst_guard[task.output_level].insert(0, reader);
                     } else {
                         sst_guard[task.output_level].push(reader);
+                        sst_guard[task.output_level].sort_by(|a, b| {
+                            crate::engine::memtable::extract_user_key(a.smallest_key())
+                                .cmp(crate::engine::memtable::extract_user_key(b.smallest_key()))
+                        });
                     }
                     vs_guard.apply_edit(&VersionEdit::AddFile {
                         level: task.output_level,
