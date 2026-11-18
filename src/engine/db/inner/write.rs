@@ -456,11 +456,24 @@ impl DB {
 
                 let wal = wal_started.elapsed();
                 let memtable_started = std::time::Instant::now();
-                // Leader 统一将当前 Group 中所有批次顺序写入 MemTable (消除 Followers 线程上下文切换与自旋空转)
-                for &w_ptr in group {
-                    let w = unsafe { &*w_ptr };
-                    let b = unsafe { &*w.batch };
-                    self.insert_batch_to_memtable(b, w.seq)?;
+                // 广播 STATE_MEMTABLE 让 Followers 与 Leader 并发向无锁 SkipMap 插入各自批次
+                if group.len() > 1 {
+                    leader.launch_memtable();
+                    let w0 = unsafe { &*group[0] };
+                    let b0 = unsafe { &*w0.batch };
+                    let leader_res = self.insert_batch_to_memtable(b0, w0.seq);
+                    let followers_res = leader.wait_memtable_done();
+                    if let Err(e) = leader_res.and(followers_res) {
+                        leader.fail(&e.to_string());
+                        return Err(e);
+                    }
+                } else {
+                    let w0 = unsafe { &*group[0] };
+                    let b0 = unsafe { &*w0.batch };
+                    if let Err(e) = self.insert_batch_to_memtable(b0, w0.seq) {
+                        leader.fail(&e.to_string());
+                        return Err(e);
+                    }
                 }
 
                 // 原子推进 committed_sequence (短暂持有 write_lock 与 snapshot 注册保持互斥)
@@ -511,7 +524,9 @@ impl DB {
                 let join = join_started.elapsed();
                 let b = unsafe { &*writer.batch };
                 let memtable_started = std::time::Instant::now();
-                self.insert_batch_to_memtable(b, seq)?;
+                if let Err(e) = self.insert_batch_to_memtable(b, seq) {
+                    writer.error = Some(e.to_string());
+                }
                 let memtable = memtable_started.elapsed();
                 writer
                     .state

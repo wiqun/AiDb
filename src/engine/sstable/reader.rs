@@ -39,7 +39,10 @@ use super::footer::{Footer, FOOTER_SIZE};
 use super::handle::BlockHandle;
 use super::index::{find_block_handle, load_index_entries, IndexBlock};
 use super::iterator::SSTableIterator;
-use super::meta::{find_meta_block_handle, read_raw_bytes, BLOOM_META_NAME, PROPERTIES_META_NAME};
+use super::meta::{
+    decode_range_tombstones, find_meta_block_handle, read_raw_bytes, BLOOM_META_NAME,
+    PROPERTIES_META_NAME, RANGE_TOMBSTONES_META_NAME,
+};
 use super::properties::SstProperties;
 
 #[derive(Clone, Debug)]
@@ -61,6 +64,8 @@ pub struct SSTableReader {
     properties: Option<SstProperties>,
     block_cache: Option<Arc<BlockCache>>,
     range_tombstones: Arc<Vec<RangeTombstoneEntry>>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    loaded_range_tombstones_from_meta: bool,
     stats: Option<Arc<Statistics>>,
 }
 
@@ -98,11 +103,26 @@ impl SSTableReader {
 
         let (smallest_key, largest_key) =
             read_key_range(&file, file_number, &index_entries, block_cache.as_ref())?;
-        let range_tombstones = Arc::new(load_range_tombstones(
-            &file,
-            file_number,
-            Arc::clone(&index_entries),
-        )?);
+        let (range_tombstones_vec, loaded_range_tombstones_from_meta) = if let Some(handle) =
+            find_meta_block_handle(&meta_index, RANGE_TOMBSTONES_META_NAME)?
+        {
+            let raw = read_raw_bytes(&file, handle.offset, handle.size)?;
+            let decoded = decode_range_tombstones(&raw)?
+                .into_iter()
+                .map(|(start, end, sequence)| RangeTombstoneEntry {
+                    start,
+                    end,
+                    sequence,
+                })
+                .collect();
+            (decoded, true)
+        } else {
+            (
+                load_range_tombstones(&file, file_number, Arc::clone(&index_entries))?,
+                false,
+            )
+        };
+        let range_tombstones = Arc::new(range_tombstones_vec);
 
         Ok(Self {
             file,
@@ -116,8 +136,14 @@ impl SSTableReader {
             properties,
             block_cache,
             range_tombstones,
+            loaded_range_tombstones_from_meta,
             stats,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn loaded_range_tombstones_from_meta(&self) -> bool {
+        self.loaded_range_tombstones_from_meta
     }
 
     pub fn file_number(&self) -> u64 {
@@ -523,4 +549,56 @@ fn load_range_tombstones(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::CompressionType;
+    use crate::engine::sstable::{sstable_path, SSTableBuilder};
+    use tempfile::tempdir;
+
+    #[test]
+    fn range_tombstones_meta_block_loads_in_o1_and_legacy_falls_back() {
+        let dir = tempdir().unwrap();
+        let path = sstable_path(dir.path(), 1, 0);
+        let mut b = SSTableBuilder::new(&path, 512, 16, CompressionType::None, 0.0).unwrap();
+        b.add(
+            &encode_internal_key(b"a", 10, ValueType::TypeRangeDelete),
+            b"m",
+        )
+        .unwrap();
+        b.add(&encode_internal_key(b"b", 5, ValueType::TypePut), b"v1")
+            .unwrap();
+        b.add(&encode_internal_key(b"z", 5, ValueType::TypePut), b"v2")
+            .unwrap();
+        b.finish().unwrap();
+
+        let reader = SSTableReader::open(&path, None).unwrap();
+        assert!(reader.loaded_range_tombstones_from_meta());
+        assert_eq!(
+            reader.collect_range_tombstones(),
+            vec![(b"a".to_vec(), b"m".to_vec(), 10)]
+        );
+
+        // Legacy SST without "range_tombstones" meta block must fall back to full scan
+        let legacy_path = sstable_path(dir.path(), 2, 0);
+        let mut lb =
+            SSTableBuilder::new(&legacy_path, 512, 16, CompressionType::None, 0.0).unwrap();
+        lb.add(
+            &encode_internal_key(b"c", 20, ValueType::TypeRangeDelete),
+            b"p",
+        )
+        .unwrap();
+        lb.add(&encode_internal_key(b"d", 5, ValueType::TypePut), b"v3")
+            .unwrap();
+        lb.finish_without_range_tombstones_meta_for_test().unwrap();
+
+        let legacy_reader = SSTableReader::open(&legacy_path, None).unwrap();
+        assert!(!legacy_reader.loaded_range_tombstones_from_meta());
+        assert_eq!(
+            legacy_reader.collect_range_tombstones(),
+            vec![(b"c".to_vec(), b"p".to_vec(), 20)]
+        );
+    }
 }

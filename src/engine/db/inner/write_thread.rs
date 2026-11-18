@@ -51,6 +51,52 @@ pub struct WriteGroupLeader<'a> {
 }
 
 impl WriteGroupLeader<'_> {
+    /// 广播 `STATE_MEMTABLE` 并唤醒所有 Followers 并发插入各自的 batch 到无锁 MemTable.
+    pub fn launch_memtable(&self) {
+        for &w_ptr in self.group.iter().skip(1) {
+            // SAFETY: Followers 在收到终态 (`STATE_COMPLETED` / `STATE_FAILED`) 前不会返回, 指针有效.
+            unsafe { publish_follower_state(w_ptr, STATE_MEMTABLE) };
+        }
+    }
+
+    /// 等待所有 Followers 完成 MemTable 插入 (`STATE_MEMTABLE_DONE`).
+    /// 若任何 Follower 插入失败, 返回首个错误信息.
+    pub fn wait_memtable_done(&self) -> Result<()> {
+        let mut first_err: Option<String> = None;
+        for &w_ptr in self.group.iter().skip(1) {
+            // SAFETY: Follower 在完成状态转变后会持续 park 等待终态, 不会销毁 Writer.
+            unsafe {
+                loop {
+                    let st = (*w_ptr).state.load(Ordering::Acquire);
+                    if st == STATE_MEMTABLE_DONE {
+                        if let Some(ref msg) = (*w_ptr).error {
+                            if first_err.is_none() {
+                                first_err = Some(msg.clone());
+                            }
+                        }
+                        break;
+                    }
+                    if st == STATE_FAILED {
+                        if first_err.is_none() {
+                            first_err = Some(
+                                (*w_ptr)
+                                    .error
+                                    .clone()
+                                    .unwrap_or_else(|| "follower memtable insert failed".into()),
+                            );
+                        }
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+            }
+        }
+        match first_err {
+            Some(msg) => Err(crate::error::Error::InvalidState(msg)),
+            None => Ok(()),
+        }
+    }
+
     /// 向除 Leader 自身外的全部 Followers 发布 `STATE_COMPLETED` 并唤醒.
     pub fn complete(&self) {
         for &w_ptr in self.group.iter().skip(1) {
@@ -336,5 +382,49 @@ mod tests {
         for h in handles {
             h.join().expect("writer thread");
         }
+    }
+
+    #[test]
+    fn follower_memtable_launch_and_wait_barrier_works() {
+        let wt = Arc::new(WriteThread::new());
+        let leader_batch = new_batch();
+        let leader_parker = Parker::new();
+        let mut leader_writer =
+            Writer::new(&leader_batch, leader_parker.unparker().clone(), true, false);
+        let WriteGroupStatus::Leader(leader) = wt
+            .join_batch_group(&mut leader_writer, &leader_parker)
+            .expect("leader joins")
+        else {
+            panic!("first writer must become leader");
+        };
+
+        let follower_entered_memtable = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&follower_entered_memtable);
+        let wt_clone = Arc::clone(&wt);
+        let follower = std::thread::spawn(move || {
+            let batch = new_batch();
+            let parker = Parker::new();
+            let mut writer = Writer::new(&batch, parker.unparker().clone(), true, false);
+            let status = wt_clone.join_batch_group(&mut writer, &parker).unwrap();
+            assert!(matches!(status, WriteGroupStatus::FollowerMemtable(_)));
+            flag.store(true, Ordering::Release);
+            writer.state.store(STATE_MEMTABLE_DONE, Ordering::Release);
+            while writer.state.load(Ordering::Acquire) != STATE_COMPLETED {
+                parker.park_timeout(Duration::from_micros(50));
+            }
+        });
+
+        while wt.queue.is_empty() {
+            std::thread::yield_now();
+        }
+        let mut leader = leader;
+        while let Some(p) = wt.queue.pop() {
+            leader.group.push(p);
+        }
+        leader.launch_memtable();
+        assert!(leader.wait_memtable_done().is_ok());
+        assert!(follower_entered_memtable.load(Ordering::Acquire));
+        leader.complete();
+        follower.join().unwrap();
     }
 }
