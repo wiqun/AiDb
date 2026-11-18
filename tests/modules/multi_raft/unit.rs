@@ -646,6 +646,13 @@ async fn test_multi_raft_node_elect_and_transfer_leader_success() {
         elect_res.is_ok(),
         "elect_group_leader should succeed: {elect_res:?}"
     );
+    // 等待异步选举完成成为 Leader 再触发 transfer_leader
+    for _ in 0..50 {
+        if multi_raft.is_group_leader(1).await.unwrap_or(false) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 
     // 触发 transfer_group_leader
     let transfer_res = multi_raft.transfer_group_leader(1, 2).await;

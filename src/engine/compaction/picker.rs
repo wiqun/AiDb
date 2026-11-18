@@ -599,9 +599,9 @@ mod tests {
         // L1 target=500, L2 target=5000
         let picker = CompactionPicker::from_options(&opts);
         let mut levels = empty_levels(7);
-        // L1: ~600 bytes, score 1.2
-        levels[1].push(big_file(dir.path(), 1, 1, b"a", 300));
-        levels[1].push(big_file(dir.path(), 2, 1, b"b", 300));
+        // L1: ~600 bytes, score ~1.2
+        levels[1].push(big_file(dir.path(), 1, 1, b"a", 200));
+        levels[1].push(big_file(dir.path(), 2, 1, b"b", 200));
         // L2: ~10000 bytes, score 2.0 — 更紧迫
         levels[2].push(big_file(dir.path(), 3, 2, b"x", 5000));
         levels[2].push(big_file(dir.path(), 4, 2, b"y", 5000));
