@@ -89,6 +89,8 @@ fn build_openraft_config(config: &RaftNodeConfig) -> Result<Config> {
         heartbeat_min_interval: (min_interval > 0).then_some(min_interval),
         max_payload_entries: config.max_payload_entries,
         snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(config.snapshot_logs_since_last),
+        enable_local_lease_read: Some(config.enable_local_lease_read),
+        enable_pre_vote: Some(config.enable_pre_vote),
         ..Default::default()
     }
     .validate()
@@ -142,6 +144,7 @@ pub struct OpenRaftNode {
     snapshot_size_threshold: Option<u64>,
     /// 是否启用 linearizable read (ReadIndex).
     linearizable_read: bool,
+    enable_local_lease_read: bool,
 }
 
 impl OpenRaftNode {
@@ -223,6 +226,7 @@ impl OpenRaftNode {
             estimated_proposed_bytes_accumulated: AtomicU64::new(0),
             snapshot_size_threshold: config.snapshot_size_threshold,
             linearizable_read: config.linearizable_read,
+            enable_local_lease_read: config.enable_local_lease_read,
         })
     }
 
@@ -505,6 +509,18 @@ impl OpenRaftNode {
                             Some(&error),
                         );
                     }
+                    if matches!(
+                        e,
+                        openraft::error::RaftError::APIError(
+                            openraft::error::ClientWriteError::LogEntryDiscarded(_)
+                        )
+                    ) {
+                        tracing::warn!(
+                            group_id = self.group_id,
+                            attempt,
+                            "raft log entry discarded after append by new leader, forwarding"
+                        );
+                    }
                     if let Some(ftl) = e.forward_to_leader() {
                         let leader_addr = ftl.leader_node.as_ref().map(|n| n.addr.clone());
                         // Register the leader address so the network factory can reach it.
@@ -672,12 +688,52 @@ impl OpenRaftNode {
     }
 
     /// 触发将当前 Group 的领导权转移给目标节点 `to`.
+    /// 若当前节点不是 Leader, 则通过 gRPC 转发给当前 Leader 触发优雅切主.
     pub async fn transfer_leader(&self, to: NodeId) -> Result<()> {
-        self.raft
-            .trigger()
-            .transfer_leader(to)
+        if self.is_leader().await {
+            return self
+                .raft
+                .trigger()
+                .transfer_leader(to)
+                .await
+                .map_err(|e| Error::Cluster(ClusterError::Raft(e.to_string())));
+        }
+        let Some(leader_id) = self.get_leader().await else {
+            return Err(Error::Cluster(ClusterError::NotLeader {
+                leader: None,
+                leader_addr: None,
+                is_ask: false,
+            }));
+        };
+        let addr = self
+            .network_factory
+            .read()
+            .list_nodes()
+            .into_iter()
+            .find(|(nid, _)| *nid == leader_id)
+            .map(|(_, a)| a)
+            .ok_or_else(|| {
+                Error::Cluster(ClusterError::Raft(format!(
+                    "leader {leader_id} address unknown for transfer_leader"
+                )))
+            })?;
+        let normalized = crate::cluster::network::factory::normalize_grpc_addr(&addr);
+        let mut client = crate::cluster::network::factory::connect_raft_client(
+            &normalized,
+            std::time::Duration::from_millis(2000),
+        )
+        .await
+        .map_err(|e| Error::Cluster(ClusterError::Raft(e.to_string())))?;
+        client
+            .transfer_leader(tonic::Request::new(
+                crate::cluster::network::raft_rpc::TransferLeaderRequest {
+                    group_id: self.group_id,
+                    target_node_id: to,
+                },
+            ))
             .await
-            .map_err(|e| Error::Cluster(ClusterError::Raft(e.to_string())))
+            .map_err(|e| Error::Cluster(ClusterError::Raft(e.to_string())))?;
+        Ok(())
     }
 
     /// 触发本节点发起选举 (pre_vote: 是否先执行预投票).
@@ -713,12 +769,25 @@ impl OpenRaftNode {
     /// 共用同一语义, 不允许落后 follower 冒充最新读.
     async fn ensure_leader_for_linear_read(&self) -> Result<()> {
         if self.linearizable_read {
-            // Linearizable read: lease 有效期内本地读零 RTT, 过期 (失去多数派
-            // 且无法续租) 时快速失败返回 ForwardToLeader::empty() → NotLeader.
-            self.raft
-                .ensure_linearizable(openraft::ReadPolicy::LeaseRead)
-                .await
-                .map_err(map_linearizable_error)?;
+            if self.enable_local_lease_read {
+                let linearizer = self
+                    .raft
+                    .get_local_read_linearizer(openraft::ReadPolicy::LeaseRead)
+                    .await
+                    .map_err(map_linearizable_error)?;
+                linearizer.await_ready(&self.raft).await.map_err(|e| {
+                    Error::Cluster(ClusterError::Internal(format!(
+                        "linearizer await_ready failed: {e}"
+                    )))
+                })?;
+            } else {
+                // Linearizable read: lease 有效期内本地读零 RTT, 过期 (失去多数派
+                // 且无法续租) 时快速失败返回 NotLeader.
+                self.raft
+                    .ensure_linearizable(openraft::ReadPolicy::LeaseRead)
+                    .await
+                    .map_err(map_linearizable_error)?;
+            }
         } else {
             // 退化路径: 本地 leader check (保持 Redis Cluster 最终一致性)
             if !self.is_leader().await {
@@ -864,6 +933,7 @@ fn map_linearizable_error(
             ForwardToLeader {
                 leader_id: Some(leader),
                 leader_node: Some(node),
+                ..
             } => {
                 return Error::Cluster(ClusterError::NotLeader {
                     leader: Some(*leader),
@@ -894,6 +964,16 @@ fn map_linearizable_error(
                 });
             }
         }
+    }
+    if matches!(
+        e,
+        RaftError::APIError(openraft::error::LinearizableReadError::QuorumNotEnough(_))
+    ) {
+        return Error::Cluster(ClusterError::NotLeader {
+            leader: None,
+            leader_addr: None,
+            is_ask: false,
+        });
     }
     Error::Cluster(ClusterError::Internal(format!(
         "linearizable read failed: {e}"

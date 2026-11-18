@@ -371,7 +371,18 @@ struct SlowGetKeyService;
 
 #[tonic::async_trait]
 impl raft_rpc::raft_service_server::RaftService for SlowGetKeyService {
+    type StreamAppendEntriesStream = tokio_stream::wrappers::ReceiverStream<
+        std::result::Result<raft_rpc::StreamAppendResponse, tonic::Status>,
+    >;
+
     async fn vote(
+        &self,
+        _request: tonic::Request<raft_rpc::VoteRequest>,
+    ) -> std::result::Result<tonic::Response<raft_rpc::VoteResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not used in this test"))
+    }
+
+    async fn pre_vote(
         &self,
         _request: tonic::Request<raft_rpc::VoteRequest>,
     ) -> std::result::Result<tonic::Response<raft_rpc::VoteResponse>, tonic::Status> {
@@ -382,6 +393,13 @@ impl raft_rpc::raft_service_server::RaftService for SlowGetKeyService {
         &self,
         _request: tonic::Request<raft_rpc::AppendEntriesRequest>,
     ) -> std::result::Result<tonic::Response<raft_rpc::AppendEntriesResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not used in this test"))
+    }
+
+    async fn stream_append_entries(
+        &self,
+        _request: tonic::Request<tonic::Streaming<raft_rpc::AppendEntriesRequest>>,
+    ) -> std::result::Result<tonic::Response<Self::StreamAppendEntriesStream>, tonic::Status> {
         Err(tonic::Status::unimplemented("not used in this test"))
     }
 
@@ -424,6 +442,13 @@ impl raft_rpc::raft_service_server::RaftService for SlowGetKeyService {
         _request: tonic::Request<raft_rpc::GetMigrationTombstoneRequest>,
     ) -> std::result::Result<tonic::Response<raft_rpc::GetMigrationTombstoneResponse>, tonic::Status>
     {
+        Err(tonic::Status::unimplemented("not used in this test"))
+    }
+
+    async fn transfer_leader(
+        &self,
+        _request: tonic::Request<raft_rpc::TransferLeaderRequest>,
+    ) -> std::result::Result<tonic::Response<raft_rpc::TransferLeaderResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("not used in this test"))
     }
 }

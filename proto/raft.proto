@@ -4,12 +4,15 @@ package aidb.raft;
 
 service RaftService {
   rpc Vote(VoteRequest) returns (VoteResponse);
+  rpc PreVote(VoteRequest) returns (VoteResponse);
   rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+  rpc StreamAppendEntries(stream AppendEntriesRequest) returns (stream StreamAppendResponse);
   rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
   rpc GetKey(GetKeyRequest) returns (GetKeyResponse);
   rpc GetMigrationTip(GetMigrationTipRequest) returns (GetMigrationTipResponse);
   rpc GetMigrationTombstone(GetMigrationTombstoneRequest) returns (GetMigrationTombstoneResponse);
   rpc RemotePropose(RemoteProposeRequest) returns (RemoteProposeResponse);
+  rpc TransferLeader(TransferLeaderRequest) returns (TransferLeaderResponse);
 }
 
 message VoteRequest {
@@ -28,6 +31,8 @@ message VoteResponse {
   bool vote_committed = 3;
   bool vote_granted = 4;
   bool is_in_membership = 5;
+  optional uint64 last_log_index = 6;
+  optional uint64 last_log_term = 7;
 }
 
 message LogEntry {
@@ -60,6 +65,19 @@ message AppendEntriesResponse {
   bool success = 4;
   optional uint64 conflict_index = 5;
   optional uint64 conflict_term = 6;
+}
+
+message StreamAppendResponse {
+  uint64 vote_term = 1;
+  uint64 vote_node_id = 2;
+  bool vote_committed = 3;
+  bool success = 4;
+  optional uint64 ack_index = 5;
+  optional uint64 ack_term = 6;
+  optional uint64 conflict_index = 7;
+  optional uint64 conflict_term = 8;
+  repeated uint64 hint_indices = 9;
+  repeated uint64 hint_terms = 10;
 }
 
 message InstallSnapshotRequest {
@@ -135,3 +153,10 @@ message RemoteProposeRequest {
 message RemoteProposeResponse {
   bytes response = 1;
 }
+
+message TransferLeaderRequest {
+  uint64 group_id = 1;
+  uint64 target_node_id = 2;
+}
+
+message TransferLeaderResponse {}

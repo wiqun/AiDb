@@ -66,32 +66,44 @@ impl OpenRaftStorage {
             return Ok(Vec::new());
         }
 
-        // Check PendingLogOverlay for pending entries.
         let overlay = self.pending_overlay();
+        let mut by_index: std::collections::BTreeMap<
+            u64,
+            <TypeConfig as openraft::RaftTypeConfig>::Entry,
+        > = std::collections::BTreeMap::new();
 
-        // 按 index 点查, 优先从 overlay 读, 再 fallback 到 DB.
-        let mut entries = Vec::with_capacity((end - start) as usize);
-        for idx in start..end {
-            // Try overlay first.
-            if let Some(ref ov) = overlay {
-                let ov_guard = ov.lock();
-                if let Some(entry) = ov_guard.get(idx) {
-                    entries.push((**entry).clone());
-                    continue;
-                }
-            }
-            // Fallback to DB.
-            let key = log_key(self.group_id, idx);
-            let Some(data) = self.db.read().get(&key)? else {
+        // 1. 先批量扫描 DB 范围 [start, end)
+        let prefix = log_prefix(self.group_id);
+        let start_key = log_key(self.group_id, start);
+        let end_key = log_key(self.group_id, end);
+        let db = self.db.read();
+        let iter = db.scan(Some(&start_key), Some(&end_key))?;
+        for item in iter {
+            let (k, v) = item?;
+            if !k.starts_with(&prefix) || k.len() != prefix.len() + 8 {
                 continue;
-            };
-            let entry: <TypeConfig as openraft::RaftTypeConfig>::Entry =
-                rmp_serde::from_slice(&data).map_err(|e| {
+            }
+            let idx = u64::from_be_bytes(k[prefix.len()..prefix.len() + 8].try_into().unwrap());
+            if idx < start || idx >= end {
+                continue;
+            }
+            let entry: <TypeConfig as openraft::RaftTypeConfig>::Entry = rmp_serde::from_slice(&v)
+                .map_err(|e| {
                     ClusterError::Serialization(format!("log_entry(idx={}): {}", idx, e))
                 })?;
-            entries.push(entry);
+            by_index.insert(idx, entry);
         }
-        Ok(entries)
+        drop(db);
+
+        // 2. 用 PendingLogOverlay 覆盖/补齐内存中的最新未落盘日志
+        if let Some(ref ov) = overlay {
+            let ov_guard = ov.lock();
+            for entry in ov_guard.get_range(start, end) {
+                by_index.insert(entry.log_id.index, (**entry).clone());
+            }
+        }
+
+        Ok(by_index.into_values().collect())
     }
 
     pub(crate) fn append_log_entries(
@@ -374,8 +386,10 @@ impl OpenRaftStorage {
 
     pub(crate) fn load_membership(
         &self,
-    ) -> std::result::Result<openraft::StoredMembership<CLId, u64, openraft::BasicNode>, Error>
-    {
+    ) -> std::result::Result<
+        openraft::StoredMembership<CLId, openraft::Membership<u64, openraft::BasicNode>>,
+        Error,
+    > {
         match self.db.read().get(&membership_key(self.group_id))? {
             Some(data) => match postcard::from_bytes(&data) {
                 Ok(m) => Ok(m),
@@ -648,5 +662,46 @@ mod tests {
         let logs = storage.get_log_entries(1..=2).unwrap();
         assert_eq!(logs.len(), 2);
         assert_eq!(logs[0].log_id.index, 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_log_entries_scan_and_overlay_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(dir.path(), Options::for_testing()).unwrap();
+        let db_slot = std::sync::Arc::new(parking_lot::RwLock::new(db.clone()));
+        let handle = crate::cluster::log_committer::spawn_committer(
+            DEFAULT_GROUP_ID,
+            db_slot.clone(),
+            crate::cluster::log_committer::LogCommitterConfig::default(),
+        );
+        let storage = OpenRaftStorage::new_with_committer(
+            db_slot,
+            DEFAULT_GROUP_ID,
+            None,
+            Some(handle.clone()),
+        )
+        .unwrap();
+
+        // DB 写入 index 1..=3
+        storage
+            .append_log_entries(&[put_entry(1, 1), put_entry(2, 1), put_entry(3, 1)])
+            .unwrap();
+        assert_eq!(storage.get_log_entries(1..4).unwrap().len(), 3);
+        assert_eq!(storage.get_log_entries(2..3).unwrap().len(), 1);
+
+        // overlay 覆盖 index 3 为 term 2, 并追加 index 4
+        {
+            let mut ov = handle.overlay.lock();
+            ov.insert_at(3, std::sync::Arc::new(put_entry(3, 2)));
+            ov.insert_at(4, std::sync::Arc::new(put_entry(4, 2)));
+        }
+        let merged = storage.get_log_entries(1..=4).unwrap();
+        assert_eq!(merged.len(), 4);
+        assert_eq!(
+            merged[2].log_id.leader_id.term, 2,
+            "overlay must win on overlap"
+        );
+        assert_eq!(merged[3].log_id.index, 4);
+        handle.shutdown().await;
     }
 }

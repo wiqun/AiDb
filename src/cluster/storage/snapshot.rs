@@ -25,7 +25,9 @@
 //! - MetaRaft 也有快照: 目录打包天然包含 `\x00meta_raft/*`, 安装后重建
 //!   `MetaStateMachine` 恢复集群元数据.
 
-use std::io::Cursor;
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use openraft::{Snapshot, SnapshotMeta};
@@ -37,6 +39,152 @@ use crate::error::{ClusterError, Error, Result};
 use crate::DB;
 
 use super::{CLId, LIdOf, MOf, OpenRaftStorage, SMOf};
+
+const SNAPSHOT_STREAM_MAGIC: &[u8; 8] = b"AIDBSNAP";
+static NEXT_TEMP_SNAP_SEQ: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn next_temp_snapshot_path(tag: &str) -> PathBuf {
+    let seq = NEXT_TEMP_SNAP_SEQ.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "aidb_snap_{}_{}_{}.bin",
+        tag,
+        std::process::id(),
+        seq
+    ))
+}
+
+#[derive(Debug)]
+struct TempSnapshotFile {
+    path: PathBuf,
+    cleanup: bool,
+}
+
+impl Drop for TempSnapshotFile {
+    fn drop(&mut self) {
+        if self.cleanup {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// 基于磁盘临时文件的流式快照载体, Drop 时自动清理临时文件.
+#[derive(Debug, Clone)]
+pub struct SnapshotFileData {
+    file: Option<Arc<TempSnapshotFile>>,
+    len: u64,
+}
+
+impl SnapshotFileData {
+    pub fn empty() -> Self {
+        Self { file: None, len: 0 }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn from_temp_path(path: PathBuf, len: u64) -> Self {
+        Self {
+            file: Some(Arc::new(TempSnapshotFile {
+                path,
+                cleanup: true,
+            })),
+            len,
+        }
+    }
+
+    pub fn from_bytes_temp(bytes: &[u8]) -> std::io::Result<Self> {
+        if bytes.is_empty() {
+            return Ok(Self::empty());
+        }
+        let path = next_temp_snapshot_path("mem");
+        std::fs::write(&path, bytes)?;
+        Ok(Self::from_temp_path(path, bytes.len() as u64))
+    }
+
+    pub fn path(&self) -> Option<&Path> {
+        self.file.as_ref().map(|f| f.path.as_path())
+    }
+
+    pub fn list_relative_paths(&self) -> Result<Vec<String>> {
+        let Some(path) = self.path() else {
+            return Ok(Vec::new());
+        };
+        let mut reader = BufReader::new(std::fs::File::open(path)?);
+        let mut magic = [0u8; 8];
+        if reader.read_exact(&mut magic).is_ok() && &magic == SNAPSHOT_STREAM_MAGIC {
+            let mut count_buf = [0u8; 4];
+            reader.read_exact(&mut count_buf)?;
+            let count = u32::from_le_bytes(count_buf) as usize;
+            let mut out = Vec::with_capacity(count);
+            for _ in 0..count {
+                let mut plen = [0u8; 4];
+                reader.read_exact(&mut plen)?;
+                let mut pbuf = vec![0u8; u32::from_le_bytes(plen) as usize];
+                reader.read_exact(&mut pbuf)?;
+                let rel = String::from_utf8(pbuf)
+                    .map_err(|e| Error::Cluster(ClusterError::Serialization(e.to_string())))?;
+                let mut flen = [0u8; 8];
+                reader.read_exact(&mut flen)?;
+                let skip = u64::from_le_bytes(flen);
+                std::io::copy(&mut reader.by_ref().take(skip), &mut std::io::sink())?;
+                out.push(rel);
+            }
+            return Ok(out);
+        }
+        let raw = std::fs::read(path)?;
+        let bundle: SnapshotBundle = postcard::from_bytes(&raw)
+            .map_err(|e| Error::Cluster(ClusterError::Serialization(e.to_string())))?;
+        Ok(bundle.files.into_iter().map(|f| f.relative_path).collect())
+    }
+
+    pub fn extract_to_dir(&self, dest_dir: &Path) -> Result<()> {
+        let Some(path) = self.path() else {
+            return Ok(());
+        };
+        let mut reader = BufReader::new(std::fs::File::open(path)?);
+        let mut magic = [0u8; 8];
+        if reader.read_exact(&mut magic).is_ok() && &magic == SNAPSHOT_STREAM_MAGIC {
+            let mut count_buf = [0u8; 4];
+            reader.read_exact(&mut count_buf)?;
+            let count = u32::from_le_bytes(count_buf) as usize;
+            for _ in 0..count {
+                let mut plen = [0u8; 4];
+                reader.read_exact(&mut plen)?;
+                let mut pbuf = vec![0u8; u32::from_le_bytes(plen) as usize];
+                reader.read_exact(&mut pbuf)?;
+                let rel = String::from_utf8(pbuf)
+                    .map_err(|e| Error::Cluster(ClusterError::Serialization(e.to_string())))?;
+                let mut flen = [0u8; 8];
+                reader.read_exact(&mut flen)?;
+                let file_len = u64::from_le_bytes(flen);
+                let dest = dest_dir.join(&rel);
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let mut out = BufWriter::new(std::fs::File::create(&dest)?);
+                std::io::copy(&mut reader.by_ref().take(file_len), &mut out)?;
+                out.flush()?;
+            }
+            return Ok(());
+        }
+        let raw = std::fs::read(path)?;
+        let bundle: SnapshotBundle = postcard::from_bytes(&raw)
+            .map_err(|e| Error::Cluster(ClusterError::Serialization(e.to_string())))?;
+        for file in &bundle.files {
+            let dest = dest_dir.join(&file.relative_path);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&dest, &file.data)?;
+        }
+        Ok(())
+    }
+}
 
 /// snapshot 传输格式: 由原来的逐条 KV (SnapshotKv) 改为 DB 目录文件级打包.
 ///
@@ -96,7 +244,48 @@ impl CapturedSnapshot {
         })
     }
 
-    /// 锁外读取 SST 并序列化.
+    /// 锁外读取 SST 并流式写入临时 bundle 文件 (消除整包内存分配).
+    fn into_bundle_file(self) -> Result<SnapshotFileData> {
+        let out_path = next_temp_snapshot_path("build");
+        let res = (|| -> Result<u64> {
+            let file = std::fs::File::create(&out_path)?;
+            let mut writer = BufWriter::new(file);
+            writer.write_all(SNAPSHOT_STREAM_MAGIC)?;
+            let total_files = (self.inline_files.len() + self.sst_paths.len()) as u32;
+            writer.write_all(&total_files.to_le_bytes())?;
+
+            for inline in &self.inline_files {
+                let rel = inline.relative_path.as_bytes();
+                writer.write_all(&(rel.len() as u32).to_le_bytes())?;
+                writer.write_all(rel)?;
+                writer.write_all(&(inline.data.len() as u64).to_le_bytes())?;
+                writer.write_all(&inline.data)?;
+            }
+
+            for (relative_path, src_path) in &self.sst_paths {
+                let rel = relative_path.as_bytes();
+                let mut src = std::fs::File::open(src_path)?;
+                let len = src.metadata()?.len();
+                writer.write_all(&(rel.len() as u32).to_le_bytes())?;
+                writer.write_all(rel)?;
+                writer.write_all(&len.to_le_bytes())?;
+                std::io::copy(&mut src, &mut writer)?;
+            }
+
+            writer.flush()?;
+            Ok(writer.get_ref().metadata()?.len())
+        })();
+        match res {
+            Ok(len) => Ok(SnapshotFileData::from_temp_path(out_path, len)),
+            Err(e) => {
+                let _ = std::fs::remove_file(&out_path);
+                Err(e)
+            }
+        }
+    }
+
+    /// 锁外读取 SST 并序列化 (仅测试兼容保留).
+    #[cfg(test)]
     fn into_bundle_bytes(self) -> Result<Vec<u8>> {
         let mut files = self.inline_files;
         files.reserve(self.sst_paths.len());
@@ -176,20 +365,21 @@ impl OpenRaftSnapshotBuilder {
         Ok(())
     }
 
-    /// 留一份完整 bundle, 复制给落后副本时由 `get_current_snapshot` 取回.
-    fn remember(&self, db: &DB, meta: &SMOf, bytes: &[u8]) -> std::io::Result<()> {
+    /// 留一份完整 bundle 文件句柄, 复制给落后副本时由 `get_current_snapshot` 取回.
+    fn remember(&self, db: &DB, meta: &SMOf, snap: &SnapshotFileData) -> std::io::Result<()> {
         self.persist_meta(db, meta)?;
-        *self.built_snapshot.write() = Some((meta.clone(), bytes.to_vec()));
+        *self.built_snapshot.write() = Some((meta.clone(), snap.clone()));
         Ok(())
     }
 }
 
 impl OpenRaftStorage {
-    /// 文件级 snapshot 安装: 关闭旧 DB → 清空目录 → 写入新文件 → 重新打开 DB.
-    pub(crate) fn install_snapshot_atomic(&mut self, meta: &SMOf, data: &[u8]) -> Result<()> {
-        let bundle: SnapshotBundle = postcard::from_bytes(data)
-            .map_err(|e| Error::Cluster(ClusterError::Serialization(e.to_string())))?;
-
+    /// 文件级 snapshot 安装: 关闭旧 DB → 清空目录 → 流式解包新文件 → 重新打开 DB.
+    pub(crate) fn install_snapshot_atomic_from_file(
+        &mut self,
+        meta: &SMOf,
+        snap: &SnapshotFileData,
+    ) -> Result<()> {
         // 写锁盖住整个换库. 日志线程要读锁才能碰到 DB, 所以 close 不会打到正在 purge 的那次调用.
         let mut slot = self.db.write();
         let old = Arc::clone(&slot);
@@ -214,14 +404,8 @@ impl OpenRaftStorage {
             }
         }
 
-        // 写入接收到的文件.
-        for file in &bundle.files {
-            let dest = db_path.join(&file.relative_path);
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&dest, &file.data)?;
-        }
+        // 流式解包写入接收到的文件.
+        snap.extract_to_dir(&db_path)?;
 
         // 重新打开 DB: CURRENT + MANIFEST + SST 文件已在目录中.
         let new_db = DB::open(&db_path, (*options).clone())?;
@@ -253,18 +437,24 @@ impl OpenRaftStorage {
         }
         Ok(())
     }
+
+    #[cfg(test)]
+    pub(crate) fn install_snapshot_atomic(&mut self, meta: &SMOf, data: &[u8]) -> Result<()> {
+        let snap = SnapshotFileData::from_bytes_temp(data)?;
+        self.install_snapshot_atomic_from_file(meta, &snap)
+    }
 }
 
 #[cfg(feature = "cluster")]
 impl openraft::RaftSnapshotBuilder<TypeConfig> for OpenRaftSnapshotBuilder {
-    type SnapshotData = std::io::Cursor<Vec<u8>>;
+    type SnapshotData = SnapshotFileData;
 
     /// openraft 每次日志清理都会调用, 且只取返回值里的 meta, 数据直接丢弃.
     /// 因此这里只 flush 并记位点, 不打包整库; 整库 bundle 见 `build_full_snapshot`.
     async fn build_snapshot(
         &mut self,
     ) -> std::result::Result<
-        Snapshot<CLId, u64, openraft::BasicNode, Cursor<Vec<u8>>>,
+        Snapshot<CLId, openraft::Membership<u64, openraft::BasicNode>, SnapshotFileData>,
         std::io::Error,
     > {
         self.run_blocking(false).await
@@ -275,7 +465,9 @@ impl OpenRaftSnapshotBuilder {
     /// 复制给落后副本时才需要: 完整 bundle, meta 与内容来自同一次抓取.
     pub(crate) async fn build_full_snapshot(
         &self,
-    ) -> std::io::Result<Snapshot<CLId, u64, openraft::BasicNode, Cursor<Vec<u8>>>> {
+    ) -> std::io::Result<
+        Snapshot<CLId, openraft::Membership<u64, openraft::BasicNode>, SnapshotFileData>,
+    > {
         self.run_blocking(true).await
     }
 
@@ -283,7 +475,9 @@ impl OpenRaftSnapshotBuilder {
     async fn run_blocking(
         &self,
         full: bool,
-    ) -> std::io::Result<Snapshot<CLId, u64, openraft::BasicNode, Cursor<Vec<u8>>>> {
+    ) -> std::io::Result<
+        Snapshot<CLId, openraft::Membership<u64, openraft::BasicNode>, SnapshotFileData>,
+    > {
         let this = self.clone();
         tokio::task::spawn_blocking(move || this.build_blocking(full))
             .await
@@ -293,7 +487,9 @@ impl OpenRaftSnapshotBuilder {
     fn build_blocking(
         &self,
         full: bool,
-    ) -> std::io::Result<Snapshot<CLId, u64, openraft::BasicNode, Cursor<Vec<u8>>>> {
+    ) -> std::io::Result<
+        Snapshot<CLId, openraft::Membership<u64, openraft::BasicNode>, SnapshotFileData>,
+    > {
         let io_err = |e: &dyn std::fmt::Display| std::io::Error::other(e.to_string());
         let started = std::time::Instant::now();
         let db = Arc::clone(&self.db.read());
@@ -342,15 +538,15 @@ impl OpenRaftSnapshotBuilder {
             db.flush_frozen().map_err(|e| io_err(&e))?;
         }
 
-        let data = match captured {
+        let snap = match captured {
             Some(c) => {
-                let data = c.into_bundle_bytes().map_err(|e| io_err(&e))?;
-                self.remember(&db, &meta, &data)?;
-                data
+                let snap = c.into_bundle_file().map_err(|e| io_err(&e))?;
+                self.remember(&db, &meta, &snap)?;
+                snap
             }
             None => {
                 self.persist_meta(&db, &meta)?;
-                Vec::new()
+                SnapshotFileData::empty()
             }
         };
         tracing::info!(
@@ -359,13 +555,13 @@ impl OpenRaftSnapshotBuilder {
             wait_ms,
             locked_ms,
             total_ms = started.elapsed().as_millis() as u64,
-            bytes = data.len(),
+            bytes = snap.len(),
             "raft snapshot built"
         );
 
         Ok(Snapshot {
             meta,
-            snapshot: Cursor::new(data),
+            snapshot: snap,
         })
     }
 }
@@ -582,13 +778,8 @@ mod tests {
             );
             let snapshot = builder.build_full_snapshot().await.unwrap();
 
-            let bundle: SnapshotBundle = postcard::from_bytes(snapshot.snapshot.get_ref()).unwrap();
             let dir = TempDir::new().unwrap();
-            for file in &bundle.files {
-                let path = dir.path().join(&file.relative_path);
-                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-                std::fs::write(&path, &file.data).unwrap();
-            }
+            snapshot.snapshot.extract_to_dir(dir.path()).unwrap();
             let bundle_db = DB::open(dir.path(), Options::for_testing()).unwrap();
             let bundle_last_applied: Option<LIdOf> = bundle_db
                 .get(&crate::cluster::storage::keys::last_applied_key(
@@ -708,12 +899,18 @@ mod tests {
         assert_eq!(sent.meta.last_log_id.map(|id| id.index), Some(7));
         // openraft 丢弃 `build_snapshot` 的数据只取 meta, 所以日常清理不打包整库;
         // 真正要发给副本时 `get_current_snapshot` 才现做完整 bundle.
-        assert!(built.snapshot.into_inner().is_empty());
-        let bundle: SnapshotBundle = postcard::from_bytes(&sent.snapshot.into_inner()).unwrap();
-        assert!(bundle
-            .files
-            .iter()
-            .any(|f| f.relative_path.ends_with(".sst")));
+        assert!(built.snapshot.is_empty());
+        let paths = sent.snapshot.list_relative_paths().unwrap();
+        assert!(paths.iter().any(|p| p.ends_with(".sst")));
+    }
+
+    #[test]
+    fn snapshot_file_data_cleans_up_temp_file_on_drop() {
+        let snap = SnapshotFileData::from_bytes_temp(b"hello-stream").unwrap();
+        let path = snap.path().unwrap().to_path_buf();
+        assert!(path.exists());
+        drop(snap);
+        assert!(!path.exists(), "temp snapshot file must be cleaned on drop");
     }
 
     /// 日常快照在发布位点前必须把冻结的数据落盘, 否则 purge 之后重启会丢这段状态.
@@ -773,7 +970,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(built.meta.last_log_id.map(|id| id.index), Some(3));
-        assert!(built.snapshot.into_inner().is_empty());
+        assert!(built.snapshot.is_empty());
         assert!(storage.built_snapshot.read().is_none());
         assert_eq!(
             storage

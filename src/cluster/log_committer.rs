@@ -78,6 +78,25 @@ impl LogCommitterConfig {
             ..Default::default()
         }
     }
+
+    pub fn validate(&self) -> Result<(), ClusterError> {
+        if self.max_commands == 0 {
+            return Err(ClusterError::InvalidConfig(
+                "log_committer.max_commands must be > 0".into(),
+            ));
+        }
+        if self.max_entries == 0 {
+            return Err(ClusterError::InvalidConfig(
+                "log_committer.max_entries must be > 0".into(),
+            ));
+        }
+        if self.max_bytes == 0 {
+            return Err(ClusterError::InvalidConfig(
+                "log_committer.max_bytes must be > 0".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 // ── Metrics ──
@@ -127,6 +146,7 @@ pub(crate) enum IoCommand {
     Append {
         first_index: u64,
         count: u64,
+        estimated_bytes: usize,
         done: Option<oneshot::Sender<CrateResult<()>>>,
         on_flush: Option<FlushCallback>,
     },
@@ -188,6 +208,7 @@ impl LogCommitterHandle {
         self.send(IoCommand::Append {
             first_index,
             count,
+            estimated_bytes: (count as usize).saturating_mul(64),
             done: Some(tx),
             on_flush: None,
         })
@@ -204,9 +225,25 @@ impl LogCommitterHandle {
         count: u64,
         callback: openraft::storage::IOFlushed<TypeConfig>,
     ) -> std::io::Result<()> {
+        self.submit_append_with_bytes(
+            first_index,
+            count,
+            (count as usize).saturating_mul(64),
+            callback,
+        )
+    }
+
+    pub fn submit_append_with_bytes(
+        &self,
+        first_index: u64,
+        count: u64,
+        estimated_bytes: usize,
+        callback: openraft::storage::IOFlushed<TypeConfig>,
+    ) -> std::io::Result<()> {
         self.send(IoCommand::Append {
             first_index,
             count,
+            estimated_bytes,
             done: None,
             on_flush: Some(FlushCallback::new(callback)),
         })
@@ -377,18 +414,28 @@ async fn run_committer(
     }
 }
 
-/// 构建一个 batch: 收到首个命令后, 使用非阻塞 try_recv 快速清空通道积压命令 (自适应凑批, 0 超时硬等待).
+/// 构建一个 batch: 收到首个命令后, 使用非阻塞 try_recv 快速清空积压; 若 `delay_us > 0` 则在微秒窗口内继续凑批.
 async fn build_batch(
     rx: &mut mpsc::UnboundedReceiver<IoCommand>,
     cfg: &LogCommitterConfig,
 ) -> Option<Vec<IoCommand>> {
     let first = rx.recv().await?;
     let mut batch = BatchState::new(first);
+    let deadline = (cfg.delay_us > 0)
+        .then(|| tokio::time::Instant::now() + std::time::Duration::from_micros(cfg.delay_us));
 
     while batch.can_add(cfg) {
         match rx.try_recv() {
             Ok(cmd) => batch.add(cmd),
-            Err(mpsc::error::TryRecvError::Empty) => break,
+            Err(mpsc::error::TryRecvError::Empty) => {
+                let Some(dl) = deadline else {
+                    break;
+                };
+                match tokio::time::timeout_at(dl, rx.recv()).await {
+                    Ok(Some(cmd)) => batch.add(cmd),
+                    _ => break,
+                }
+            }
             Err(mpsc::error::TryRecvError::Disconnected) => break,
         }
     }
@@ -398,27 +445,41 @@ async fn build_batch(
 struct BatchState {
     commands: Vec<IoCommand>,
     entry_count: u64,
+    total_bytes: usize,
 }
 
 impl BatchState {
     fn new(cmd: IoCommand) -> Self {
-        let entry_count = match &cmd {
-            IoCommand::Append { count, .. } => *count,
-            _ => 0,
+        let (entry_count, total_bytes) = match &cmd {
+            IoCommand::Append {
+                count,
+                estimated_bytes,
+                ..
+            } => (*count, *estimated_bytes),
+            _ => (0, 0),
         };
         Self {
             commands: vec![cmd],
             entry_count,
+            total_bytes,
         }
     }
 
     fn can_add(&self, cfg: &LogCommitterConfig) -> bool {
-        self.commands.len() < cfg.max_commands && self.entry_count < cfg.max_entries as u64
+        self.commands.len() < cfg.max_commands
+            && self.entry_count < cfg.max_entries as u64
+            && self.total_bytes < cfg.max_bytes
     }
 
     fn add(&mut self, cmd: IoCommand) {
-        if let IoCommand::Append { count, .. } = &cmd {
+        if let IoCommand::Append {
+            count,
+            estimated_bytes,
+            ..
+        } = &cmd
+        {
             self.entry_count += count;
+            self.total_bytes = self.total_bytes.saturating_add(*estimated_bytes);
         }
         self.commands.push(cmd);
     }
@@ -454,6 +515,7 @@ async fn flush_batch(
                 count,
                 done,
                 on_flush,
+                ..
             } => {
                 appends.push(AppendOp {
                     first_index,
@@ -1103,5 +1165,97 @@ mod tests {
         handle.submit_append(1, 1, cb).unwrap();
         assert!(rx.await.unwrap().is_err());
         assert!(db.get(&log_key(1, 1)).unwrap().is_none());
+    }
+
+    #[test]
+    fn validate_rejects_zero_limits() {
+        assert!(LogCommitterConfig::default().validate().is_ok());
+        assert!(LogCommitterConfig {
+            max_commands: 0,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+        assert!(LogCommitterConfig {
+            max_entries: 0,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+        assert!(LogCommitterConfig {
+            max_bytes: 0,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn batch_respects_max_bytes() {
+        let cfg = LogCommitterConfig {
+            max_commands: 100,
+            max_entries: 100,
+            max_bytes: 256,
+            delay_us: 0,
+        };
+        let (tx1, _rx1) = oneshot::channel();
+        let (tx2, _rx2) = oneshot::channel();
+        let mut batch = BatchState::new(IoCommand::Append {
+            first_index: 1,
+            count: 1,
+            estimated_bytes: 260,
+            done: Some(tx1),
+            on_flush: None,
+        });
+        assert!(
+            !batch.can_add(&cfg),
+            "exceeding max_bytes must close the batch"
+        );
+        batch.add(IoCommand::Append {
+            first_index: 2,
+            count: 1,
+            estimated_bytes: 10,
+            done: Some(tx2),
+            on_flush: None,
+        });
+        assert_eq!(batch.total_bytes, 270);
+    }
+
+    #[tokio::test]
+    async fn build_batch_waits_when_delay_us_nonzero() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let cfg = LogCommitterConfig {
+            max_commands: 8,
+            max_entries: 64,
+            max_bytes: 64 * 1024,
+            delay_us: 20_000, // 20ms
+        };
+        let (d1, _) = oneshot::channel();
+        let (d2, _) = oneshot::channel();
+        tx.send(IoCommand::Append {
+            first_index: 1,
+            count: 1,
+            estimated_bytes: 64,
+            done: Some(d1),
+            on_flush: None,
+        })
+        .unwrap();
+        let tx2 = tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            let _ = tx2.send(IoCommand::Append {
+                first_index: 2,
+                count: 1,
+                estimated_bytes: 64,
+                done: Some(d2),
+                on_flush: None,
+            });
+        });
+        let batch = build_batch(&mut rx, &cfg).await.unwrap();
+        assert_eq!(
+            batch.len(),
+            2,
+            "delay_us window should coalesce delayed arrival"
+        );
     }
 }
