@@ -267,6 +267,10 @@ impl DB {
         self.stats
             .compaction_written_bytes
             .fetch_add(written_bytes, AtomicOrdering::Relaxed);
+        let raft_written: u64 = results.iter().map(|r| r.raft_written_bytes).sum();
+        self.stats
+            .raft_compaction_written_bytes
+            .fetch_add(raft_written, AtomicOrdering::Relaxed);
 
         let read_bytes: u64 = task
             .inputs

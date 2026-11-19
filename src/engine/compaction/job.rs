@@ -65,7 +65,8 @@ pub struct CompactionResult {
     pub smallest_key: Vec<u8>,
     pub largest_key: Vec<u8>,
     pub file_size: u64,
-    /// 本子任务中因 filter 丢弃的最新 Put 的 user_key (去重前由调用方合并).
+    /// 输出 SST 中 `\x00raft/` 前缀条目的 key + value 字节数.
+    pub raft_written_bytes: u64,
     pub filter_removed_user_keys: Vec<Vec<u8>>,
 }
 
@@ -377,6 +378,7 @@ impl CompactionJob {
                         let size_split = builder.estimated_file_size() >= self.target_file_size;
                         let gp_split = gp_tracker.should_stop_before(user_key);
                         if size_split || gp_split {
+                            let raft_bytes = builder.raft_written_bytes();
                             let file_size = builder.finish()?;
                             results.push(CompactionResult {
                                 file_number: cur_file_number,
@@ -385,6 +387,7 @@ impl CompactionJob {
                                 smallest_key: smallest_key.take().unwrap_or_default(),
                                 largest_key: largest_key.take().unwrap_or_default(),
                                 file_size,
+                                raft_written_bytes: raft_bytes,
                                 filter_removed_user_keys: std::mem::take(&mut filter_removed),
                             });
                             pending_fragments = range_tracker.active_past(user_key);
@@ -487,12 +490,14 @@ impl CompactionJob {
                     smallest_key: vec![],
                     largest_key: vec![],
                     file_size: 0,
+                    raft_written_bytes: 0,
                     filter_removed_user_keys: filter_removed,
                 });
             }
             return Ok(results);
         }
 
+        let raft_bytes = builder.raft_written_bytes();
         let file_size = builder.finish()?;
         results.push(CompactionResult {
             file_number: cur_file_number,
@@ -501,6 +506,7 @@ impl CompactionJob {
             smallest_key: smallest_key.unwrap_or_default(),
             largest_key: largest_key.unwrap_or_default(),
             file_size,
+            raft_written_bytes: raft_bytes,
             filter_removed_user_keys: filter_removed,
         });
         Ok(results)
@@ -523,6 +529,7 @@ impl CompactionJob {
                 smallest_key: vec![],
                 largest_key: vec![],
                 file_size: 0,
+                raft_written_bytes: 0,
                 filter_removed_user_keys: vec![],
             }]);
         }
@@ -813,6 +820,7 @@ fn write_sub_compaction(
             smallest_key: vec![],
             largest_key: vec![],
             file_size: 0,
+            raft_written_bytes: 0,
             filter_removed_user_keys: vec![],
         });
     }
@@ -965,10 +973,12 @@ fn write_sub_compaction(
             smallest_key: vec![],
             largest_key: vec![],
             file_size: 0,
+            raft_written_bytes: 0,
             filter_removed_user_keys: filter_removed,
         });
     }
 
+    let raft_bytes = builder.raft_written_bytes();
     let file_size = builder.finish()?;
     Ok(CompactionResult {
         file_number,
@@ -977,6 +987,7 @@ fn write_sub_compaction(
         smallest_key: smallest_key.unwrap_or_default(),
         largest_key: largest_key.unwrap_or_default(),
         file_size,
+        raft_written_bytes: raft_bytes,
         filter_removed_user_keys: filter_removed,
     })
 }

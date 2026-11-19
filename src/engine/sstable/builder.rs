@@ -49,6 +49,7 @@ pub struct SSTableBuilder {
     num_entries: u64,
     raw_key_size: u64,
     raw_value_size: u64,
+    raft_written_bytes: u64,
     block_size: usize,
     block_restart_interval: usize,
     compression: CompressionType,
@@ -91,6 +92,7 @@ impl SSTableBuilder {
             num_entries: 0,
             raw_key_size: 0,
             raw_value_size: 0,
+            raft_written_bytes: 0,
             block_size,
             block_restart_interval,
             compression,
@@ -112,6 +114,10 @@ impl SSTableBuilder {
     /// 估算当前已写入与缓冲的 SSTable 字节数 (用于 Compaction 目标大小切分).
     pub fn estimated_file_size(&self) -> u64 {
         self.data_block_offset + self.data_block_builder.current_size() as u64
+    }
+
+    pub fn raft_written_bytes(&self) -> u64 {
+        self.raft_written_bytes
     }
 
     pub fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -147,6 +153,10 @@ impl SSTableBuilder {
 
         self.raw_key_size += key.len() as u64;
         self.raw_value_size += value.len() as u64;
+        let user_key = extract_user_key(key);
+        if user_key.starts_with(b"\x00raft/") {
+            self.raft_written_bytes += (key.len() + value.len()) as u64;
+        }
 
         if self.enable_bloom {
             if self.bloom_filter.is_none() {
@@ -154,7 +164,6 @@ impl SSTableBuilder {
                 // This fallback is only triggered if add() is called before set_expected_keys().
                 self.bloom_filter = Some(BloomFilter::default_with_keys(128));
             }
-            let user_key = extract_user_key(key);
             self.bloom_filter.as_mut().unwrap().add(user_key);
         }
 

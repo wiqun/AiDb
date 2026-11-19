@@ -133,10 +133,14 @@ impl DB {
             );
             return Ok(());
         }
+        let raft_bytes = builder.raft_written_bytes();
         let file_size = builder.finish()?;
         self.stats
             .flush_written_bytes
             .fetch_add(file_size, AtomicOrdering::Relaxed);
+        self.stats
+            .raft_flush_written_bytes
+            .fetch_add(raft_bytes, AtomicOrdering::Relaxed);
         let reader = Arc::new(SSTableReader::open_with_caches(
             &path,
             Some(Arc::clone(&self.block_cache)),
