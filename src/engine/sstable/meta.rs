@@ -1,9 +1,10 @@
 //! Meta Block 辅助: Bloom 等裸字节块.
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
 
 use crate::error::Result;
+
+use super::block_io::read_exact_at;
 
 use super::handle::BlockHandle;
 use super::index::{IndexBlock, IndexEntry};
@@ -77,9 +78,7 @@ pub fn find_meta_block_handle(meta_index: &IndexBlock, name: &[u8]) -> Result<Op
 
 pub fn read_raw_bytes(file: &File, offset: u64, size: u64) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; size as usize];
-    let mut f = file.try_clone()?;
-    f.seek(SeekFrom::Start(offset))?;
-    f.read_exact(&mut buf)?;
+    read_exact_at(file, &mut buf, offset)?;
     Ok(buf)
 }
 

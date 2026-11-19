@@ -18,7 +18,6 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
@@ -514,9 +513,7 @@ fn load_properties_required(file: &File, meta_index: &IndexBlock) -> Result<SstP
 
 fn read_footer(file: &File, file_size: u64) -> Result<Footer> {
     let mut buf = [0u8; FOOTER_SIZE];
-    let mut f = file.try_clone()?;
-    f.seek(SeekFrom::Start(file_size - FOOTER_SIZE as u64))?;
-    f.read_exact(&mut buf)?;
+    super::block_io::read_exact_at(file, &mut buf, file_size - FOOTER_SIZE as u64)?;
     Footer::decode(&buf)
 }
 

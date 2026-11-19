@@ -90,11 +90,31 @@ pub fn read_block_cached_with_id(
     Ok(bytes)
 }
 
+/// 从 `File` 以 pread 语义精确读取满 `buf`, 处理短读并支持 `Arc<File>` 安全并发读.
+pub(crate) fn read_exact_at(
+    file: &std::fs::File,
+    mut buf: &mut [u8],
+    mut offset: u64,
+) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    while !buf.is_empty() {
+        let n = file.read_at(buf, offset)?;
+        if n == 0 {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "unexpected EOF in read_exact_at",
+            )));
+        }
+        buf = &mut buf[n..];
+        offset += n as u64;
+    }
+    Ok(())
+}
+
 /// 从 `File` 以 pread 语义读取 block, 支持 `Arc<File>` 安全并发读.
 pub fn read_block_from_file(file: &std::fs::File, handle: &BlockHandle) -> Result<Vec<u8>> {
-    use std::os::unix::fs::FileExt;
     let mut raw = vec![0u8; handle.size as usize];
-    file.read_at(&mut raw, handle.offset)?;
+    read_exact_at(file, &mut raw, handle.offset)?;
     parse_block_bytes(&raw, handle)
 }
 
@@ -111,7 +131,7 @@ pub fn read_block_bytes<R: Read + Seek>(reader: &mut R, handle: &BlockHandle) ->
 }
 
 /// 解析 raw block 数据: 校验 size、CRC、解压.
-fn parse_block_bytes(raw: &[u8], handle: &BlockHandle) -> Result<Vec<u8>> {
+pub(crate) fn parse_block_bytes(raw: &[u8], handle: &BlockHandle) -> Result<Vec<u8>> {
     if handle.size < BLOCK_TRAILER_SIZE as u64 {
         return Err(Error::Corruption(format!(
             "block size {} < trailer",
