@@ -29,7 +29,7 @@ use super::block::BlockBuilder;
 use super::block_io::write_block;
 use super::footer::Footer;
 use super::handle::BlockHandle;
-use super::index::{IndexBlockBuilder, IndexEntry};
+use super::index::{find_shortest_internal_key_separator, IndexBlockBuilder, IndexEntry};
 use super::meta::{
     encode_range_tombstones, index_entry_for_bloom, write_raw_block, RANGE_TOMBSTONES_META_NAME,
 };
@@ -43,6 +43,7 @@ pub struct SSTableBuilder {
     final_path: PathBuf,
     data_block_builder: BlockBuilder,
     index_block_builder: IndexBlockBuilder,
+    first_key: Vec<u8>,
     last_key: Vec<u8>,
     data_block_offset: u64,
     num_entries: u64,
@@ -84,6 +85,7 @@ impl SSTableBuilder {
             final_path: path.to_path_buf(),
             data_block_builder: BlockBuilder::new(block_restart_interval),
             index_block_builder: IndexBlockBuilder::new(),
+            first_key: Vec::new(),
             last_key: Vec::new(),
             data_block_offset: 0,
             num_entries: 0,
@@ -124,9 +126,14 @@ impl SSTableBuilder {
             ));
         }
 
+        if self.first_key.is_empty() {
+            self.first_key.extend_from_slice(key);
+        }
+
         if let Some(handle) = self.pending_handle.take() {
+            let sep_key = find_shortest_internal_key_separator(&self.last_key, key);
             self.index_block_builder.add_entry(&IndexEntry {
-                key: self.last_key.clone(),
+                key: sep_key,
                 handle,
             })?;
         }
@@ -186,16 +193,7 @@ impl SSTableBuilder {
         Ok(())
     }
 
-    pub fn finish(self) -> Result<u64> {
-        self.finish_inner(true)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn finish_without_range_tombstones_meta_for_test(self) -> Result<u64> {
-        self.finish_inner(false)
-    }
-
-    fn finish_inner(mut self, write_range_tombstones_meta: bool) -> Result<u64> {
+    pub fn finish(mut self) -> Result<u64> {
         if self.num_entries == 0 {
             return Err(Error::InvalidArgument("empty sstable".into()));
         }
@@ -203,6 +201,7 @@ impl SSTableBuilder {
         if !self.data_block_builder.is_empty() {
             self.flush_data_block()?;
         }
+        let data_size = self.data_block_offset;
         if let Some(handle) = self.pending_handle.take() {
             self.index_block_builder.add_entry(&IndexEntry {
                 key: self.last_key.clone(),
@@ -210,9 +209,23 @@ impl SSTableBuilder {
             })?;
         }
 
+        // 先写出 IndexBlock, 以便在 Properties 中记录准确的 index_size
+        let index_data = self.index_block_builder.finish();
+        let index_offset = self.data_block_offset;
+        let index_payload_len =
+            write_block(&mut self.writer, index_data.as_ref(), CompressionType::None)?;
+        let index_handle = BlockHandle {
+            offset: index_offset,
+            size: index_payload_len + super::BLOCK_TRAILER_SIZE as u64,
+        };
+        self.data_block_offset += index_handle.size;
+
+        // Meta Index 必须按 key 字典序写入: "bloom" < "properties" < "range_tombstones"
         let mut meta_index_builder = IndexBlockBuilder::new();
+        let mut filter_size = 0u64;
         if let Some(ref filter) = self.bloom_filter {
             let encoded = filter.encode();
+            filter_size = encoded.len() as u64;
             let bloom_handle =
                 write_raw_block(&mut self.writer, &mut self.data_block_offset, &encoded)?;
             meta_index_builder.add_entry(&index_entry_for_bloom(bloom_handle))?;
@@ -224,6 +237,12 @@ impl SSTableBuilder {
                 num_entries: self.num_entries,
                 raw_key_size: self.raw_key_size,
                 raw_value_size: self.raw_value_size,
+                data_size,
+                index_size: index_handle.size,
+                filter_size,
+                num_data_blocks: self.block_count,
+                smallest_key: self.first_key,
+                largest_key: self.last_key,
             };
             let encoded = props.encode();
             let props_handle =
@@ -234,8 +253,8 @@ impl SSTableBuilder {
             })?;
         }
 
-        // Range Tombstones Meta Block (Phase 5: O(1) open, backward-compatible via meta_index)
-        if write_range_tombstones_meta {
+        // Range Tombstones Meta Block
+        {
             let encoded = encode_range_tombstones(&self.range_tombstones);
             let rt_handle =
                 write_raw_block(&mut self.writer, &mut self.data_block_offset, &encoded)?;
@@ -255,16 +274,6 @@ impl SSTableBuilder {
         let meta_index_handle = BlockHandle {
             offset: meta_index_offset,
             size: meta_index_payload_len + super::BLOCK_TRAILER_SIZE as u64,
-        };
-        self.data_block_offset += meta_index_handle.size;
-
-        let index_data = self.index_block_builder.finish();
-        let index_offset = self.data_block_offset;
-        let index_payload_len =
-            write_block(&mut self.writer, index_data.as_ref(), CompressionType::None)?;
-        let index_handle = BlockHandle {
-            offset: index_offset,
-            size: index_payload_len + super::BLOCK_TRAILER_SIZE as u64,
         };
 
         let footer = Footer::new(meta_index_handle, index_handle);
