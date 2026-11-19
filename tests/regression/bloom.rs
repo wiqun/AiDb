@@ -146,7 +146,9 @@ fn test_bloom_parameterized_fpr() {
         }
 
         let mean_fpr = run_results.iter().sum::<f64>() / run_results.len() as f64;
-        let threshold = theoretical * 2.5;
+        // Cache-line blocked bloom 用「块内负载不均」换取单次 cache line 访问, 目标 FPR 越低
+        // 相对经典 bloom 的放大越明显 (实测 14 bits/key 约 2.9x), 阈值放宽到 3.5x.
+        let threshold = theoretical * 3.5;
 
         eprintln!(
             "bits_per_key={bits_per_key}, keys={num_keys}: theoretical={theoretical:.6}, \
@@ -157,7 +159,7 @@ fn test_bloom_parameterized_fpr() {
         assert!(
       mean_fpr < threshold,
       "bits_per_key={bits_per_key}, keys={num_keys}: mean FPR {mean_fpr:.6} >= {threshold:.6} \
-       (2.5x theoretical {theoretical:.6})"
+       (3.5x theoretical {theoretical:.6})"
     );
     }
 }
