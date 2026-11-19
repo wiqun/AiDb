@@ -72,34 +72,36 @@ impl OpenRaftStorage {
             <TypeConfig as openraft::RaftTypeConfig>::Entry,
         > = std::collections::BTreeMap::new();
 
-        // 1. 先批量扫描 DB 范围 [start, end)
-        let prefix = log_prefix(self.group_id);
-        let start_key = log_key(self.group_id, start);
-        let end_key = log_key(self.group_id, end);
-        let db = self.db.read();
-        let iter = db.scan(Some(&start_key), Some(&end_key))?;
-        for item in iter {
-            let (k, v) = item?;
-            if !k.starts_with(&prefix) || k.len() != prefix.len() + 8 {
-                continue;
-            }
-            let idx = u64::from_be_bytes(k[prefix.len()..prefix.len() + 8].try_into().unwrap());
-            if idx < start || idx >= end {
-                continue;
-            }
-            let entry: <TypeConfig as openraft::RaftTypeConfig>::Entry = rmp_serde::from_slice(&v)
-                .map_err(|e| {
-                    ClusterError::Serialization(format!("log_entry(idx={}): {}", idx, e))
-                })?;
-            by_index.insert(idx, entry);
-        }
-        drop(db);
-
-        // 2. 用 PendingLogOverlay 覆盖/补齐内存中的最新未落盘日志
+        // 1. 必须先读 PendingLogOverlay, 再扫 DB (LogCommitter 先写 DB 后删 overlay,
+        //    先读 DB 再读 overlay 会在删 overlay 瞬间出现两处皆空的 TOCTOU 竞态).
         if let Some(ref ov) = overlay {
             let ov_guard = ov.lock();
             for entry in ov_guard.get_range(start, end) {
                 by_index.insert(entry.log_id.index, (**entry).clone());
+            }
+        }
+
+        // 2. 从 DB 批量扫描补齐 overlay 中未覆盖的历史条目
+        if (by_index.len() as u64) < (end - start) {
+            let prefix = log_prefix(self.group_id);
+            let start_key = log_key(self.group_id, start);
+            let end_key = log_key(self.group_id, end);
+            let db = self.db.read();
+            let iter = db.scan(Some(&start_key), Some(&end_key))?;
+            for item in iter {
+                let (k, v) = item?;
+                if !k.starts_with(&prefix) || k.len() != prefix.len() + 8 {
+                    continue;
+                }
+                let idx = u64::from_be_bytes(k[prefix.len()..prefix.len() + 8].try_into().unwrap());
+                if idx < start || idx >= end || by_index.contains_key(&idx) {
+                    continue;
+                }
+                let entry: <TypeConfig as openraft::RaftTypeConfig>::Entry =
+                    rmp_serde::from_slice(&v).map_err(|e| {
+                        ClusterError::Serialization(format!("log_entry(idx={}): {}", idx, e))
+                    })?;
+                by_index.insert(idx, entry);
             }
         }
 
@@ -702,6 +704,62 @@ mod tests {
             "overlay must win on overlap"
         );
         assert_eq!(merged[3].log_id.index, 4);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn get_log_entries_concurrent_with_log_committer_never_drops_entry() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(dir.path(), Options::for_testing()).unwrap();
+        let db_slot = Arc::new(parking_lot::RwLock::new(db));
+        let handle = crate::cluster::log_committer::spawn_committer(
+            DEFAULT_GROUP_ID,
+            db_slot.clone(),
+            crate::cluster::log_committer::LogCommitterConfig::default(),
+        );
+        let storage = OpenRaftStorage::new_with_committer(
+            db_slot,
+            DEFAULT_GROUP_ID,
+            None,
+            Some(handle.clone()),
+        )
+        .unwrap();
+
+        let written = Arc::new(AtomicU64::new(0));
+        let done = Arc::new(AtomicBool::new(false));
+        let reader_storage = storage.clone();
+        let reader_written = Arc::clone(&written);
+        let reader_done = Arc::clone(&done);
+
+        let reader = std::thread::spawn(move || {
+            while !reader_done.load(Ordering::Acquire) {
+                let hi = reader_written.load(Ordering::Acquire);
+                if hi == 0 {
+                    continue;
+                }
+                let got = reader_storage.get_log_entries(hi..=hi).unwrap();
+                assert_eq!(got.len(), 1, "TOCTOU gap at log index {hi}");
+            }
+        });
+
+        for idx in 1..=2000u64 {
+            let entry = put_entry(idx, 1);
+            {
+                let mut ov = handle.overlay.lock();
+                ov.insert_at(idx, Arc::new(entry));
+            }
+            let cb = openraft::storage::IOFlushed::<TypeConfig>::noop();
+            handle.submit_append_with_bytes(idx, 1, 64, cb).unwrap();
+            written.store(idx, Ordering::Release);
+            if idx % 32 == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+        done.store(true, Ordering::Release);
+        reader.join().unwrap();
         handle.shutdown().await;
     }
 }
