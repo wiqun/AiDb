@@ -86,6 +86,9 @@ struct OtelMetrics {
     recovery_wal_replayed_bytes: Gauge<f64>,
     recovery_manifest_duration_seconds: Gauge<f64>,
     recovery_sstable_open_duration_seconds: Gauge<f64>,
+    raft_flush_written_bytes_total: Counter<u64>,
+    raft_compaction_written_bytes_total: Counter<u64>,
+    sstable_index_bytes: Gauge<f64>,
 }
 
 #[cfg(feature = "monitoring")]
@@ -316,6 +319,21 @@ impl OtelMetrics {
                 .with_description("SSTable Reader 打开恢复耗时")
                 .with_unit("s")
                 .build(),
+            raft_flush_written_bytes_total: meter
+                .u64_counter("aidb_raft_flush_written_bytes_total")
+                .with_description("Flush 写入 SSTable 中 Raft 前缀条目字节总数")
+                .with_unit("By")
+                .build(),
+            raft_compaction_written_bytes_total: meter
+                .u64_counter("aidb_raft_compaction_written_bytes_total")
+                .with_description("Compaction 写入 SSTable 中 Raft 前缀条目字节总数")
+                .with_unit("By")
+                .build(),
+            sstable_index_bytes: meter
+                .f64_gauge("aidb_sstable_index_bytes")
+                .with_description("活跃 SSTable Index Block 总字节数")
+                .with_unit("By")
+                .build(),
         }
     }
 }
@@ -473,6 +491,8 @@ pub fn sync_to_otel(stats: &crate::statistics::Statistics) {
     );
     m.sequence.record(current.sequence as f64, &[]);
     m.live_bytes.record(current.live_bytes as f64, &[]);
+    m.sstable_index_bytes
+        .record(current.sstable_index_bytes as f64, &[]);
 
     for (level, (&count, &size)) in current
         .sstable_count
@@ -550,6 +570,19 @@ pub fn sync_to_otel(stats: &crate::statistics::Statistics) {
     if comp_written_delta > 0 {
         m.compaction_written_bytes_total
             .add(comp_written_delta, &[]);
+    }
+    let raft_flush_delta = current
+        .raft_flush_written_bytes
+        .saturating_sub(baseline.raft_flush_written_bytes);
+    if raft_flush_delta > 0 {
+        m.raft_flush_written_bytes_total.add(raft_flush_delta, &[]);
+    }
+    let raft_comp_delta = current
+        .raft_compaction_written_bytes
+        .saturating_sub(baseline.raft_compaction_written_bytes);
+    if raft_comp_delta > 0 {
+        m.raft_compaction_written_bytes_total
+            .add(raft_comp_delta, &[]);
     }
     let logical_write_delta = current
         .logical_write_bytes

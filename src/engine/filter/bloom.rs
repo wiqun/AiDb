@@ -1,14 +1,16 @@
-//! BloomFilter — SSTable 级布隆过滤器: FNV-1a 双哈希, 编码内嵌 CRC32.
+//! BloomFilter — 64B (512-bit) Cache-line Blocked Bloom Filter, 编码内嵌 CRC32.
 //!
-//! # 哈希方案
+//! # 哈希与分桶方案
 //!
 //! ```text
-//! h1 = fnv1a_like(key, 0xbc9f1d34);  h2 = fnv1a_like(key, 0xd0e89c7b) (强制奇数)
-//! pos_i = (h1 + i × h2) % num_bits,  i ∈ [0, num_hashes)
+//! h = hash64(key) (FNV-1a 64-bit + SplitMix64 混合)
+//! block_idx = ((h >> 32) as usize) % num_blocks   // 定位单个 64B cache line
+//! h1 = h as u32;  h2 = ((h >> 17) as u32) | 1
+//! bit_i = (h1 + i × h2) & 511,  i ∈ [0, num_hashes)
 //! ```
 //!
-//! bits/hashes 按期望 key 数与目标 false positive rate 取最优; 磁盘编码
-//! `[num_hashes:4][num_bits:8][bits][crc32:4]`, `decode` 校验长度与 CRC.
+//! bits 向上对齐到 512 bits 的整数倍; 磁盘编码 `[num_hashes:4][num_bits:8][bits][crc32:4]`,
+//! `decode` 校验长度, 512 对齐约束与 CRC.
 //!
 //! # Invariant
 //!
@@ -18,6 +20,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{Error, Result};
+
+const CACHE_LINE_BITS: usize = 512;
+const CACHE_LINE_BYTES: usize = 64;
 
 static BLOOM_FALSE_POSITIVES: AtomicU64 = AtomicU64::new(0);
 
@@ -45,12 +50,13 @@ pub struct BloomFilter {
     bits: Vec<u8>,
     num_hashes: u32,
     num_bits: usize,
+    num_blocks: usize,
 }
 
 impl BloomFilter {
     pub fn new(expected_keys: usize, false_positive_rate: f64) -> Self {
         if expected_keys == 0 {
-            return Self::with_bits_and_hashes(64, 1);
+            return Self::with_bits_and_hashes(CACHE_LINE_BITS, 1);
         }
         let fp = false_positive_rate.clamp(0.0001, 0.9999);
         let num_bits = Self::optimal_num_bits(expected_keys, fp);
@@ -62,20 +68,22 @@ impl BloomFilter {
         Self::new(num_keys, 0.01)
     }
 
-    fn with_bits_and_hashes(num_bits: usize, num_hashes: u32) -> Self {
-        let num_bytes = num_bits.div_ceil(8);
+    fn with_bits_and_hashes(raw_bits: usize, num_hashes: u32) -> Self {
+        let num_blocks = raw_bits.div_ceil(CACHE_LINE_BITS).max(1);
+        let num_bits = num_blocks * CACHE_LINE_BITS;
         Self {
-            bits: vec![0u8; num_bytes],
+            bits: vec![0u8; num_blocks * CACHE_LINE_BYTES],
             num_hashes,
             num_bits,
+            num_blocks,
         }
     }
 
     fn optimal_num_bits(expected_keys: usize, false_positive_rate: f64) -> usize {
         let n = expected_keys as f64;
         let p = false_positive_rate;
-        let num_bits = (-n * p.ln() / (2.0_f64.ln().powi(2))).ceil() as usize;
-        num_bits.max(64)
+        let raw_bits = (-n * p.ln() / (2.0_f64.ln().powi(2))).ceil() as usize;
+        raw_bits.div_ceil(CACHE_LINE_BITS).max(1) * CACHE_LINE_BITS
     }
 
     fn optimal_num_hashes(num_bits: usize, expected_keys: usize) -> u32 {
@@ -86,16 +94,13 @@ impl BloomFilter {
         k.clamp(1, 30)
     }
 
-    fn hash_positions(&self, key: &[u8]) -> impl Iterator<Item = usize> + '_ {
-        let h1 = fnv1a_like(key, 0xbc9f1d34);
-        let mut h2 = fnv1a_like(key, 0xd0e89c7b);
-        if h2.is_multiple_of(2) {
-            h2 = h2.wrapping_add(1);
-        }
-        (0..self.num_hashes).map(move |i| {
-            let hash = h1.wrapping_add(i.wrapping_mul(h2));
-            (hash as usize) % self.num_bits
-        })
+    #[inline]
+    fn block_and_seeds(&self, key: &[u8]) -> (usize, u32, u32) {
+        let h = hash64(key);
+        let block_idx = ((h >> 32) as usize) % self.num_blocks;
+        let h1 = h as u32;
+        let h2 = ((h >> 17) as u32) | 1;
+        (block_idx * CACHE_LINE_BYTES, h1, h2)
     }
 
     pub fn num_hashes(&self) -> u32 {
@@ -107,44 +112,50 @@ impl BloomFilter {
     }
 }
 
-fn fnv1a_like(key: &[u8], seed: u32) -> u32 {
-    const FNV_OFFSET: u32 = 0x811c9dc5;
-    const FNV_PRIME: u32 = 0x01000193;
-    let mut hash = FNV_OFFSET ^ seed;
+#[inline]
+fn hash64(key: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x00000100000001b3;
+    let mut z = FNV_OFFSET;
     for &b in key {
-        hash ^= b as u32;
-        hash = hash.wrapping_mul(FNV_PRIME);
+        z ^= b as u64;
+        z = z.wrapping_mul(FNV_PRIME);
     }
-    hash
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+    z ^ (z >> 31)
 }
 
 impl Filter for BloomFilter {
+    #[inline]
     fn may_contain(&self, key: &[u8]) -> bool {
-        for pos in self.hash_positions(key) {
-            if self.bits[pos / 8] & (1 << (pos % 8)) == 0 {
+        let (base, h1, h2) = self.block_and_seeds(key);
+        let block = &self.bits[base..base + CACHE_LINE_BYTES];
+        let mut h = h1;
+        for _ in 0..self.num_hashes {
+            let bit_pos = (h & 511) as usize;
+            if block[bit_pos >> 3] & (1 << (bit_pos & 7)) == 0 {
                 return false;
             }
+            h = h.wrapping_add(h2);
         }
         true
     }
 
+    #[inline]
     fn add(&mut self, key: &[u8]) {
-        let num_hashes = self.num_hashes;
-        let num_bits = self.num_bits;
-        let h1 = fnv1a_like(key, 0xbc9f1d34);
-        let mut h2 = fnv1a_like(key, 0xd0e89c7b);
-        if h2.is_multiple_of(2) {
-            h2 = h2.wrapping_add(1);
-        }
-        for i in 0..num_hashes {
-            let hash = h1.wrapping_add(i.wrapping_mul(h2));
-            let pos = (hash as usize) % num_bits;
-            self.bits[pos / 8] |= 1 << (pos % 8);
+        let (base, h1, h2) = self.block_and_seeds(key);
+        let block = &mut self.bits[base..base + CACHE_LINE_BYTES];
+        let mut h = h1;
+        for _ in 0..self.num_hashes {
+            let bit_pos = (h & 511) as usize;
+            block[bit_pos >> 3] |= 1 << (bit_pos & 7);
+            h = h.wrapping_add(h2);
         }
     }
 
     fn encode(&self) -> Vec<u8> {
-        let mut raw = Vec::with_capacity(12 + self.bits.len());
+        let mut raw = Vec::with_capacity(12 + self.bits.len() + 4);
         raw.extend_from_slice(&self.num_hashes.to_le_bytes());
         raw.extend_from_slice(&(self.num_bits as u64).to_le_bytes());
         raw.extend_from_slice(&self.bits);
@@ -162,10 +173,12 @@ impl Filter for BloomFilter {
         if num_hashes == 0 || num_hashes > 30 {
             return Err(Error::Corruption("invalid num_hashes".into()));
         }
-        if num_bits < 64 {
-            return Err(Error::Corruption("num_bits too small".into()));
+        if num_bits < CACHE_LINE_BITS || !num_bits.is_multiple_of(CACHE_LINE_BITS) {
+            return Err(Error::Corruption(
+                "num_bits must be a positive multiple of 512".into(),
+            ));
         }
-        let expected_bytes = num_bits.div_ceil(8);
+        let expected_bytes = num_bits / 8;
         if data.len() != 16 + expected_bytes {
             return Err(Error::Corruption(
                 "bloom filter data length mismatch".into(),
@@ -181,6 +194,7 @@ impl Filter for BloomFilter {
             bits: data[12..body_end].to_vec(),
             num_hashes,
             num_bits,
+            num_blocks: num_bits / CACHE_LINE_BITS,
         })
     }
 }
@@ -274,14 +288,14 @@ mod tests {
         }
     }
 
-    /// 验证 FNV-1a 种子哈希算法分散性
+    /// 验证 64-bit 哈希分散性与 512-bit 对齐
     #[test]
-    fn test_fnv_hasher() {
-        let a = fnv1a_like(b"key", 0xbc9f1d34);
-        let b = fnv1a_like(b"key", 0xd0e89c7b);
-        let c = fnv1a_like(b"other", 0xbc9f1d34);
-        assert_eq!(a, fnv1a_like(b"key", 0xbc9f1d34));
+    fn test_cacheline_blocked_bloom_alignment_and_hash64() {
+        let f = BloomFilter::new(10_000, 0.01);
+        assert_eq!(f.num_bits() % CACHE_LINE_BITS, 0);
+        let a = hash64(b"key");
+        let b = hash64(b"other");
+        assert_eq!(a, hash64(b"key"));
         assert_ne!(a, b);
-        assert_ne!(a, c);
     }
 }

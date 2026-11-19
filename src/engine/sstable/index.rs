@@ -11,7 +11,9 @@ use std::cmp::Ordering;
 
 use bytes::Bytes;
 
-use crate::engine::memtable::compare_internal_key;
+use crate::engine::memtable::{
+    compare_internal_key, encode_internal_key, extract_user_key, ValueType,
+};
 use crate::error::{Error, Result};
 
 use super::block::{Block, BlockBuilder};
@@ -124,4 +126,57 @@ pub fn load_index_entries(block: &Block) -> Result<Vec<(Vec<u8>, BlockHandle)>> 
         }
     }
     Ok(out)
+}
+
+const MAX_SEQUENCE_NUMBER: u64 = (1u64 << 56) - 1;
+
+/// 计算满足 `last_key < sep < next_first_key` 的最短 InternalKey 分隔符.
+pub fn find_shortest_internal_key_separator(last_key: &[u8], next_first_key: &[u8]) -> Vec<u8> {
+    if last_key.len() < 8 || next_first_key.len() < 8 {
+        return last_key.to_vec();
+    }
+    let last_user = extract_user_key(last_key);
+    let next_user = extract_user_key(next_first_key);
+    if last_user >= next_user {
+        return last_key.to_vec();
+    }
+    let prefix_len = last_user
+        .iter()
+        .zip(next_user.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    if prefix_len < last_user.len()
+        && last_user[prefix_len] < 0xff
+        && last_user[prefix_len] + 1 < next_user[prefix_len]
+    {
+        let mut sep_user = last_user[..=prefix_len].to_vec();
+        sep_user[prefix_len] += 1;
+        let sep_internal = encode_internal_key(&sep_user, MAX_SEQUENCE_NUMBER, ValueType::TypePut);
+        if sep_internal.len() < last_key.len()
+            && compare_internal_key(last_key, &sep_internal) == Ordering::Less
+            && compare_internal_key(&sep_internal, next_first_key) == Ordering::Less
+        {
+            return sep_internal;
+        }
+    }
+    last_key.to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shortest_internal_key_separator_shortens_and_preserves_order() {
+        let last = encode_internal_key(b"user:1000:profile", 50, ValueType::TypePut);
+        let next = encode_internal_key(b"user:3000:profile", 40, ValueType::TypePut);
+        let sep = find_shortest_internal_key_separator(&last, &next);
+        assert!(sep.len() < last.len());
+        assert_eq!(compare_internal_key(&last, &sep), Ordering::Less);
+        assert_eq!(compare_internal_key(&sep, &next), Ordering::Less);
+
+        let adj1 = encode_internal_key(b"ab", 10, ValueType::TypePut);
+        let adj2 = encode_internal_key(b"ac", 10, ValueType::TypePut);
+        assert_eq!(find_shortest_internal_key_separator(&adj1, &adj2), adj1);
+    }
 }

@@ -448,7 +448,10 @@ fn test_corrupted_checksum() {
         bytes[10] ^= 0xff;
     }
     fs::write(&path, &bytes).unwrap();
-    assert!(SSTableReader::open(&path, None).is_err());
+    let reader = SSTableReader::open(&path, None).unwrap();
+    assert!(reader
+        .get(&encode_internal_key(b"k", 1, ValueType::TypePut))
+        .is_err());
 }
 
 #[test]

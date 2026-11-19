@@ -67,4 +67,7 @@ pub struct StatsSnapshot {
     pub recovery_wal_replayed_bytes: u64,
     pub recovery_manifest_duration_us: u64,
     pub recovery_sstable_open_duration_us: u64,
+    pub raft_flush_written_bytes: u64,
+    pub raft_compaction_written_bytes: u64,
+    pub sstable_index_bytes: u64,
 }

@@ -128,3 +128,21 @@ fn test_flush_and_wal_atomic_stats() {
     // 断言 WAL 大小大于 0
     assert!(stats.wal_size_bytes.load(Ordering::Relaxed) > 0);
 }
+
+#[test]
+fn test_raft_prefix_written_bytes_and_index_bytes_metrics() {
+    let dir = TempDir::new().unwrap();
+    let db = DB::open(dir.path(), Options::default()).unwrap();
+    let stats = db.statistics();
+
+    db.put(b"\x00raft/1/log/00000001", &[b'r'; 200]).unwrap();
+    db.put(b"user_key_1", &[b'u'; 200]).unwrap();
+    db.flush().unwrap();
+    assert!(stats.raft_flush_written_bytes.load(Ordering::Relaxed) >= 200);
+    assert!(stats.sstable_index_bytes.load(Ordering::Relaxed) > 0);
+
+    db.put(b"\x00raft/1/log/00000002", &[b'r'; 200]).unwrap();
+    db.flush().unwrap();
+    db.compact_range(None, None).unwrap();
+    assert!(stats.raft_compaction_written_bytes.load(Ordering::Relaxed) >= 400);
+}

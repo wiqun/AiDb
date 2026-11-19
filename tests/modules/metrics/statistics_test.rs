@@ -28,8 +28,8 @@ fn test_atomic_histogram_bucket_boundaries_and_overflow() {
 
     assert_eq!(hist.buckets[0].load(Ordering::Relaxed), 2);
     assert_eq!(hist.buckets[1].load(Ordering::Relaxed), 1);
-    for i in 2..8 {
-        assert_eq!(hist.buckets[i].load(Ordering::Relaxed), 0);
+    for bucket in &hist.buckets[2..8] {
+        assert_eq!(bucket.load(Ordering::Relaxed), 0);
     }
     assert_eq!(hist.buckets[8].load(Ordering::Relaxed), 1);
     assert_eq!(hist.buckets[9].load(Ordering::Relaxed), 1);

@@ -10,6 +10,7 @@ fn test_db_shared_block_cache() {
     let dir = tempdir().unwrap();
     let mut opts = Options::for_testing();
     opts.block_cache_size = 512 * 1024;
+    opts.row_cache_size = 0;
     opts.memtable_size = 256;
 
     let db = DB::open(dir.path(), opts).unwrap();
@@ -22,10 +23,13 @@ fn test_db_shared_block_cache() {
     }
 
     db.flush().unwrap();
-    let stats_after_flush = db.cache_stats();
+    for i in 0..50 {
+        let _ = db.get(format!("key_{i:03}").as_bytes()).unwrap();
+    }
+    let stats_after_warm = db.cache_stats();
     assert!(
-        stats_after_flush.insertions >= 1,
-        "open/read_key_range or flush reads should warm cache: {stats_after_flush:?}"
+        stats_after_warm.insertions >= 1,
+        "first read pass should warm block cache: {stats_after_warm:?}"
     );
 
     db.reset_cache_stats();

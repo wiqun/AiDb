@@ -91,6 +91,9 @@ pub struct Statistics {
     pub recovery_wal_replayed_bytes: AtomicU64,
     pub recovery_manifest_duration_us: AtomicU64,
     pub recovery_sstable_open_duration_us: AtomicU64,
+    pub raft_flush_written_bytes: AtomicU64,
+    pub raft_compaction_written_bytes: AtomicU64,
+    pub sstable_index_bytes: AtomicU64,
 
     // === 5. 实例差分基线 (内嵌隔离, 串行保护) ===
     pub(crate) sync_baseline: parking_lot::Mutex<StatsSnapshot>,
@@ -170,6 +173,9 @@ impl Statistics {
             recovery_wal_replayed_bytes: AtomicU64::new(0),
             recovery_manifest_duration_us: AtomicU64::new(0),
             recovery_sstable_open_duration_us: AtomicU64::new(0),
+            raft_flush_written_bytes: AtomicU64::new(0),
+            raft_compaction_written_bytes: AtomicU64::new(0),
+            sstable_index_bytes: AtomicU64::new(0),
 
             sync_baseline: parking_lot::Mutex::new(StatsSnapshot::default()),
         }
@@ -316,6 +322,11 @@ impl Statistics {
             recovery_sstable_open_duration_us: self
                 .recovery_sstable_open_duration_us
                 .load(Ordering::Relaxed),
+            raft_flush_written_bytes: self.raft_flush_written_bytes.load(Ordering::Relaxed),
+            raft_compaction_written_bytes: self
+                .raft_compaction_written_bytes
+                .load(Ordering::Relaxed),
+            sstable_index_bytes: self.sstable_index_bytes.load(Ordering::Relaxed),
         }
     }
 
@@ -361,6 +372,9 @@ impl Statistics {
         self.wal_written_bytes.store(0, Ordering::Relaxed);
         self.flush_written_bytes.store(0, Ordering::Relaxed);
         self.compaction_written_bytes.store(0, Ordering::Relaxed);
+        self.raft_flush_written_bytes.store(0, Ordering::Relaxed);
+        self.raft_compaction_written_bytes
+            .store(0, Ordering::Relaxed);
         self.logical_write_bytes.store(0, Ordering::Relaxed);
         self.block_read_bytes.store(0, Ordering::Relaxed);
         self.logical_read_bytes.store(0, Ordering::Relaxed);
@@ -440,6 +454,9 @@ aidb_block_seek_count_total
 aidb_logical_read_count_total
 aidb_logical_read_bytes_total
 aidb_recovery_wal_replay_duration_seconds
+aidb_raft_flush_written_bytes_total
+aidb_raft_compaction_written_bytes_total
+aidb_sstable_index_bytes
 "
 }
 

@@ -719,6 +719,10 @@ pub(crate) fn update_sstable_metrics(
         })
         .sum();
     stats.live_bytes.store(live_total, AtomicOrdering::Relaxed);
+    let index_total: u64 = sstables.iter().flatten().map(|r| r.index_size()).sum();
+    stats
+        .sstable_index_bytes
+        .store(index_total, AtomicOrdering::Relaxed);
     for (level, readers) in sstables.iter().enumerate() {
         if level < stats.sstable_count.len() {
             let total: u64 = readers.iter().map(|r| r.file_size()).sum();

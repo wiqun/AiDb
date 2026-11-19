@@ -310,7 +310,8 @@ fn test_sstable_load_skip_corrupted() {
     sst_paths.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
     let mut data = std::fs::read(sst_paths.last().unwrap()).unwrap();
     if data.len() > 20 {
-        data[10] ^= 0xff;
+        let idx = data.len() - 10;
+        data[idx] ^= 0xff;
         std::fs::write(sst_paths.last().unwrap(), data).unwrap();
     }
     let db = DB::open(dir.path(), tiny_opts()).unwrap();
