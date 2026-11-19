@@ -139,6 +139,8 @@ pub struct DB {
     write_stall_active: AtomicBool,
     /// 边沿触发写停顿日志状态: 记录当前活跃 stall 类型与进入时刻.
     write_stall_state: Mutex<Option<(crate::statistics::WriteStallKind, std::time::Instant)>>,
+    write_delay_epoch: std::time::Instant,
+    write_delay_next_ns: AtomicU64,
     pub(crate) stats: Arc<Statistics>,
 }
 
@@ -372,6 +374,8 @@ impl DB {
             sst_range_tombstones: RwLock::new(sst_range_tombstones),
             write_stall_active: AtomicBool::new(false),
             write_stall_state: Mutex::new(None),
+            write_delay_epoch: std::time::Instant::now(),
+            write_delay_next_ns: AtomicU64::new(0),
             stats: Arc::clone(&stats),
         });
 

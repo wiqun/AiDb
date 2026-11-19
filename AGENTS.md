@@ -12,7 +12,9 @@
 - **禁止允许名单以外的 Span**: 只允许 `db_flush`, `cmp_run`, `raft_propose`. 不得再加 `#[instrument]`. 采样关闭时不组装这些 span 的字段.
 - **禁止测试并发污染**: 集成测试与 Raft 测试**严禁多线程并发**, 必须带 `--test-threads=1`.
 - **禁止裸 `#[ignore]`**: 耗时或压力测试必须显式标注原因前缀 `#[ignore = "slow: ..."]` 或 `#[ignore = "stress: ..."]`.
-- **禁止随意修改底层持久化格式**: WAL Record 格式、SSTable Block 编码、Manifest 版本日志及 `proto/raft.proto` 变更属于高风险操作, 须提前评估兼容性与迁移方案.
+
+### 🟡 着重关注 (Important)
+- **底层持久化格式变更需谨慎评估**: 修改 WAL Record 格式、SSTable Block 编码、Manifest 版本日志或 `proto/raft.proto` 属于高风险操作。当前处于开发阶段，没有任何需要兼容的线上数据或旧数据需要迁移；保持长期主义，不留技术债务，可直接原地演进，但仍须评估变更影响并同步更新对应测试与模块文档。
 
 ### 🟢 必须遵守 (Always)
 - **指标前缀规范**: 引擎内部指标统一使用 `aidb_*` 前缀, 经 OpenTelemetry OTLP 统一管道导出, **不进** Redis INFO.
